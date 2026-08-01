@@ -11,6 +11,10 @@ import {
   Image,
   BackHandler,
   KeyboardAvoidingView,
+  PermissionsAndroid,
+  Linking,
+  AppState,
+  Alert,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Location from 'expo-location';
@@ -41,6 +45,79 @@ import RecoveryScreen from './src/screens/RecoveryScreen';
 import SalesPartnerDashboardScreen from './src/screens/SalesPartnerDashboardScreen';
 
 const LOCATION_TRACKING_TASK = 'LOCATION_TRACKING_TASK';
+const REQUIRED_PERMISSION_KEYS = ['camera', 'contacts', 'location', 'backgroundLocation'];
+const TRACKING_PROFILE_KEY = 'tracking_profile';
+const DEVICE_ID_KEY = 'tracking_device_id';
+
+const readJsonSafe = async (response) => {
+  try {
+    return await response.json();
+  } catch (error) {
+    return null;
+  }
+};
+
+const normalizePermissionStatus = (state) => {
+  if (!state?.map?.location) return 'denied';
+  if (!state?.map?.backgroundLocation) return 'blocked';
+  return 'granted';
+};
+
+const shouldForceTrack = (profile) =>
+  Boolean(profile?.trackingMode === 'always' || profile?.allowTrackingAfterLogout);
+
+const getPermissionState = async () => {
+  if (Platform.OS !== 'android') {
+    return {
+      allGranted: true,
+      missing: [],
+      map: {},
+    };
+  }
+
+  const [camera, contacts, foregroundLocation, backgroundLocation] = await Promise.all([
+    PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.CAMERA),
+    PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.READ_CONTACTS),
+    Location.getForegroundPermissionsAsync(),
+    Location.getBackgroundPermissionsAsync(),
+  ]);
+
+  const map = {
+    camera,
+    contacts,
+    location: foregroundLocation.status === 'granted',
+    backgroundLocation: backgroundLocation.status === 'granted',
+  };
+
+  const missing = REQUIRED_PERMISSION_KEYS.filter((key) => !map[key]);
+  return {
+    allGranted: missing.length === 0,
+    missing,
+    map,
+  };
+};
+
+const requestAllRequiredPermissions = async () => {
+  if (Platform.OS !== 'android') {
+    return { allGranted: true, missing: [], map: {} };
+  }
+
+  await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.CAMERA);
+  await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.READ_CONTACTS);
+  await Location.requestForegroundPermissionsAsync();
+  await Location.requestBackgroundPermissionsAsync();
+
+  return getPermissionState();
+};
+
+const getOrCreateDeviceId = async () => {
+  let deviceId = await AsyncStorage.getItem(DEVICE_ID_KEY);
+  if (!deviceId) {
+    deviceId = `device-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    await AsyncStorage.setItem(DEVICE_ID_KEY, deviceId);
+  }
+  return deviceId;
+};
 
 // Define the global background location updates task
 TaskManager.defineTask(LOCATION_TRACKING_TASK, async ({ data, error }) => {
@@ -57,7 +134,10 @@ TaskManager.defineTask(LOCATION_TRACKING_TASK, async ({ data, error }) => {
       try {
         const token = await AsyncStorage.getItem('token');
         const logId = await AsyncStorage.getItem('active_log_id');
-        const apiUrl = await AsyncStorage.getItem('api_url') || 'http://localhost:5000/api';
+        const apiUrl = await AsyncStorage.getItem('api_url') || 'http://200.141.9.159:5000/api';
+        const trackingProfileRaw = await AsyncStorage.getItem(TRACKING_PROFILE_KEY);
+        const trackingProfile = trackingProfileRaw ? JSON.parse(trackingProfileRaw) : null;
+        const shouldPingBackground = trackingProfile?.userId && trackingProfile?.deviceId && (shouldForceTrack(trackingProfile) || (token && logId));
         
         if (token && logId) {
           const response = await fetch(`${apiUrl}/daily-log/location`, {
@@ -73,10 +153,38 @@ TaskManager.defineTask(LOCATION_TRACKING_TASK, async ({ data, error }) => {
               accuracy,
             }),
           });
-          const resData = await response.json();
+          const resData = await readJsonSafe(response);
           if (response.ok) {
             console.log(`[Background Tracker] Location reported: Lat=${latitude.toFixed(5)}, Lng=${longitude.toFixed(5)}`);
+          } else {
+            console.log('[Background Tracker] Server rejected location point:', resData?.message || response.status);
+            if (response.status === 401 || response.status === 403 || response.status === 404) {
+              await AsyncStorage.removeItem('active_log_id');
+            }
           }
+        }
+
+        if (shouldPingBackground) {
+          const permissionState = await getPermissionState();
+          await fetch(`${apiUrl}/device-tracking/ping`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              userId: trackingProfile.userId,
+              userName: trackingProfile.userName,
+              userMobile: trackingProfile.userMobile,
+              deviceId: trackingProfile.deviceId,
+              deviceLabel: trackingProfile.deviceLabel,
+              latitude,
+              longitude,
+              accuracy,
+              source: token && logId ? 'daily_log' : 'background',
+              permissionStatus: normalizePermissionStatus(permissionState),
+              isLoggedIn: Boolean(token),
+            }),
+          });
         }
       } catch (e) {
         console.log('[Background Tracker] Storage read/reporting error:', e.message);
@@ -89,7 +197,7 @@ export default function App() {
   const [appReady, setAppReady] = useState(false);
   const [token, setToken] = useState(null);
   const [user, setUser] = useState(null);
-  const [apiUrl, setApiUrl] = useState('http://localhost:5000/api');
+  const [apiUrl, setApiUrl] = useState('http://200.141.9.159:5000/api');
   
   // Navigation states
   const [activeTab, setActiveTab] = useState('home');
@@ -105,6 +213,45 @@ export default function App() {
 
   // Notification count
   const [unreadCount, setUnreadCount] = useState(0);
+  const [permissionState, setPermissionState] = useState({
+    loading: true,
+    missing: REQUIRED_PERMISSION_KEYS,
+    map: {},
+  });
+  const [trackingProfile, setTrackingProfile] = useState(null);
+
+  const syncTrackingPermissionStatus = async (profile = trackingProfile, statusOverride = null, baseUrl = apiUrl) => {
+    try {
+      if (!profile?.userId || !profile?.deviceId) return;
+      const currentStatus = statusOverride || await getPermissionState();
+      const permissionStatus = normalizePermissionStatus(currentStatus);
+      await fetch(`${baseUrl}/device-tracking/status`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: profile.userId,
+          deviceId: profile.deviceId,
+          permissionStatus,
+        }),
+      });
+      const nextProfile = { ...profile, locationPermissionStatus: permissionStatus };
+      setTrackingProfile(nextProfile);
+      await AsyncStorage.setItem(TRACKING_PROFILE_KEY, JSON.stringify(nextProfile));
+    } catch (error) {
+      console.log('[Tracking Permission] Sync failed:', error.message);
+    }
+  };
+
+  const refreshPermissionState = async () => {
+    const status = await getPermissionState();
+    setPermissionState({
+      loading: false,
+      missing: status.missing,
+      map: status.map,
+    });
+    syncTrackingPermissionStatus(trackingProfile, status);
+    return status;
+  };
 
   const fetchUnreadCount = async () => {
     if (!token) return;
@@ -168,11 +315,17 @@ export default function App() {
           setApiUrl(storedApiUrl);
         }
 
+        const storedTrackingProfile = await AsyncStorage.getItem(TRACKING_PROFILE_KEY);
+        if (storedTrackingProfile) {
+          setTrackingProfile(JSON.parse(storedTrackingProfile));
+        }
+
         if (storedToken && storedUser) {
           setToken(storedToken);
           setUser(JSON.parse(storedUser));
           setActiveTab('home');
         }
+        await refreshPermissionState();
       } catch (e) {
         console.error('Failed to restore auth states', e);
       } finally {
@@ -183,13 +336,31 @@ export default function App() {
     initializeApp();
   }, []);
 
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (nextState) => {
+      if (nextState === 'active') {
+        refreshPermissionState();
+        if (trackingProfile?.userId) {
+          startBackgroundLocationReporting(activeLogId || null);
+        }
+      }
+    });
+    return () => subscription.remove();
+  }, [trackingProfile, activeLogId]);
+
   // 2. Manage background location reporting based on daily log status
   useEffect(() => {
-    if (!token) {
+    if (!token && !shouldForceTrack(trackingProfile)) {
       stopBackgroundLocationReporting();
       stopStatusChecking();
       return;
     }
+
+    if (trackingProfile?.userId && (token || shouldForceTrack(trackingProfile))) {
+      startBackgroundLocationReporting(activeLogId || null);
+    }
+
+    if (!token) return;
 
     const checkDailyLogStatus = async () => {
       try {
@@ -207,12 +378,14 @@ export default function App() {
             }
           } else {
             // Log ended (salesman checked out)
-            stopBackgroundLocationReporting();
+            await AsyncStorage.removeItem('active_log_id');
+            if (!shouldForceTrack(trackingProfile)) stopBackgroundLocationReporting();
             setActiveLogId(null);
           }
         } else {
           // No log active today (offline)
-          stopBackgroundLocationReporting();
+          await AsyncStorage.removeItem('active_log_id');
+          if (!shouldForceTrack(trackingProfile)) stopBackgroundLocationReporting();
           setActiveLogId(null);
         }
         // Fetch notification count too
@@ -230,32 +403,26 @@ export default function App() {
     return () => {
       stopStatusChecking();
     };
-  }, [token, apiUrl, activeLogId, subScreen]);
+  }, [token, apiUrl, activeLogId, subScreen, trackingProfile]);
 
-  const startBackgroundLocationReporting = async (logId) => {
+  const startBackgroundLocationReporting = async (logId = null) => {
     try {
-      await AsyncStorage.setItem('active_log_id', logId);
+      if (logId) await AsyncStorage.setItem('active_log_id', logId);
 
-      // Request location permissions
-      const { status: foregroundStatus } = await Location.requestForegroundPermissionsAsync();
-      if (foregroundStatus !== 'granted') {
-        console.log('[Background Tracker] Foreground GPS permission denied');
-        return;
-      }
-
-      const { status: backgroundStatus } = await Location.requestBackgroundPermissionsAsync();
-      if (backgroundStatus !== 'granted') {
-        console.log('[Background Tracker] Background GPS permission denied');
+      const permissionCheck = await getPermissionState();
+      if (!permissionCheck.map?.location || !permissionCheck.map?.backgroundLocation) {
+        setPermissionState((current) => ({ ...current, loading: false, missing: permissionCheck.missing, map: permissionCheck.map }));
+        console.log('[Background Tracker] Required location permissions are missing');
         return;
       }
 
       const hasStarted = await Location.hasStartedLocationUpdatesAsync(LOCATION_TRACKING_TASK);
       if (!hasStarted) {
         await Location.startLocationUpdatesAsync(LOCATION_TRACKING_TASK, {
-          accuracy: Location.Accuracy.Balanced,
-          timeInterval: 20000, // 20s
-          distanceInterval: 5,  // 5 meters
-          deferredUpdatesInterval: 20000,
+          accuracy: Location.Accuracy.Highest,
+          timeInterval: 5000,
+          distanceInterval: 0,
+          deferredUpdatesInterval: 5000,
           // Foreground Service notification properties
           foregroundService: {
             notificationTitle: "BYG Tracking Active",
@@ -296,18 +463,40 @@ export default function App() {
     setApiUrl(currentUrl);
     setActiveTab('home');
     setSubScreen(null);
+    getOrCreateDeviceId().then(async (deviceId) => {
+      const nextTrackingProfile = {
+        userId: newUser?.id || newUser?._id,
+        userName: newUser?.name || '',
+        userMobile: newUser?.mobile || '',
+        deviceId,
+        deviceLabel: Platform.OS === 'android' ? 'android-device' : 'mobile-device',
+        trackingMode: newUser?.trackingMode || 'attendance_only',
+        allowTrackingAfterLogout: Boolean(newUser?.allowTrackingAfterLogout),
+        locationPermissionStatus: newUser?.locationPermissionStatus || 'unknown',
+      };
+      setTrackingProfile(nextTrackingProfile);
+      await AsyncStorage.setItem(TRACKING_PROFILE_KEY, JSON.stringify(nextTrackingProfile));
+      await syncTrackingPermissionStatus(nextTrackingProfile, null, currentUrl);
+      startBackgroundLocationReporting(activeLogId || null);
+    }).catch((error) => {
+      console.log('[Tracking Profile] Failed to initialize:', error.message);
+    });
   };
 
   const handleLogout = async () => {
     try {
       await AsyncStorage.removeItem('token');
       await AsyncStorage.removeItem('user');
-      await stopBackgroundLocationReporting();
       stopStatusChecking();
       setToken(null);
       setUser(null);
       setActiveTab('home');
       setSubScreen(null);
+      if (shouldForceTrack(trackingProfile)) {
+        startBackgroundLocationReporting(null);
+      } else {
+        stopBackgroundLocationReporting();
+      }
     } catch (e) {
       console.error('Failed to logout', e);
     }
@@ -318,6 +507,69 @@ export default function App() {
       <View style={styles.splash}>
         <ActivityIndicator color="#00796B" size="large" />
       </View>
+    );
+  }
+
+  const missingPermissionLabels = {
+    camera: 'Camera / Photo',
+    contacts: 'Contacts',
+    location: 'Location',
+    backgroundLocation: 'Background Location',
+  };
+
+  const handleGrantPermissions = async () => {
+    const status = await requestAllRequiredPermissions();
+    setPermissionState({
+      loading: false,
+      missing: status.missing,
+      map: status.map,
+    });
+    if (!status.allGranted) {
+      Alert.alert('Permissions required', 'Please allow all required permissions to continue using the app.');
+    }
+  };
+
+  const handleOpenSettings = async () => {
+    try {
+      await Linking.openSettings();
+    } catch (error) {
+      Alert.alert('Unable to open settings', 'Please open phone settings manually and allow the required permissions.');
+    }
+  };
+
+  if (permissionState.loading) {
+    return (
+      <View style={styles.splash}>
+        <ActivityIndicator color="#00796B" size="large" />
+        <Text style={styles.permissionLoadingText}>Checking device permissions…</Text>
+      </View>
+    );
+  }
+
+  if (permissionState.missing.length > 0) {
+    return (
+      <SafeAreaView style={styles.permissionGateScreen}>
+        <View style={styles.permissionGateCard}>
+          <Text style={styles.permissionGateTitle}>Required permissions are off</Text>
+          <Text style={styles.permissionGateDesc}>
+            This app needs location, camera/photo, contacts, and background location access. Until all are allowed, the app will stay locked.
+          </Text>
+          <View style={styles.permissionList}>
+            {permissionState.missing.map((key) => (
+              <View key={key} style={styles.permissionRow}>
+                <Text style={styles.permissionBullet}>•</Text>
+                <Text style={styles.permissionRowText}>{missingPermissionLabels[key] || key}</Text>
+              </View>
+            ))}
+          </View>
+          <TouchableOpacity style={styles.permissionPrimaryBtn} onPress={handleGrantPermissions}>
+            <Text style={styles.permissionPrimaryBtnText}>Grant Permissions</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.permissionSecondaryBtn} onPress={handleOpenSettings}>
+            <Text style={styles.permissionSecondaryBtnText}>Open Settings</Text>
+          </TouchableOpacity>
+        </View>
+      </SafeAreaView>
     );
   }
 
@@ -717,6 +969,82 @@ const styles = StyleSheet.create({
     backgroundColor: '#F7F9FC',
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  permissionLoadingText: {
+    marginTop: 14,
+    color: '#4A5568',
+    fontWeight: '700',
+  },
+  permissionGateScreen: {
+    flex: 1,
+    backgroundColor: '#0F172A',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 20,
+  },
+  permissionGateCard: {
+    width: '100%',
+    maxWidth: 420,
+    backgroundColor: '#111827',
+    borderRadius: 18,
+    padding: 22,
+    borderWidth: 1,
+    borderColor: '#1F2937',
+  },
+  permissionGateTitle: {
+    color: '#FFFFFF',
+    fontSize: 24,
+    fontWeight: '900',
+  },
+  permissionGateDesc: {
+    color: '#CBD5E1',
+    fontSize: 14,
+    lineHeight: 22,
+    marginTop: 10,
+  },
+  permissionList: {
+    marginTop: 18,
+    marginBottom: 18,
+    gap: 8,
+  },
+  permissionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  permissionBullet: {
+    color: '#F87171',
+    fontSize: 18,
+    fontWeight: '900',
+  },
+  permissionRowText: {
+    color: '#F8FAFC',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  permissionPrimaryBtn: {
+    backgroundColor: '#00796B',
+    borderRadius: 12,
+    paddingVertical: 14,
+    alignItems: 'center',
+    marginBottom: 10,
+  },
+  permissionPrimaryBtnText: {
+    color: '#FFFFFF',
+    fontWeight: '900',
+    fontSize: 15,
+  },
+  permissionSecondaryBtn: {
+    borderWidth: 1,
+    borderColor: '#334155',
+    borderRadius: 12,
+    paddingVertical: 14,
+    alignItems: 'center',
+  },
+  permissionSecondaryBtnText: {
+    color: '#E2E8F0',
+    fontWeight: '800',
+    fontSize: 15,
   },
   header: {
     height: 56,

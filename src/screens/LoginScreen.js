@@ -16,7 +16,7 @@ export default function LoginScreen({ onLoginSuccess }) {
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const [apiUrl, setApiUrl] = useState('http://localhost:5000/api');
+  const [apiUrl, setApiUrl] = useState('http://200.141.9.159:5000/api');
   const [tempUrl, setTempUrl] = useState('');
   const [settingsVisible, setSettingsVisible] = useState(false);
 
