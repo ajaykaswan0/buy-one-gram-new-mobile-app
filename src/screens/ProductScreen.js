@@ -16,9 +16,10 @@ import {
   Platform,
 } from 'react-native';
 
-export default function ProductScreen({ token, apiUrl, onBack }) {
+export default function ProductScreen({ token, apiUrl, user, onBack }) {
   const [products, setProducts] = useState([]);
   const [priceList, setPriceList] = useState(null);
+  const [inventoryRows, setInventoryRows] = useState([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
@@ -43,26 +44,24 @@ export default function ProductScreen({ token, apiUrl, onBack }) {
 
   const fetchData = async () => {
     try {
-      // 1. Fetch products
-      const prodResponse = await fetch(`${apiUrl}/product?limit=100`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const prodData = await prodResponse.json();
+      const headers = { Authorization: `Bearer ${token}` };
+      const [prodResponse, plResponse, stockResponse] = await Promise.all([
+        fetch(`${apiUrl}/product?limit=100`, { headers }),
+        fetch(`${apiUrl}/price-list/manufacturing?page=1&limit=100`, { headers }),
+        fetch(`${apiUrl}/inventory/stock?stockType=finished_goods&limit=100`, { headers }),
+      ]);
+      const [prodData, plData, stockData] = await Promise.all([
+        prodResponse.json(),
+        plResponse.json(),
+        stockResponse.json(),
+      ]);
 
-      // 2. Fetch price lists
-      const plResponse = await fetch(`${apiUrl}/price-list`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const plData = await plResponse.json();
-
-      if (prodResponse.ok && plResponse.ok) {
+      if (prodResponse.ok && plResponse.ok && stockResponse.ok) {
         setProducts(prodData.data || []);
-        // Find general price list (Standard Price List or the one without partyId)
-        const allLists = plData.data || [];
-        const activePL = allLists.find(p => p.name === 'Standard Price List') || allLists.find(p => p.partyId === null);
-        setPriceList(activePL || null);
+        setPriceList({ items: plData.data || [] });
+        setInventoryRows(stockData.data || []);
       } else {
-        Alert.alert('Error', 'Failed to retrieve rate list records.');
+        Alert.alert('Error', 'Failed to retrieve products, prices or finished-goods stock.');
       }
     } catch (e) {
       console.warn('Rate list fetch error:', e.message);
@@ -76,7 +75,8 @@ export default function ProductScreen({ token, apiUrl, onBack }) {
   const fetchParties = async () => {
     setLoadingParties(true);
     try {
-      const response = await fetch(`${apiUrl}/parties/my`, {
+      const partyEndpoint = user?.role === 'cso' ? '/parties?limit=100' : '/parties/my';
+      const response = await fetch(`${apiUrl}${partyEndpoint}`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       const data = await response.json();
@@ -103,16 +103,18 @@ export default function ProductScreen({ token, apiUrl, onBack }) {
       (prod.variants || []).forEach((variant) => {
         if (variant.isDeleted || !variant.isActive) return;
 
-        // Resolve rate from Standard Price List or fallback to product salesPrice
-        let price = variant.salesPrice || 0;
+        // Price and MRP are owned by PriceList, never by embedded product fields.
+        let price = 0;
+        let mrp = 0;
         let priceHistory = [];
         if (priceList && priceList.items) {
           const pli = priceList.items.find(
-            (i) => i.productId?._id?.toString() === prod._id?.toString() || 
-                   i.productId?.toString() === prod._id?.toString()
+            (i) => String(i.productId?._id || i.productId) === String(prod._id) &&
+                   String(i.variantId?._id || i.variantId) === String(variant._id)
           );
-          if (pli && pli.variantId?.toString() === variant._id?.toString()) {
-            price = pli.price;
+          if (pli) {
+            price = Number(pli.finalSellingPrice ?? pli.price ?? 0);
+            mrp = Number(pli.mrp || 0);
             priceHistory = pli.priceHistory || [];
           }
         }
@@ -120,8 +122,6 @@ export default function ProductScreen({ token, apiUrl, onBack }) {
         // GST Calculation
         const gstPercentage = variant.gstPercentage || 0;
         const rate = withGst ? price * (1 + gstPercentage / 100) : price;
-        const mrp = variant.mrp || 0;
-
         // +/- difference from last price list update
         const previousPrice = priceHistory.length > 0
           ? priceHistory[priceHistory.length - 1].price
@@ -131,6 +131,16 @@ export default function ProductScreen({ token, apiUrl, onBack }) {
 
         // Margin percentage: (MRP - Rate) / Rate * 100
         const margin = rate > 0 ? Math.max(0, Math.round(((mrp - rate) / rate) * 100)) : 0;
+        const stockRows = inventoryRows.filter(
+          (row) => String(row.product?._id || row.product || row.productId?._id || row.productId) === String(prod._id) &&
+                   String(row.variantId?._id || row.variantId) === String(variant._id)
+        );
+        const totalStock = stockRows.reduce((sum, row) => sum + Number(row.quantity || 0), 0);
+        const reservedStock = stockRows.reduce((sum, row) => sum + Number(row.reservedQuantity || 0), 0);
+        const availableStock = stockRows.reduce(
+          (sum, row) => sum + Number(row.availableQuantity ?? (Number(row.quantity || 0) - Number(row.reservedQuantity || 0))),
+          0
+        );
 
         items.push({
           id: variant._id,
@@ -142,11 +152,14 @@ export default function ProductScreen({ token, apiUrl, onBack }) {
           mrp,
           diff: diffRate,
           margin,
+          totalStock,
+          reservedStock,
+          availableStock,
         });
       });
     });
     return items;
-  }, [products, priceList, withGst]);
+  }, [products, priceList, inventoryRows, withGst]);
 
   const items = getRateListItems();
 
@@ -336,7 +349,7 @@ export default function ProductScreen({ token, apiUrl, onBack }) {
       {/* Table Header */}
       <View style={styles.tableHeaderRow}>
         <Text style={[styles.thText, { flex: 0.8, textAlign: 'center' }]}>S.No</Text>
-        <Text style={[styles.thText, { flex: 2.8 }]}>Product Name</Text>
+        <Text style={[styles.thText, { flex: 3.2 }]}>Product / Available Stock</Text>
         <Text style={[styles.thText, { flex: 1.6, color: '#3182CE', textAlign: 'right' }]}>Rate</Text>
         <Text style={[styles.thText, { flex: 1.4, textAlign: 'right' }]}>MRP</Text>
         <Text style={[styles.thText, { flex: 1.2, textAlign: 'center' }]}>+/-</Text>
@@ -374,9 +387,17 @@ export default function ProductScreen({ token, apiUrl, onBack }) {
                 <Text style={[styles.tdText, styles.sNoText, { flex: 0.8 }]}>{idx + 1}</Text>
 
                 {/* Product Name */}
-                <View style={{ flex: 2.8 }}>
+                <View style={{ flex: 3.2 }}>
                   <Text style={styles.productNameText} numberOfLines={1}>{item.name}</Text>
                   <Text style={styles.productPackSizeText}>{item.packSize} {item.unit}</Text>
+                  <Text style={{
+                    color: item.availableStock > 0 ? '#38A169' : '#E53E3E',
+                    fontSize: 10,
+                    fontWeight: '700',
+                    marginTop: 2,
+                  }}>
+                    Available {item.availableStock} · Total {item.totalStock} · Reserved {item.reservedStock}
+                  </Text>
                 </View>
 
                 {/* Rate */}

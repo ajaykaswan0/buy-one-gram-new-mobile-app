@@ -15,7 +15,7 @@ import {
   Platform,
 } from 'react-native';
 
-export default function PartyProfileScreen({ token, apiUrl, partyId, onBack, onNavigateToOrder }) {
+export default function PartyProfileScreen({ token, apiUrl, partyId, onBack, onNavigateToOrder, onNavigateToCollection }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [profile, setProfile] = useState(null);
@@ -38,6 +38,45 @@ export default function PartyProfileScreen({ token, apiUrl, partyId, onBack, onN
   const [replaceQuantities, setReplaceQuantities] = useState({}); // { [variantId]: quantity }
   const [replaceRemarks, setReplaceRemarks] = useState('');
   const [submittingReplacement, setSubmittingReplacement] = useState(false);
+  const [issueModalVisible, setIssueModalVisible] = useState(false);
+  const [issueCategory, setIssueCategory] = useState('service');
+  const [issuePriority, setIssuePriority] = useState('medium');
+  const [issueSubject, setIssueSubject] = useState('');
+  const [issueDescription, setIssueDescription] = useState('');
+  const [submittingIssue, setSubmittingIssue] = useState(false);
+
+  const handleSubmitIssue = async () => {
+    if (!issueSubject.trim() || !issueDescription.trim()) {
+      Alert.alert('Required', 'Please enter the issue subject and full details.');
+      return;
+    }
+    setSubmittingIssue(true);
+    try {
+      const response = await fetch(`${apiUrl}/feedback`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          type: 'issue',
+          targetType: 'party',
+          partyId,
+          category: issueCategory,
+          priority: issuePriority,
+          subject: issueSubject.trim(),
+          description: issueDescription.trim(),
+        }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.message || 'Could not raise issue.');
+      setIssueModalVisible(false);
+      setIssueSubject('');
+      setIssueDescription('');
+      Alert.alert('Issue Raised', `${result.data?.issueNumber || 'Issue'} has been sent to Admin.`);
+    } catch (err) {
+      Alert.alert('Failed', err.message || 'Could not raise issue.');
+    } finally {
+      setSubmittingIssue(false);
+    }
+  };
 
   const toggleExpandOrder = (id) => {
     setExpandedOrders(prev => ({ ...prev, [id]: !prev[id] }));
@@ -225,12 +264,18 @@ export default function PartyProfileScreen({ token, apiUrl, partyId, onBack, onN
     setLoading(true);
     setError('');
     try {
-      const response = await fetch(`${apiUrl}/parties/${partyId}/profile`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const data = await response.json();
+      const headers = { Authorization: `Bearer ${token}` };
+      const [response, financeResponse] = await Promise.all([
+        fetch(`${apiUrl}/parties/${partyId}/profile`, { headers }),
+        fetch(`${apiUrl}/finance/party/${partyId}`, { headers }),
+      ]);
+      const [data, financeResult] = await Promise.all([
+        response.json(),
+        financeResponse.json(),
+      ]);
       if (response.ok) {
         setProfile(data.data);
+        setFinanceData(financeResponse.ok && financeResult.success ? financeResult.data : null);
       } else {
         throw new Error(data.message || 'Failed to load party profile.');
       }
@@ -315,9 +360,9 @@ export default function PartyProfileScreen({ token, apiUrl, partyId, onBack, onN
   const { party, recentOrders, recentVisits, recentCollections, stats } = profile;
 
   let pendingUnallocated = 0;
-  let pendingAllocated = 0;
+  let pendingAllocated = Number(financeData?.summary?.pendingAllocated || 0);
 
-  (recentCollections || []).forEach((c) => {
+  (financeData?.payments || recentCollections || []).forEach((c) => {
     if (['pending', 'unallocated', 'allocated_pending', 'pending_verification', 'pending_handover', 'received'].includes(c.status)) {
       const allocations = c.allocations || [];
       const pendingAllocationsAmt = allocations
@@ -326,10 +371,48 @@ export default function PartyProfileScreen({ token, apiUrl, partyId, onBack, onN
 
       const totalUnallocated = Number(c.unallocatedAmount ?? c.amount ?? 0);
 
-      pendingAllocated += pendingAllocationsAmt;
+      if (!financeData) pendingAllocated += pendingAllocationsAmt;
       pendingUnallocated += Math.max(0, totalUnallocated - pendingAllocationsAmt);
     }
   });
+
+  const invoiceByOrderId = new Map();
+  (financeData?.invoices || []).forEach((invoice) => {
+    const orderId = invoice.orderId?._id || invoice.orderId;
+    if (orderId) invoiceByOrderId.set(String(orderId), invoice);
+  });
+  const pendingByInvoiceId = new Map();
+  (financeData?.payments || []).forEach((payment) => {
+    (payment.allocations || []).forEach((allocation) => {
+      if (allocation.status !== 'pending') return;
+      const invoiceId = allocation.invoiceId?._id || allocation.invoiceId;
+      if (!invoiceId) return;
+      pendingByInvoiceId.set(
+        String(invoiceId),
+        Number(pendingByInvoiceId.get(String(invoiceId)) || 0) + Number(allocation.amount || 0)
+      );
+    });
+  });
+  const netOutstanding = Number(financeData?.summary?.netOutstanding ?? party.currentOutstanding ?? 0);
+
+  const getOrderPaymentState = (order) => {
+    if (order.paymentType === 'prepaid') return { label: 'PAID', color: '#38A169' };
+    const invoice = invoiceByOrderId.get(String(order._id));
+    if (!invoice) {
+      return order.paymentType === 'cod'
+        ? { label: 'COD', color: '#D69E2E' }
+        : { label: 'UNPAID', color: '#E53E3E' };
+    }
+    const total = Number(invoice.originalAmount || order.netPayableAmount || order.grandTotal || order.totalAmount || 0);
+    const confirmed = Math.max(0, total - Number(invoice.balanceDue || 0));
+    const pending = Number(pendingByInvoiceId.get(String(invoice._id)) || 0);
+    const allocated = Math.min(total, confirmed + pending);
+    if (invoice.status === 'paid' || (total > 0 && allocated >= total - 0.01)) {
+      return { label: pending > 0 ? 'FULLY ALLOCATED' : 'PAID', color: '#38A169' };
+    }
+    if (allocated > 0) return { label: `PARTIAL ${formatCurrency(allocated)}`, color: '#D69E2E' };
+    return { label: 'UNPAID', color: '#E53E3E' };
+  };
 
   return (
     <SafeAreaView style={styles.safeArea}>
@@ -341,6 +424,12 @@ export default function PartyProfileScreen({ token, apiUrl, partyId, onBack, onN
           </TouchableOpacity>
           <Text style={styles.headerTitle}>Party Profile</Text>
         </View>
+        <TouchableOpacity
+          style={styles.headerOrderBtn}
+          onPress={() => onNavigateToCollection && onNavigateToCollection(party)}
+        >
+          <Text style={styles.headerOrderBtnText}>₹ Collect</Text>
+        </TouchableOpacity>
         <TouchableOpacity 
           style={styles.headerOrderBtn}
           onPress={() => onNavigateToOrder && onNavigateToOrder(party)}
@@ -380,10 +469,14 @@ export default function PartyProfileScreen({ token, apiUrl, partyId, onBack, onN
           ) : null}
         </View>
 
+        <TouchableOpacity style={styles.raiseIssueBtn} onPress={() => setIssueModalVisible(true)}>
+          <Text style={styles.raiseIssueBtnText}>⚠ Raise Issue for {party.partyName}</Text>
+        </TouchableOpacity>
+
         {/* Stats Cards */}
         <View style={styles.statsRow}>
           <View style={[styles.statCard, { backgroundColor: '#FFF5F5', padding: 12 }]}>
-            <Text style={[styles.statValue, { color: '#E53E3E', fontSize: 15 }]}>{formatCurrency(party.currentOutstanding)}</Text>
+            <Text style={[styles.statValue, { color: '#E53E3E', fontSize: 15 }]}>{formatCurrency(netOutstanding)}</Text>
             <Text style={[styles.statLabel, { fontSize: 9.5 }]}>Outstanding</Text>
           </View>
           <View style={[styles.statCard, { backgroundColor: '#EBF8FF', padding: 12 }]}>
@@ -475,6 +568,8 @@ export default function PartyProfileScreen({ token, apiUrl, partyId, onBack, onN
             ) : (
               recentOrders.map((order) => {
                 const isExpanded = !!expandedOrders[order._id];
+                const paymentState = getOrderPaymentState(order);
+                const orderTotal = order.netPayableAmount ?? order.grandTotal ?? order.totalAmount ?? 0;
                 return (
                   <View key={order._id} style={styles.listCardWrapper}>
                     <TouchableOpacity
@@ -493,8 +588,14 @@ export default function PartyProfileScreen({ token, apiUrl, partyId, onBack, onN
                       <Text style={styles.listCardSub}>
                         {formatDate(order.createdAt)} • {order.items?.length || 0} items
                       </Text>
+                      <View style={[styles.paymentBadge, { backgroundColor: paymentState.color + '18' }]}>
+                        <View style={[styles.paymentDot, { backgroundColor: paymentState.color }]} />
+                        <Text style={[styles.paymentBadgeText, { color: paymentState.color }]}>
+                          {paymentState.label}
+                        </Text>
+                      </View>
                       <View style={styles.listCardFooter}>
-                        <Text style={styles.listCardAmount}>{formatCurrency(order.totalAmount || order.grandTotal)}</Text>
+                        <Text style={styles.listCardAmount}>Total: {formatCurrency(orderTotal)}</Text>
                         <Text style={styles.expandLabelText}>
                           {isExpanded ? 'Hide Details ▲' : 'Show Details ▼'}
                         </Text>
@@ -611,6 +712,91 @@ export default function PartyProfileScreen({ token, apiUrl, partyId, onBack, onN
           </View>
         ) : null}
       </ScrollView>
+      <Modal
+        visible={issueModalVisible}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setIssueModalVisible(false)}
+      >
+        <SafeAreaView style={styles.modalOverlay}>
+          <KeyboardAvoidingView
+            behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+            style={styles.issueModalWrapper}
+          >
+            <View style={styles.modalHeader}>
+              <View>
+                <Text style={styles.modalTitleText}>Raise Party Issue</Text>
+                <Text style={styles.issuePartyName}>{profile?.party?.partyName}</Text>
+              </View>
+              <TouchableOpacity style={styles.closeXBtn} onPress={() => setIssueModalVisible(false)}>
+                <Text style={styles.closeXText}>✕</Text>
+              </TouchableOpacity>
+            </View>
+            <ScrollView contentContainerStyle={styles.replacementFormContent}>
+              <Text style={styles.fieldLabel}>Category</Text>
+              <View style={styles.issueChoiceRow}>
+                {['payment', 'order', 'delivery', 'service', 'product', 'behaviour', 'other'].map((value) => (
+                  <TouchableOpacity
+                    key={value}
+                    style={[styles.issueChoice, issueCategory === value && styles.issueChoiceActive]}
+                    onPress={() => setIssueCategory(value)}
+                  >
+                    <Text style={[styles.issueChoiceText, issueCategory === value && styles.issueChoiceTextActive]}>
+                      {value.replace('_', ' ').toUpperCase()}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+              <Text style={styles.fieldLabel}>Priority</Text>
+              <View style={styles.issueChoiceRow}>
+                {['low', 'medium', 'high', 'critical'].map((value) => (
+                  <TouchableOpacity
+                    key={value}
+                    style={[styles.issueChoice, issuePriority === value && styles.issueChoiceActive]}
+                    onPress={() => setIssuePriority(value)}
+                  >
+                    <Text style={[styles.issueChoiceText, issuePriority === value && styles.issueChoiceTextActive]}>
+                      {value.toUpperCase()}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+              <Text style={styles.fieldLabel}>Subject *</Text>
+              <TextInput
+                style={styles.issueInput}
+                value={issueSubject}
+                onChangeText={setIssueSubject}
+                placeholder="Short summary of the problem"
+                placeholderTextColor="#A0AEC0"
+              />
+              <Text style={styles.fieldLabel}>Problem Details *</Text>
+              <TextInput
+                style={[styles.issueInput, styles.issueDescriptionInput]}
+                value={issueDescription}
+                onChangeText={setIssueDescription}
+                multiline
+                textAlignVertical="top"
+                placeholder="Explain what happened and what help is required..."
+                placeholderTextColor="#A0AEC0"
+              />
+            </ScrollView>
+            <View style={styles.modalActionsFooter}>
+              <TouchableOpacity style={styles.cancelBtn} onPress={() => setIssueModalVisible(false)}>
+                <Text style={styles.cancelBtnText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.submitReplacementBtn, submittingIssue && styles.disabledSubmitBtn]}
+                onPress={handleSubmitIssue}
+                disabled={submittingIssue}
+              >
+                {submittingIssue
+                  ? <ActivityIndicator color="#FFFFFF" size="small" />
+                  : <Text style={styles.submitReplacementBtnText}>Submit Issue</Text>}
+              </TouchableOpacity>
+            </View>
+          </KeyboardAvoidingView>
+        </SafeAreaView>
+      </Modal>
       {selectedOrderForReplace && (
         <Modal
           visible={replacementModalVisible}
@@ -1080,6 +1266,41 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     color: '#1A202C',
   },
+  raiseIssueBtn: {
+    backgroundColor: '#FFF5F5',
+    borderWidth: 1,
+    borderColor: '#FC8181',
+    borderRadius: 12,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    alignItems: 'center',
+    marginBottom: 16,
+  },
+  raiseIssueBtnText: {
+    color: '#C53030',
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  paymentBadge: {
+    alignSelf: 'flex-start',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    marginTop: 4,
+  },
+  paymentDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+  },
+  paymentBadgeText: {
+    fontSize: 10,
+    fontWeight: '800',
+    letterSpacing: 0.4,
+  },
   visitIndicators: {
     flexDirection: 'row',
     gap: 6,
@@ -1217,6 +1438,59 @@ const styles = StyleSheet.create({
     borderTopLeftRadius: 20,
     borderTopRightRadius: 20,
     height: '80%',
+  },
+  issueModalWrapper: {
+    backgroundColor: '#FFFFFF',
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    height: '82%',
+  },
+  issuePartyName: {
+    color: '#718096',
+    fontSize: 11,
+    marginTop: 2,
+  },
+  issueChoiceRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 7,
+    marginTop: 7,
+    marginBottom: 16,
+  },
+  issueChoice: {
+    borderWidth: 1,
+    borderColor: '#CBD5E0',
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+  },
+  issueChoiceActive: {
+    backgroundColor: '#00796B',
+    borderColor: '#00796B',
+  },
+  issueChoiceText: {
+    color: '#4A5568',
+    fontSize: 10,
+    fontWeight: '800',
+  },
+  issueChoiceTextActive: {
+    color: '#FFFFFF',
+  },
+  issueInput: {
+    minHeight: 44,
+    backgroundColor: '#F7F9FC',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    color: '#2D3748',
+    fontSize: 13,
+    marginTop: 6,
+    marginBottom: 16,
+  },
+  issueDescriptionInput: {
+    minHeight: 130,
   },
   replacementFormContent: {
     padding: 16,

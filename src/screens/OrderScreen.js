@@ -14,7 +14,7 @@ import {
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
-export default function OrderScreen({ token, apiUrl, preSelectedParty, onBack }) {
+export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onBack }) {
   const [selectedParty, setSelectedParty] = useState(preSelectedParty || null);
   const [parties, setParties] = useState([]);
   const [partySearchQuery, setPartySearchQuery] = useState('');
@@ -25,6 +25,7 @@ export default function OrderScreen({ token, apiUrl, preSelectedParty, onBack })
   const [productSearchQuery, setProductSearchQuery] = useState('');
   const [loadingProducts, setLoadingProducts] = useState(false);
   const [expandedProduct, setExpandedProduct] = useState(null);
+  const [selectedWarehouseId, setSelectedWarehouseId] = useState(null);
   
   // Stock mapping: { [variantId]: quantity }
   const [stockMap, setStockMap] = useState({});
@@ -82,7 +83,8 @@ export default function OrderScreen({ token, apiUrl, preSelectedParty, onBack })
   const loadInitialParties = async () => {
     setLoadingParties(true);
     try {
-      const response = await fetch(`${apiUrl}/parties/my`, {
+      const partyEndpoint = user?.role === 'cso' ? '/parties?limit=100' : '/parties/my';
+      const response = await fetch(`${apiUrl}${partyEndpoint}`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       const data = await response.json();
@@ -131,55 +133,83 @@ export default function OrderScreen({ token, apiUrl, preSelectedParty, onBack })
   const fetchProducts = async () => {
     setLoadingProducts(true);
     try {
-      const response = await fetch(`${apiUrl}/product?limit=100`, {
-        headers: { Authorization: `Bearer ${token}` },
+      const headers = { Authorization: `Bearer ${token}` };
+      const [productResponse, priceResponse, stockResponse] = await Promise.all([
+        fetch(`${apiUrl}/product?limit=100`, { headers }),
+        fetch(`${apiUrl}/price-list/manufacturing?page=1&limit=100`, { headers }),
+        fetch(`${apiUrl}/inventory/stock?stockType=finished_goods&limit=100`, { headers }),
+      ]);
+      const [productData, priceData, stockData] = await Promise.all([
+        productResponse.json(), priceResponse.json(), stockResponse.json(),
+      ]);
+      if (!productResponse.ok || !productData.success) throw new Error(productData.message || 'Products could not be loaded');
+      if (!priceResponse.ok || !priceData.success) throw new Error(priceData.message || 'Sales price list could not be loaded');
+      if (!stockResponse.ok || !stockData.success) throw new Error(stockData.message || 'Product inventory could not be loaded');
+
+      const prices = new Map((priceData.data || []).map((item) => [String(item.variantId), item]));
+      const inventoryRows = stockData.data || [];
+      const warehouseId = inventoryRows[0]?.warehouse?._id || inventoryRows[0]?.warehouse || null;
+      setSelectedWarehouseId(warehouseId);
+      const nextStock = {};
+      inventoryRows
+        .filter((item) => !warehouseId || String(item.warehouse?._id || item.warehouse) === String(warehouseId))
+        .forEach((item) => {
+          nextStock[String(item.variantId)] = Math.max(0, Number(item.availableQuantity ?? (Number(item.quantity || 0) - Number(item.reservedQuantity || 0))));
+        });
+      setStockMap(nextStock);
+
+      const enrichedProducts = (productData.data || []).map((product) => ({
+        ...product,
+        variants: (product.variants || []).map((variant) => {
+          const priced = prices.get(String(variant._id));
+          return {
+            ...variant,
+            salesPrice: Number(priced?.finalSellingPrice || 0),
+            mrp: Number(priced?.mrp || 0),
+            hasActivePrice: Boolean(priced && Number(priced.finalSellingPrice) >= 0),
+          };
+        }),
+      }));
+      setProducts(enrichedProducts);
+
+      // Drafts may contain yesterday's price/stock snapshot. Reconcile every
+      // draft line with the freshly loaded server catalogue before display.
+      setOrderItems((current) => {
+        const next = {};
+        Object.entries(current).forEach(([variantId, item]) => {
+          const product = enrichedProducts.find((entry) => entry.variants?.some((variant) => String(variant._id) === String(variantId)));
+          const variant = product?.variants?.find((entry) => String(entry._id) === String(variantId));
+          const available = Number(nextStock[String(variantId)] || 0);
+          if (!product || !variant?.hasActivePrice || available <= 0) return;
+          next[variantId] = {
+            ...item,
+            product: { _id: product._id, productName: product.productName },
+            variant: { ...item.variant, ...variant },
+            quantity: Math.min(Number(item.quantity || 0), available),
+            rate: variant.salesPrice,
+          };
+        });
+        return next;
       });
-      const data = await response.json();
-      if (response.ok && data.success) {
-        setProducts(data.data || []);
-      }
+      setCustomRates((current) => Object.fromEntries(Object.keys(current).map((variantId) => {
+        const product = enrichedProducts.find((entry) => entry.variants?.some((variant) => String(variant._id) === String(variantId)));
+        const variant = product?.variants?.find((entry) => String(entry._id) === String(variantId));
+        return [variantId, Number(variant?.salesPrice || 0)];
+      })));
     } catch (e) {
       console.warn('Failed to fetch products:', e.message);
+      Alert.alert('Products unavailable', e.message);
+      setProducts([]);
+      setStockMap({});
     } finally {
       setLoadingProducts(false);
     }
   };
 
-  const fallbackStock = (productId) => {
-    const product = products.find(p => p._id === productId);
-    if (product && product.variants) {
-      const newStockMap = {};
-      product.variants.forEach(v => {
-        newStockMap[v._id] = 1000; // Simulated fallback stock (e.g. 1000)
-      });
-      setStockMap(prev => ({ ...prev, ...newStockMap }));
-    }
-  };
-
   const fetchProductStock = async (productId) => {
-    if (loadingStockMap[productId]) return;
-    setLoadingStockMap(prev => ({ ...prev, [productId]: true }));
-    try {
-      const response = await fetch(`${apiUrl}/stock/product/${productId}`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const data = await response.json();
-      if (response.ok && data.success) {
-        const newStockMap = {};
-        (data.data || []).forEach(stockItem => {
-          newStockMap[stockItem.variantId] = stockItem.quantity;
-        });
-        setStockMap(prev => ({ ...prev, ...newStockMap }));
-      } else {
-        console.warn('API returned error for stock, using fallback.');
-        fallbackStock(productId);
-      }
-    } catch (e) {
-      console.warn('Failed to fetch stock for product:', productId, e.message);
-      fallbackStock(productId);
-    } finally {
-      setLoadingStockMap(prev => ({ ...prev, [productId]: false }));
-    }
+    // Inventory is loaded in one authoritative warehouse-scoped request with
+    // the price list. Never manufacture fallback stock on the device.
+    return productId;
   };
 
   // Draft saving & loading
@@ -232,7 +262,7 @@ export default function OrderScreen({ token, apiUrl, preSelectedParty, onBack })
   // Quantity updates
   const updateQuantity = (product, variant, newQty) => {
     const variantId = variant._id;
-    const availableStock = stockMap[variantId] !== undefined ? stockMap[variantId] : 9999;
+    const availableStock = stockMap[variantId] !== undefined ? stockMap[variantId] : 0;
 
     if (newQty > availableStock) {
       Alert.alert('Out of Stock', `Only ${availableStock} units available in stock.`);
@@ -427,7 +457,9 @@ export default function OrderScreen({ token, apiUrl, preSelectedParty, onBack })
 
       const payload = {
         partyId: selectedParty._id,
+        warehouseId: selectedWarehouseId,
         source: 'phone',
+        paymentType: paymentTerms === 'Cash on Delivery (COD)' ? 'cod' : paymentTerms === 'Advance' ? 'prepaid' : 'credit',
         items: payloadItems,
         remarks: `Payment Terms: ${paymentTerms}. Notes: ${orderNotes}`,
       };

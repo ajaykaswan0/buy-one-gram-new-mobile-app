@@ -25,6 +25,11 @@ export default function DashboardScreen({
   onNavigateToProducts,
   onNavigateToOrderList,
   onNavigateToOutstandingList,
+  onNavigateToRoutePlanner,
+  onNavigateToBeatPlan,
+  user,
+  isCso = false,
+  onNavigateToTeam,
 }) {
   const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(true);
@@ -81,6 +86,8 @@ export default function DashboardScreen({
 
   // Outstanding state
   const [totalOutstanding, setTotalOutstanding] = useState(0);
+  const [outstandingLimit, setOutstandingLimit] = useState(0);
+  const [teamSummary, setTeamSummary] = useState({ members: 0, orders: 0, sales: 0, outstanding: 0 });
 
   const fetchDashboardStats = async () => {
     if (!token) return;
@@ -162,6 +169,19 @@ export default function DashboardScreen({
       });
 
       // 5. Fetch Assigned Parties to compute Total Outstanding
+      const mePromise = fetch(`${apiUrl}/auth/me`, {
+        headers: { Authorization: `Bearer ${token}` },
+      }).then(async (res) => {
+        const data = await res.json();
+        if (res.ok && data.success && data.data) {
+          setOutstandingLimit(Number(data.data.outstandingLimit || 0));
+        } else {
+          setOutstandingLimit(Number(user?.outstandingLimit || 0));
+        }
+      }).catch(() => {
+        setOutstandingLimit(Number(user?.outstandingLimit || 0));
+      });
+
       const partiesPromise = fetch(`${apiUrl}/parties/my`, {
         headers: { Authorization: `Bearer ${token}` },
       }).then(async (res) => {
@@ -177,7 +197,24 @@ export default function DashboardScreen({
         setTotalOutstanding(0);
       });
 
-      await Promise.all([targetPromise, ordersPromise, visitsPromise, bannersPromise, partiesPromise]);
+      await Promise.all([targetPromise, ordersPromise, visitsPromise, bannersPromise, partiesPromise, mePromise]);
+      if (isCso) {
+        const usersResponse = await fetch(`${apiUrl}/users?limit=200`, { headers: { Authorization: `Bearer ${token}` } });
+        const usersResult = await usersResponse.json();
+        const myId = user?._id || user?.id;
+        const members = (Array.isArray(usersResult.data) ? usersResult.data : []).filter(member => String(member.reportsTo?._id || member.reportsTo) === String(myId));
+        const memberData = await Promise.all(members.map(async member => {
+          const [orderResponse, partyResponse] = await Promise.all([
+            fetch(`${apiUrl}/order?salesmanId=${member._id}&startDate=${start}&endDate=${end}&limit=200`, { headers: { Authorization: `Bearer ${token}` } }),
+            fetch(`${apiUrl}/parties?assignedSalesman=${member._id}&limit=500`, { headers: { Authorization: `Bearer ${token}` } }),
+          ]);
+          const [orderResult, partyResult] = await Promise.all([orderResponse.json(), partyResponse.json()]);
+          const orders = Array.isArray(orderResult.data) ? orderResult.data.filter(order => String(order.salesmanId?._id || order.salesmanId) === String(member._id)) : [];
+          const parties = Array.isArray(partyResult.data) ? partyResult.data.filter(party => String(party.assignedSalesman?._id || party.assignedSalesman) === String(member._id)) : [];
+          return { orders: orders.length, sales: orders.reduce((sum,order)=>sum+Number(order.netPayableAmount||order.grandTotal||0),0), outstanding: parties.reduce((sum,party)=>sum+Number(party.currentOutstanding||0),0) };
+        }));
+        setTeamSummary({ members: members.length, orders: memberData.reduce((s,x)=>s+x.orders,0), sales: memberData.reduce((s,x)=>s+x.sales,0), outstanding: memberData.reduce((s,x)=>s+x.outstanding,0) });
+      }
     } catch (e) {
       console.warn('Dashboard stats loader error:', e.message);
     } finally {
@@ -286,6 +323,31 @@ export default function DashboardScreen({
                 <Text style={styles.targetProgressDetails}>
                   ₹{achievedAmount.toLocaleString('en-IN')} achieved (₹{pipelineAmount.toLocaleString('en-IN')} pipeline) of ₹{targetAmount.toLocaleString('en-IN')}
                 </Text>
+
+                {outstandingLimit > 0 ? (
+                  <View style={styles.outstandingLimitWrap}>
+                    <View style={styles.targetHeadingRow}>
+                      <Text style={styles.targetSectionTitle}>Outstanding Limit</Text>
+                      <Text style={styles.targetPercentText}>
+                        {Math.min(100, Math.round((totalOutstanding / outstandingLimit) * 100 || 0))}%
+                      </Text>
+                    </View>
+                    <View style={styles.outstandingLimitBg}>
+                      <View
+                        style={[
+                          styles.outstandingLimitFill,
+                          {
+                            width: `${Math.min(100, (totalOutstanding / outstandingLimit) * 100 || 0)}%`,
+                            backgroundColor: totalOutstanding > outstandingLimit ? '#E53E3E' : '#DD6B20',
+                          },
+                        ]}
+                      />
+                    </View>
+                    <Text style={styles.targetProgressDetails}>
+                      ₹{totalOutstanding.toLocaleString('en-IN')} used of ₹{outstandingLimit.toLocaleString('en-IN')}
+                    </Text>
+                  </View>
+                ) : null}
               </View>
 
               <View style={styles.cardDivider} />
@@ -336,6 +398,17 @@ export default function DashboardScreen({
           )}
         </View>
 
+        {isCso && <View style={styles.actionsCard}>
+          <Text style={styles.actionsCardTitle}>Team Performance Today</Text>
+          <View style={styles.statsGrid}>
+            <View style={styles.gridCell}><Text style={styles.cellLabel}>Members</Text><Text style={styles.cellValue}>{teamSummary.members}</Text></View>
+            <View style={styles.gridCell}><Text style={styles.cellLabel}>Team Orders</Text><Text style={styles.cellValue}>{teamSummary.orders}</Text></View>
+            <View style={styles.gridCell}><Text style={styles.cellLabel}>Team Sales</Text><Text style={styles.cellValue}>₹{teamSummary.sales.toLocaleString('en-IN')}</Text></View>
+          </View>
+          <Text style={{color:'#C05621',fontWeight:'700',marginTop:12}}>Team Outstanding: ₹{teamSummary.outstanding.toLocaleString('en-IN')}</Text>
+          <TouchableOpacity style={{backgroundColor:'#00796B',padding:12,borderRadius:8,alignItems:'center',marginTop:12}} onPress={onNavigateToTeam}><Text style={{color:'#fff',fontWeight:'800'}}>Open My Team</Text></TouchableOpacity>
+        </View>}
+
         {/* Quick Actions Container Card */}
         <View style={styles.actionsCard}>
           <Text style={styles.actionsCardTitle}>Quick Actions</Text>
@@ -383,6 +456,18 @@ export default function DashboardScreen({
               </TouchableOpacity>
               <Text style={styles.actionLabel}>Price List</Text>
             </View>
+
+            {isCso ? <View style={styles.actionItem}>
+              <TouchableOpacity style={[styles.circleBtn, styles.outlineBtn]} onPress={onNavigateToBeatPlan}>
+                <Text style={styles.outlineIconText}>↝</Text>
+              </TouchableOpacity>
+              <Text style={styles.actionLabel}>My Beat Plan</Text>
+            </View> : <View style={styles.actionItem}>
+              <TouchableOpacity style={[styles.circleBtn, styles.outlineBtn]} onPress={onNavigateToRoutePlanner}>
+                <Text style={styles.outlineIconText}>⌖</Text>
+              </TouchableOpacity>
+              <Text style={styles.actionLabel}>Plan Route</Text>
+            </View>}
 
             {/* Order Action Item */}
             <View style={styles.actionItem}>
@@ -539,6 +624,21 @@ const styles = StyleSheet.create({
     fontSize: 11,
     color: '#4A5568',
     fontWeight: '600',
+  },
+  outstandingLimitWrap: {
+    marginTop: 14,
+  },
+  outstandingLimitBg: {
+    height: 8,
+    backgroundColor: '#FEEBC8',
+    borderRadius: 4,
+    width: '100%',
+    overflow: 'hidden',
+    marginBottom: 6,
+  },
+  outstandingLimitFill: {
+    height: '100%',
+    borderRadius: 4,
   },
 
   cardDivider: {

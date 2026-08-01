@@ -10,6 +10,7 @@ import {
   Platform,
   Image,
   BackHandler,
+  KeyboardAvoidingView,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Location from 'expo-location';
@@ -30,6 +31,14 @@ import OutstandingListScreen from './src/screens/OutstandingListScreen';
 import BeatPlanScreen from './src/screens/BeatPlanScreen';
 import PartyProfileScreen from './src/screens/PartyProfileScreen';
 import CreateCollectionScreen from './src/screens/CreateCollectionScreen';
+import DriverDashboardScreen from './src/screens/DriverDashboardScreen';
+import CrmDashboardScreen from './src/screens/CrmDashboardScreen';
+import CrmHomeScreen from './src/screens/CrmHomeScreen';
+import AssignedIssuesScreen from './src/screens/AssignedIssuesScreen';
+import PartyRoutePlannerScreen from './src/screens/PartyRoutePlannerScreen';
+import MyTeamScreen from './src/screens/MyTeamScreen';
+import RecoveryScreen from './src/screens/RecoveryScreen';
+import SalesPartnerDashboardScreen from './src/screens/SalesPartnerDashboardScreen';
 
 const LOCATION_TRACKING_TASK = 'LOCATION_TRACKING_TASK';
 
@@ -314,10 +323,10 @@ export default function App() {
 
   if (!token) {
     return (
-      <View style={styles.container}>
+      <KeyboardAvoidingView style={styles.container} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
         <StatusBar barStyle="dark-content" backgroundColor="#F7F9FC" />
         <LoginScreen onLoginSuccess={handleLoginSuccess} />
-      </View>
+      </KeyboardAvoidingView>
     );
   }
 
@@ -329,6 +338,15 @@ export default function App() {
         .substring(0, 2)
         .toUpperCase()
     : 'EE';
+  const normalizedRole = String(
+    user?.roleName ||
+    user?.role?.name ||
+    (typeof user?.role === 'string' ? user.role : '')
+  ).toLowerCase().replace(/[\s_-]/g, '');
+  const isDriver = normalizedRole === 'driver';
+  const isCrm = normalizedRole === 'crm' || normalizedRole === 'customerrelationshipmanager';
+  const isCso = normalizedRole === 'cso';
+  const isSalesPartner = normalizedRole === 'salespartner';
 
   return (
     <SafeAreaView style={styles.container}>
@@ -371,13 +389,52 @@ export default function App() {
       </View>
 
       {/* Render Main Content Screen */}
-      <View style={styles.contentBody}>
+      <KeyboardAvoidingView style={styles.contentBody} behavior={Platform.OS === 'ios' ? 'padding' : 'height'} keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 4}>
         {subScreen === 'attendance' ? (
           <AttendanceScreen
             token={token}
             apiUrl={apiUrl}
             onBack={() => setSubScreen(null)}
           />
+        ) : subScreen === 'crmParties' ? (
+          <CrmDashboardScreen
+            token={token}
+            apiUrl={apiUrl}
+            user={user}
+            onNavigateToPartyProfile={(partyId) => {
+              setPreviousSubScreen('crmParties');
+              setProfilePartyId(partyId);
+              setSubScreen('partyProfile');
+            }}
+            onNavigateToCollection={(party) => {
+              setPreviousSubScreen('crmParties');
+              setCollectionParty(party);
+              setSubScreen('collection');
+            }}
+            onNavigateToOrder={(party) => {
+              setPreviousSubScreen('crmParties');
+              setOrderParty(party);
+              setSubScreen('order');
+            }}
+          />
+        ) : subScreen === 'team' ? (
+          <MyTeamScreen
+            token={token}
+            apiUrl={apiUrl}
+            user={user}
+            onBack={() => setSubScreen(null)}
+            onNavigateToOrder={(party) => {
+              setPreviousSubScreen('team');
+              setOrderParty(party);
+              setSubScreen('order');
+            }}
+          />
+        ) : subScreen === 'issues' ? (
+          <AssignedIssuesScreen token={token} apiUrl={apiUrl} onBack={() => setSubScreen(null)} />
+        ) : subScreen === 'recovery' ? (
+          <RecoveryScreen token={token} apiUrl={apiUrl} onBack={() => setSubScreen(null)} />
+        ) : subScreen === 'routePlanner' ? (
+          <PartyRoutePlannerScreen token={token} apiUrl={apiUrl} onBack={() => setSubScreen(null)} />
         ) : subScreen === 'leave' ? (
           <LeaveScreen
             token={token}
@@ -427,11 +484,17 @@ export default function App() {
               setOrderParty(party);
               setSubScreen('order');
             }}
+            onNavigateToCollection={(party) => {
+              setPreviousSubScreen('partyProfile');
+              setCollectionParty(party);
+              setSubScreen('collection');
+            }}
           />
         ) : subScreen === 'order' ? (
           <OrderScreen
             token={token}
             apiUrl={apiUrl}
+            user={user}
             preSelectedParty={orderParty}
             onBack={() => {
               setSubScreen(previousSubScreen || null);
@@ -443,6 +506,7 @@ export default function App() {
           <ProductScreen
             token={token}
             apiUrl={apiUrl}
+            user={user}
             onBack={() => setSubScreen(null)}
           />
         ) : subScreen === 'orderList' ? (
@@ -470,22 +534,73 @@ export default function App() {
             }}
           />
         ) : activeTab === 'home' ? (
-          <DashboardScreen
-            token={token}
-            apiUrl={apiUrl}
-            activeLogId={activeLogId}
-            onNavigateToAttendance={() => setSubScreen('attendance')}
-            onNavigateToLeave={() => setSubScreen('leave')}
-            onNavigateToParty={() => setSubScreen('party')}
-            onNavigateToOrder={() => {
-              setPreviousSubScreen(null);
-              setOrderParty(null);
-              setSubScreen('order');
-            }}
-            onNavigateToProducts={() => setSubScreen('products')}
-            onNavigateToOrderList={() => setSubScreen('orderList')}
-            onNavigateToOutstandingList={() => setSubScreen('outstandingList')}
-          />
+          isDriver ? (
+            <DriverDashboardScreen
+              token={token}
+              apiUrl={apiUrl}
+              activeLogId={activeLogId}
+              onNavigateToAttendance={() => setSubScreen('attendance')}
+              onNavigateToLeave={() => setSubScreen('leave')}
+              onNavigateToProducts={() => setSubScreen('products')}
+            />
+          ) : isCrm ? (
+            <CrmHomeScreen
+              token={token}
+              apiUrl={apiUrl}
+              user={user}
+              activeLogId={activeLogId}
+              onNavigateToAttendance={() => setSubScreen('attendance')}
+              onNavigateToLeave={() => setSubScreen('leave')}
+              onNavigateToProducts={() => setSubScreen('products')}
+              onNavigateToOrder={() => {
+                setPreviousSubScreen(null);
+                setOrderParty(null);
+                setSubScreen('order');
+              }}
+              onNavigateToIssues={() => setSubScreen('issues')}
+              onNavigateToRecovery={() => setSubScreen('recovery')}
+              onNavigateToRoutePlanner={() => setSubScreen('routePlanner')}
+              onNavigateToParties={() => setSubScreen('crmParties')}
+            />
+          ) : isSalesPartner ? (
+            <SalesPartnerDashboardScreen
+              token={token}
+              apiUrl={apiUrl}
+              user={user}
+              onLogout={handleLogout}
+              onNavigateToParty={() => setSubScreen('party')}
+              onNavigateToOrder={() => {
+                setPreviousSubScreen(null);
+                setOrderParty(null);
+                setSubScreen('order');
+              }}
+              onNavigateToOrderList={() => setSubScreen('orderList')}
+              onNavigateToProducts={() => setSubScreen('products')}
+              onNavigateToRoutePlanner={() => setSubScreen('routePlanner')}
+            />
+          ) : (
+            <DashboardScreen
+              token={token}
+              apiUrl={apiUrl}
+              activeLogId={activeLogId}
+              onNavigateToAttendance={() => setSubScreen('attendance')}
+              onNavigateToLeave={() => setSubScreen('leave')}
+              onNavigateToParty={() => setSubScreen('party')}
+              onNavigateToOrder={() => {
+                setPreviousSubScreen(null);
+                setOrderParty(null);
+                setSubScreen('order');
+              }}
+              onNavigateToProducts={() => setSubScreen('products')}
+              onNavigateToOrderList={() => setSubScreen('orderList')}
+              onNavigateToOutstandingList={() => setSubScreen('outstandingList')}
+              onNavigateToRoutePlanner={() => setSubScreen('routePlanner')}
+              onNavigateToBeatPlan={() => { setActiveTab('beatPlan'); setSubScreen(null); }}
+              user={user}
+              isCso={isCso}
+              onNavigateToTeam={() => setSubScreen('team')}
+            />
+          )
         ) : activeTab === 'profile' ? (
           <ProfileScreen
             user={user}
@@ -494,16 +609,32 @@ export default function App() {
             onLogout={handleLogout}
           />
         ) : activeTab === 'history' ? (
+          isSalesPartner ? (
+            <OrderListScreen
+              token={token}
+              apiUrl={apiUrl}
+              onBack={() => { setActiveTab('home'); setSubScreen(null); }}
+            />
+          ) : (
           <VisitHistoryScreen
             token={token}
             apiUrl={apiUrl}
             user={user}
           />
+          )
         ) : activeTab === 'report' ? (
+          isSalesPartner ? (
+            <PartyRoutePlannerScreen
+              token={token}
+              apiUrl={apiUrl}
+              onBack={() => { setActiveTab('home'); setSubScreen(null); }}
+            />
+          ) : (
           <ReportScreen
             token={token}
             apiUrl={apiUrl}
           />
+          )
         ) : activeTab === 'beatPlan' ? (
           <BeatPlanScreen
             token={token}
@@ -523,7 +654,7 @@ export default function App() {
             </Text>
           </View>
         )}
-      </View>
+      </KeyboardAvoidingView>
 
       {/* Global Bottom Tab Bar (Image 1/2 style) */}
       <View style={styles.tabBar}>
@@ -532,16 +663,16 @@ export default function App() {
           style={styles.tabItem}
           onPress={() => { setActiveTab('report'); setSubScreen(null); }}
         >
-          <Text style={[styles.tabIcon, activeTab === 'report' && styles.activeTabColor]}>📊</Text>
-          <Text style={[styles.tabLabel, activeTab === 'report' && styles.activeTabColor]}>Report</Text>
+            <Text style={[styles.tabIcon, activeTab === 'report' && styles.activeTabColor]}>{isSalesPartner ? '🗺️' : '📊'}</Text>
+          <Text style={[styles.tabLabel, activeTab === 'report' && styles.activeTabColor]}>{isSalesPartner ? 'Route' : 'Report'}</Text>
         </TouchableOpacity>
 
         <TouchableOpacity
           style={styles.tabItem}
           onPress={() => { setActiveTab('history'); setSubScreen(null); }}
         >
-          <Text style={[styles.tabIcon, activeTab === 'history' && styles.activeTabColor]}>🕒</Text>
-          <Text style={[styles.tabLabel, activeTab === 'history' && styles.activeTabColor]}>History</Text>
+          <Text style={[styles.tabIcon, activeTab === 'history' && styles.activeTabColor]}>{isSalesPartner ? '📋' : '🕒'}</Text>
+          <Text style={[styles.tabLabel, activeTab === 'history' && styles.activeTabColor]}>{isSalesPartner ? 'Orders' : 'History'}</Text>
         </TouchableOpacity>
 
         {/* Middle Floating Home Button */}
