@@ -22,6 +22,8 @@ export default function StoreManagerDashboardScreen({
   onNavigateToAttendance,
   onNavigateToLeave,
   onNavigateToProfile,
+  onNavigateToProducts,
+  onNavigateToOrders,
 }) {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -357,6 +359,29 @@ export default function StoreManagerDashboardScreen({
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
       >
         {/* Metric Cards Row */}
+        <View style={styles.quickActionGrid}>
+          <TouchableOpacity style={styles.quickActionCard} onPress={onNavigateToAttendance}>
+            <Text style={styles.quickActionIcon}>🕒</Text>
+            <Text style={styles.quickActionTitle}>Attendance</Text>
+            <Text style={styles.quickActionSub}>Check in / check out</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.quickActionCard} onPress={onNavigateToLeave}>
+            <Text style={styles.quickActionIcon}>🌴</Text>
+            <Text style={styles.quickActionTitle}>Leave</Text>
+            <Text style={styles.quickActionSub}>Apply & view leave</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.quickActionCard} onPress={onNavigateToProducts}>
+            <Text style={styles.quickActionIcon}>📦</Text>
+            <Text style={styles.quickActionTitle}>Stock</Text>
+            <Text style={styles.quickActionSub}>Check product inventory</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.quickActionCard} onPress={onNavigateToOrders}>
+            <Text style={styles.quickActionIcon}>📋</Text>
+            <Text style={styles.quickActionTitle}>Orders</Text>
+            <Text style={styles.quickActionSub}>See warehouse orders</Text>
+          </TouchableOpacity>
+        </View>
+
         <View style={styles.metricsGrid}>
           <TouchableOpacity
             style={[styles.metricCard, activeTab === 'to_pack' && styles.metricCardActive]}
@@ -894,6 +919,35 @@ const styles = StyleSheet.create({
   },
   scrollContent: {
     padding: 16,
+  },
+  quickActionGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+    marginBottom: 16,
+  },
+  quickActionCard: {
+    width: '48%',
+    backgroundColor: '#FFFFFF',
+    borderRadius: 12,
+    padding: 14,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+  },
+  quickActionIcon: {
+    fontSize: 22,
+    marginBottom: 8,
+  },
+  quickActionTitle: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: '#1A202C',
+  },
+  quickActionSub: {
+    fontSize: 11,
+    color: '#718096',
+    marginTop: 4,
+    fontWeight: '600',
   },
   metricsGrid: {
     flexDirection: 'row',

@@ -166,12 +166,13 @@ export default function ProfileScreen({ user, token, apiUrl, onLogout }) {
           )}
         </View>
 
-        {/* Account Logout Action Card */}
-        <View style={styles.actionsCard}>
-          <TouchableOpacity style={styles.logoutBtn} onPress={onLogout}>
-            <Text style={styles.logoutBtnText}>Log Out Account</Text>
-          </TouchableOpacity>
-        </View>
+        {onLogout ? (
+          <View style={styles.actionsCard}>
+            <TouchableOpacity style={styles.logoutBtn} onPress={onLogout}>
+              <Text style={styles.logoutBtnText}>Log Out Account</Text>
+            </TouchableOpacity>
+          </View>
+        ) : null}
       </ScrollView>
 
       {/* Salary Slip Breakdown Detail Modal */}

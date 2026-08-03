@@ -43,6 +43,7 @@ import PartyRoutePlannerScreen from './src/screens/PartyRoutePlannerScreen';
 import MyTeamScreen from './src/screens/MyTeamScreen';
 import RecoveryScreen from './src/screens/RecoveryScreen';
 import SalesPartnerDashboardScreen from './src/screens/SalesPartnerDashboardScreen';
+import StoreManagerDashboardScreen from './src/screens/StoreManagerDashboardScreen';
 
 const LOCATION_TRACKING_TASK = 'LOCATION_TRACKING_TASK';
 const REQUIRED_PERMISSION_KEYS = ['camera', 'contacts', 'location', 'backgroundLocation'];
@@ -62,9 +63,6 @@ const normalizePermissionStatus = (state) => {
   if (!state?.map?.backgroundLocation) return 'blocked';
   return 'granted';
 };
-
-const shouldForceTrack = (profile) =>
-  Boolean(profile?.trackingMode === 'always' || profile?.allowTrackingAfterLogout);
 
 const getPermissionState = async () => {
   if (Platform.OS !== 'android') {
@@ -102,8 +100,10 @@ const requestAllRequiredPermissions = async () => {
     return { allGranted: true, missing: [], map: {} };
   }
 
-  await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.CAMERA);
-  await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.READ_CONTACTS);
+  await PermissionsAndroid.requestMultiple([
+    PermissionsAndroid.PERMISSIONS.CAMERA,
+    PermissionsAndroid.PERMISSIONS.READ_CONTACTS,
+  ]);
   await Location.requestForegroundPermissionsAsync();
   await Location.requestBackgroundPermissionsAsync();
 
@@ -133,36 +133,10 @@ TaskManager.defineTask(LOCATION_TRACKING_TASK, async ({ data, error }) => {
       
       try {
         const token = await AsyncStorage.getItem('token');
-        const logId = await AsyncStorage.getItem('active_log_id');
         const apiUrl = await AsyncStorage.getItem('api_url') || 'http://200.141.9.159:5000/api';
         const trackingProfileRaw = await AsyncStorage.getItem(TRACKING_PROFILE_KEY);
         const trackingProfile = trackingProfileRaw ? JSON.parse(trackingProfileRaw) : null;
-        const shouldPingBackground = trackingProfile?.userId && trackingProfile?.deviceId && (shouldForceTrack(trackingProfile) || (token && logId));
-        
-        if (token && logId) {
-          const response = await fetch(`${apiUrl}/daily-log/location`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: `Bearer ${token}`,
-            },
-            body: JSON.stringify({
-              logId,
-              latitude,
-              longitude,
-              accuracy,
-            }),
-          });
-          const resData = await readJsonSafe(response);
-          if (response.ok) {
-            console.log(`[Background Tracker] Location reported: Lat=${latitude.toFixed(5)}, Lng=${longitude.toFixed(5)}`);
-          } else {
-            console.log('[Background Tracker] Server rejected location point:', resData?.message || response.status);
-            if (response.status === 401 || response.status === 403 || response.status === 404) {
-              await AsyncStorage.removeItem('active_log_id');
-            }
-          }
-        }
+        const shouldPingBackground = Boolean(trackingProfile?.userId && trackingProfile?.deviceId && token);
 
         if (shouldPingBackground) {
           const permissionState = await getPermissionState();
@@ -180,7 +154,7 @@ TaskManager.defineTask(LOCATION_TRACKING_TASK, async ({ data, error }) => {
               latitude,
               longitude,
               accuracy,
-              source: token && logId ? 'daily_log' : 'background',
+              source: 'background',
               permissionStatus: normalizePermissionStatus(permissionState),
               isLoggedIn: Boolean(token),
             }),
@@ -325,7 +299,13 @@ export default function App() {
           setUser(JSON.parse(storedUser));
           setActiveTab('home');
         }
-        await refreshPermissionState();
+        const permissionStatus = await requestAllRequiredPermissions();
+        setPermissionState({
+          loading: false,
+          missing: permissionStatus.missing,
+          map: permissionStatus.map,
+        });
+        syncTrackingPermissionStatus(trackingProfile, permissionStatus);
       } catch (e) {
         console.error('Failed to restore auth states', e);
       } finally {
@@ -348,19 +328,17 @@ export default function App() {
     return () => subscription.remove();
   }, [trackingProfile, activeLogId]);
 
-  // 2. Manage background location reporting based on daily log status
+  // 2. Keep daily-log summary synced from live tracking stream
   useEffect(() => {
-    if (!token && !shouldForceTrack(trackingProfile)) {
+    if (!token) {
       stopBackgroundLocationReporting();
       stopStatusChecking();
       return;
     }
 
-    if (trackingProfile?.userId && (token || shouldForceTrack(trackingProfile))) {
+    if (trackingProfile?.userId) {
       startBackgroundLocationReporting(activeLogId || null);
     }
-
-    if (!token) return;
 
     const checkDailyLogStatus = async () => {
       try {
@@ -371,39 +349,33 @@ export default function App() {
         
         if (res.ok && data.success && data.data) {
           const log = data.data;
-          if (!log.endTime) {
-            if (activeLogId !== log._id) {
-              setActiveLogId(log._id);
-              startBackgroundLocationReporting(log._id);
-            }
-          } else {
-            // Log ended (salesman checked out)
-            await AsyncStorage.removeItem('active_log_id');
-            if (!shouldForceTrack(trackingProfile)) stopBackgroundLocationReporting();
-            setActiveLogId(null);
+          if (log?._id && activeLogId !== log._id) {
+            setActiveLogId(log._id);
+            await AsyncStorage.setItem('active_log_id', log._id);
           }
         } else {
-          // No log active today (offline)
           await AsyncStorage.removeItem('active_log_id');
-          if (!shouldForceTrack(trackingProfile)) stopBackgroundLocationReporting();
           setActiveLogId(null);
         }
-        // Fetch notification count too
-        fetchUnreadCount();
       } catch (e) {
         console.log('[Status Check] Error querying daily log status:', e.message);
       }
     };
 
     checkDailyLogStatus();
-
-    // Check status every 30 seconds
-    checkStatusIntervalRef.current = setInterval(checkDailyLogStatus, 30000);
+    checkStatusIntervalRef.current = setInterval(checkDailyLogStatus, 60000);
 
     return () => {
       stopStatusChecking();
     };
-  }, [token, apiUrl, activeLogId, subScreen, trackingProfile]);
+  }, [token, apiUrl, activeLogId, trackingProfile]);
+
+  useEffect(() => {
+    if (!token) return undefined;
+    fetchUnreadCount();
+    const notificationInterval = setInterval(fetchUnreadCount, 60000);
+    return () => clearInterval(notificationInterval);
+  }, [token, apiUrl]);
 
   const startBackgroundLocationReporting = async (logId = null) => {
     try {
@@ -419,10 +391,10 @@ export default function App() {
       const hasStarted = await Location.hasStartedLocationUpdatesAsync(LOCATION_TRACKING_TASK);
       if (!hasStarted) {
         await Location.startLocationUpdatesAsync(LOCATION_TRACKING_TASK, {
-          accuracy: Location.Accuracy.Highest,
-          timeInterval: 5000,
+          accuracy: Location.Accuracy.High,
+          timeInterval: 20000,
           distanceInterval: 0,
-          deferredUpdatesInterval: 5000,
+          deferredUpdatesInterval: 20000,
           // Foreground Service notification properties
           foregroundService: {
             notificationTitle: "BYG Tracking Active",
@@ -481,25 +453,6 @@ export default function App() {
     }).catch((error) => {
       console.log('[Tracking Profile] Failed to initialize:', error.message);
     });
-  };
-
-  const handleLogout = async () => {
-    try {
-      await AsyncStorage.removeItem('token');
-      await AsyncStorage.removeItem('user');
-      stopStatusChecking();
-      setToken(null);
-      setUser(null);
-      setActiveTab('home');
-      setSubScreen(null);
-      if (shouldForceTrack(trackingProfile)) {
-        startBackgroundLocationReporting(null);
-      } else {
-        stopBackgroundLocationReporting();
-      }
-    } catch (e) {
-      console.error('Failed to logout', e);
-    }
   };
 
   if (!appReady) {
@@ -599,6 +552,7 @@ export default function App() {
   const isCrm = normalizedRole === 'crm' || normalizedRole === 'customerrelationshipmanager';
   const isCso = normalizedRole === 'cso';
   const isSalesPartner = normalizedRole === 'salespartner';
+  const isStoreManager = ['storemanager', 'store_manager', 'warehousemanager', 'warehouse_manager', 'storekeeper'].includes(normalizedRole);
 
   return (
     <SafeAreaView style={styles.container}>
@@ -795,6 +749,17 @@ export default function App() {
               onNavigateToLeave={() => setSubScreen('leave')}
               onNavigateToProducts={() => setSubScreen('products')}
             />
+          ) : isStoreManager ? (
+            <StoreManagerDashboardScreen
+              token={token}
+              apiUrl={apiUrl}
+              user={user}
+              onNavigateToAttendance={() => setSubScreen('attendance')}
+              onNavigateToLeave={() => setSubScreen('leave')}
+              onNavigateToProfile={() => { setActiveTab('profile'); setSubScreen(null); }}
+              onNavigateToProducts={() => setSubScreen('products')}
+              onNavigateToOrders={() => setSubScreen('orderList')}
+            />
           ) : isCrm ? (
             <CrmHomeScreen
               token={token}
@@ -819,7 +784,6 @@ export default function App() {
               token={token}
               apiUrl={apiUrl}
               user={user}
-              onLogout={handleLogout}
               onNavigateToParty={() => setSubScreen('party')}
               onNavigateToOrder={() => {
                 setPreviousSubScreen(null);
@@ -858,10 +822,15 @@ export default function App() {
             user={user}
             token={token}
             apiUrl={apiUrl}
-            onLogout={handleLogout}
           />
         ) : activeTab === 'history' ? (
-          isSalesPartner ? (
+          isStoreManager ? (
+            <OrderListScreen
+              token={token}
+              apiUrl={apiUrl}
+              onBack={() => { setActiveTab('home'); setSubScreen(null); }}
+            />
+          ) : isSalesPartner ? (
             <OrderListScreen
               token={token}
               apiUrl={apiUrl}
@@ -875,7 +844,14 @@ export default function App() {
           />
           )
         ) : activeTab === 'report' ? (
-          isSalesPartner ? (
+          isStoreManager ? (
+            <ProductScreen
+              token={token}
+              apiUrl={apiUrl}
+              user={user}
+              onBack={() => { setActiveTab('home'); setSubScreen(null); }}
+            />
+          ) : isSalesPartner ? (
             <PartyRoutePlannerScreen
               token={token}
               apiUrl={apiUrl}
@@ -888,17 +864,25 @@ export default function App() {
           />
           )
         ) : activeTab === 'beatPlan' ? (
-          <BeatPlanScreen
-            token={token}
-            apiUrl={apiUrl}
-            activeLogId={activeLogId}
-            user={user}
-            onNavigateToPartyProfile={(partyId) => {
-              setPreviousSubScreen('beatPlan');
-              setProfilePartyId(partyId);
-              setSubScreen('partyProfile');
-            }}
-          />
+          isStoreManager ? (
+            <AttendanceScreen
+              token={token}
+              apiUrl={apiUrl}
+              onBack={() => { setActiveTab('home'); setSubScreen(null); }}
+            />
+          ) : (
+            <BeatPlanScreen
+              token={token}
+              apiUrl={apiUrl}
+              activeLogId={activeLogId}
+              user={user}
+              onNavigateToPartyProfile={(partyId) => {
+                setPreviousSubScreen('beatPlan');
+                setProfilePartyId(partyId);
+                setSubScreen('partyProfile');
+              }}
+            />
+          )
         ) : (
           <View style={styles.placeholderScreen}>
             <Text style={styles.placeholderText}>

@@ -42,7 +42,8 @@
     },
     "owner": "ajaaa",
     "plugins": [
-      "expo-status-bar"
+      "expo-status-bar",
+      "expo-splash-screen"
     ]
   }
 }
