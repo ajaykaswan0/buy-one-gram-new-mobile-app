@@ -12,7 +12,8 @@ import {
   Alert,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import * as Location from 'expo-location';
+import Geolocation from '@react-native-community/geolocation';
+import { PermissionsAndroid, Platform } from 'react-native';
 import { launchCamera } from 'react-native-image-picker';
 import PartyProfileScreen from './PartyProfileScreen';
 
@@ -154,20 +155,25 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
     // Auto-fetch GPS coordinates
     setFetchingLocation(true);
     try {
-      const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== 'granted') {
-        setError('Location permission denied. Cannot register party without GPS coordinates.');
-        setFetchingLocation(false);
-        return;
+      if (Platform.OS === 'android') {
+        await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION);
       }
-
-      const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
-      setLat(loc.coords.latitude);
-      setLng(loc.coords.longitude);
+      Geolocation.getCurrentPosition(
+        (position) => {
+          setLat(position.coords.latitude);
+          setLng(position.coords.longitude);
+          setFetchingLocation(false);
+        },
+        (err) => {
+          console.warn('GPS fetch failed:', err.message);
+          setError('Could not auto-fetch location. Verify GPS is enabled.');
+          setFetchingLocation(false);
+        },
+        { enableHighAccuracy: false, timeout: 15000, maximumAge: 10000 }
+      );
     } catch (e) {
       console.warn('GPS fetch failed:', e.message);
       setError('Could not auto-fetch location. Verify GPS is enabled.');
-    } finally {
       setFetchingLocation(false);
     }
   };

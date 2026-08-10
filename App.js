@@ -17,8 +17,8 @@ import {
   Alert,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import * as Location from 'expo-location';
-import * as TaskManager from 'expo-task-manager';
+import messaging from '@react-native-firebase/messaging';
+import Geolocation from '@react-native-community/geolocation';
 import LoginScreen from './src/screens/LoginScreen';
 import DashboardScreen from './src/screens/DashboardScreen';
 import AttendanceScreen from './src/screens/AttendanceScreen';
@@ -49,6 +49,9 @@ const LOCATION_TRACKING_TASK = 'LOCATION_TRACKING_TASK';
 const REQUIRED_PERMISSION_KEYS = ['camera', 'contacts', 'location', 'backgroundLocation'];
 const TRACKING_PROFILE_KEY = 'tracking_profile';
 const DEVICE_ID_KEY = 'tracking_device_id';
+const PUSH_TOKEN_KEY = 'push_token';
+const AUTH_STATUS_AUTHORIZED = 1;
+const AUTH_STATUS_PROVISIONAL = 2;
 
 const readJsonSafe = async (response) => {
   try {
@@ -76,15 +79,15 @@ const getPermissionState = async () => {
   const [camera, contacts, foregroundLocation, backgroundLocation] = await Promise.all([
     PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.CAMERA),
     PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.READ_CONTACTS),
-    Location.getForegroundPermissionsAsync(),
-    Location.getBackgroundPermissionsAsync(),
+    PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION),
+    Platform.Version >= 29 ? PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.ACCESS_BACKGROUND_LOCATION) : Promise.resolve(true),
   ]);
 
   const map = {
     camera,
     contacts,
-    location: foregroundLocation.status === 'granted',
-    backgroundLocation: backgroundLocation.status === 'granted',
+    location: Boolean(foregroundLocation),
+    backgroundLocation: Boolean(backgroundLocation),
   };
 
   const missing = REQUIRED_PERMISSION_KEYS.filter((key) => !map[key]);
@@ -100,12 +103,35 @@ const requestAllRequiredPermissions = async () => {
     return { allGranted: true, missing: [], map: {} };
   }
 
-  await PermissionsAndroid.requestMultiple([
+  // 1. Request foreground permissions first (Camera, Contacts, Location)
+  const foregroundPermissions = [
     PermissionsAndroid.PERMISSIONS.CAMERA,
     PermissionsAndroid.PERMISSIONS.READ_CONTACTS,
-  ]);
-  await Location.requestForegroundPermissionsAsync();
-  await Location.requestBackgroundPermissionsAsync();
+    PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+  ];
+
+  await PermissionsAndroid.requestMultiple(foregroundPermissions);
+
+  // 2. Separately request Background Location ONLY if Fine Location is granted (Android 10+ requirement)
+  const isFineLocationGranted = await PermissionsAndroid.check(
+    PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION
+  );
+
+  if (isFineLocationGranted && Platform.Version >= 29) {
+    try {
+      await PermissionsAndroid.request(
+        PermissionsAndroid.PERMISSIONS.ACCESS_BACKGROUND_LOCATION,
+        {
+          title: 'Location Tracking Permission',
+          message: 'SFA app collects location data to track salesman routes, attendance, and delivery updates even when the app is closed.',
+          buttonPositive: 'Allow all the time',
+          buttonNegative: 'Cancel',
+        }
+      );
+    } catch (e) {
+      console.log('Background location request error:', e.message);
+    }
+  }
 
   return getPermissionState();
 };
@@ -119,53 +145,117 @@ const getOrCreateDeviceId = async () => {
   return deviceId;
 };
 
-// Define the global background location updates task
-TaskManager.defineTask(LOCATION_TRACKING_TASK, async ({ data, error }) => {
-  if (error) {
-    console.log('[Background Tracker] Task error:', error);
-    return;
+const getMessagingInstance = () => {
+  try {
+    if (typeof messaging !== 'function') return null;
+    return messaging();
+  } catch (e) {
+    console.log('[FCM] Messaging instance not available:', e.message);
+    return null;
   }
-  if (data) {
-    const { locations } = data;
-    if (locations && locations.length > 0) {
-      const location = locations[0];
-      const { latitude, longitude, accuracy } = location.coords;
-      
-      try {
-        const token = await AsyncStorage.getItem('token');
-        const apiUrl = await AsyncStorage.getItem('api_url') || 'http://200.141.9.159:5000/api';
-        const trackingProfileRaw = await AsyncStorage.getItem(TRACKING_PROFILE_KEY);
-        const trackingProfile = trackingProfileRaw ? JSON.parse(trackingProfileRaw) : null;
-        const shouldPingBackground = Boolean(trackingProfile?.userId && trackingProfile?.deviceId && token);
+};
 
-        if (shouldPingBackground) {
-          const permissionState = await getPermissionState();
-          await fetch(`${apiUrl}/device-tracking/ping`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              userId: trackingProfile.userId,
-              userName: trackingProfile.userName,
-              userMobile: trackingProfile.userMobile,
-              deviceId: trackingProfile.deviceId,
-              deviceLabel: trackingProfile.deviceLabel,
-              latitude,
-              longitude,
-              accuracy,
-              source: 'background',
-              permissionStatus: normalizePermissionStatus(permissionState),
-              isLoggedIn: Boolean(token),
-            }),
-          });
-        }
-      } catch (e) {
-        console.log('[Background Tracker] Storage read/reporting error:', e.message);
-      }
-    }
+const requestNotificationPermission = async () => {
+  if (Platform.OS === 'android' && Platform.Version >= 33) {
+    const granted = await PermissionsAndroid.request(
+      PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS
+    );
+    return granted === PermissionsAndroid.RESULTS.GRANTED;
   }
-});
+
+  const messagingInstance = getMessagingInstance();
+  if (!messagingInstance || typeof messagingInstance.requestPermission !== 'function') {
+    return Platform.OS === 'android';
+  }
+
+  const status = await messagingInstance.requestPermission();
+  return (
+    status === AUTH_STATUS_AUTHORIZED ||
+    status === AUTH_STATUS_PROVISIONAL
+  );
+};
+
+const registerFcmTokenWithBackend = async ({ authToken, apiUrl }) => {
+  if (!authToken || !apiUrl) return;
+  try {
+    const permissionGranted = await requestNotificationPermission();
+    if (!permissionGranted) return;
+
+    const messagingInstance = getMessagingInstance();
+    if (!messagingInstance || typeof messagingInstance.getToken !== 'function') {
+      console.log('[FCM] Messaging module is not ready on this build');
+      return;
+    }
+
+    if (typeof messagingInstance.registerDeviceForRemoteMessages === 'function' && Platform.OS !== 'android') {
+      await messagingInstance.registerDeviceForRemoteMessages();
+    }
+
+    const fcmToken = await messagingInstance.getToken();
+    const cleanToken = String(fcmToken || '').trim();
+    if (!cleanToken) return;
+
+    const savedToken = await AsyncStorage.getItem(PUSH_TOKEN_KEY);
+    if (savedToken === cleanToken) return;
+
+    const response = await fetch(`${apiUrl}/auth/push-token`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${authToken}`,
+      },
+      body: JSON.stringify({ pushToken: cleanToken }),
+    });
+
+    if (!response.ok) {
+      const error = await readJsonSafe(response);
+      throw new Error(error?.message || 'Failed to register push token');
+    }
+
+    await AsyncStorage.setItem(PUSH_TOKEN_KEY, cleanToken);
+  } catch (error) {
+    console.log('[FCM] Token registration failed:', error.message);
+  }
+};
+
+// Define the global background location updates task safely
+try {
+  if (TaskManager && typeof TaskManager.defineTask === 'function') {
+    TaskManager.defineTask(LOCATION_TRACKING_TASK, async ({ data, error }) => {
+      if (error) return;
+      if (data && data.locations && data.locations.length > 0) {
+        const location = data.locations[0];
+        const { latitude, longitude, accuracy } = location.coords;
+        try {
+          const token = await AsyncStorage.getItem('token');
+          const apiUrl = await AsyncStorage.getItem('api_url') || 'http://200.141.9.159:5000/api';
+          const trackingProfileRaw = await AsyncStorage.getItem(TRACKING_PROFILE_KEY);
+          const trackingProfile = trackingProfileRaw ? JSON.parse(trackingProfileRaw) : null;
+          if (trackingProfile?.userId && trackingProfile?.deviceId && token) {
+            const permissionState = await getPermissionState();
+            await fetch(`${apiUrl}/device-tracking/ping`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                userId: trackingProfile.userId,
+                userName: trackingProfile.userName,
+                userMobile: trackingProfile.userMobile,
+                deviceId: trackingProfile.deviceId,
+                deviceLabel: trackingProfile.deviceLabel,
+                latitude,
+                longitude,
+                accuracy,
+                source: 'background',
+                permissionStatus: normalizePermissionStatus(permissionState),
+                isLoggedIn: Boolean(token),
+              }),
+            });
+          }
+        } catch (e) {}
+      }
+    });
+  }
+} catch (e) {}
 
 export default function App() {
   const [appReady, setAppReady] = useState(false);
@@ -298,6 +388,68 @@ export default function App() {
           setToken(storedToken);
           setUser(JSON.parse(storedUser));
           setActiveTab('home');
+          registerFcmTokenWithBackend({
+            authToken: storedToken,
+            apiUrl: storedApiUrl || apiUrl,
+          }).catch(() => {});
+        }
+        const permissionStatus = await requestAllRequiredPermissions();
+        setPermissionState({
+          loading: false,
+          missing: permissionStatus.missing,
+          map: permissionStatus.map,
+        });
+        syncTrackingPermissionStatus(trackingProfile, permissionStatus);
+      } catch (e) {
+        console.error('Failed to restore auth states', e);
+      } finally {
+        setAppReady(true);
+      }
+    };
+
+    initializeApp();
+  }, []);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (nextState) => {
+      if (nextState === 'active') {
+        refreshPermissionState();
+        if (trackingProfile?.userId) {
+          startBackgroundLocationReporting(activeLogId || null);
+        }
+      }
+    });
+    return () => subscription.remove();
+  }, [trackingProfile, activeLogId]);
+
+  // 2. Keep daily-log summary synced from live tracking stream
+  useEffect(() => {
+    if (!token) {
+      stopBackgroundLocationReporting();
+      stopStatusChecking();
+      return;
+    }
+
+    if (trackingProfile?.userId) {
+      startBackgroundLocationReporting(activeLogId || null);
+    }
+
+    const checkDailyLogStatus = async () => {
+      try {
+        const res = await fetch(`${apiUrl}/daily-log/my/today`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const data = await res.json();
+        
+        if (res.ok && data.success && data.data) {
+          const log = data.data;
+          if (log?._id && activeLogId !== log._id) {
+            setActiveLogId(log._id);
+            await AsyncStorage.setItem('active_log_id', log._id);
+          }
+        } else {
+          await AsyncStorage.removeItem('active_log_id');
+          setActiveLogId(null);
         }
         const permissionStatus = await requestAllRequiredPermissions();
         setPermissionState({
@@ -370,55 +522,56 @@ export default function App() {
     };
   }, [token, apiUrl, activeLogId, trackingProfile]);
 
-  useEffect(() => {
-    if (!token) return undefined;
-    fetchUnreadCount();
-    const notificationInterval = setInterval(fetchUnreadCount, 60000);
-    return () => clearInterval(notificationInterval);
-  }, [token, apiUrl]);
-
   const startBackgroundLocationReporting = async (logId = null) => {
     try {
       if (logId) await AsyncStorage.setItem('active_log_id', logId);
 
       const permissionCheck = await getPermissionState();
-      if (!permissionCheck.map?.location || !permissionCheck.map?.backgroundLocation) {
+      if (!permissionCheck.map?.location) {
         setPermissionState((current) => ({ ...current, loading: false, missing: permissionCheck.missing, map: permissionCheck.map }));
-        console.log('[Background Tracker] Required location permissions are missing');
         return;
       }
 
-      const hasStarted = await Location.hasStartedLocationUpdatesAsync(LOCATION_TRACKING_TASK);
-      if (!hasStarted) {
-        await Location.startLocationUpdatesAsync(LOCATION_TRACKING_TASK, {
-          accuracy: Location.Accuracy.High,
-          timeInterval: 20000,
-          distanceInterval: 0,
-          deferredUpdatesInterval: 20000,
-          // Foreground Service notification properties
-          foregroundService: {
-            notificationTitle: "BYG Tracking Active",
-            notificationBody: "Reporting your location in the background.",
-            notificationColor: "#00796B",
-          },
-        });
-        console.log('[Background Tracker] Native Android Background Service successfully started.');
-      }
+      Geolocation.getCurrentPosition(
+        async (position) => {
+          const { latitude, longitude, accuracy } = position.coords;
+          const storedToken = await AsyncStorage.getItem('token');
+          const storedApiUrl = await AsyncStorage.getItem('api_url') || 'http://200.141.9.159:5000/api';
+          const trackingProfileRaw = await AsyncStorage.getItem(TRACKING_PROFILE_KEY);
+          const trackingProfile = trackingProfileRaw ? JSON.parse(trackingProfileRaw) : null;
+          if (trackingProfile?.userId && trackingProfile?.deviceId && storedToken) {
+            fetch(`${storedApiUrl}/device-tracking/ping`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                userId: trackingProfile.userId,
+                userName: trackingProfile.userName,
+                userMobile: trackingProfile.userMobile,
+                deviceId: trackingProfile.deviceId,
+                deviceLabel: trackingProfile.deviceLabel,
+                latitude,
+                longitude,
+                accuracy,
+                source: 'foreground',
+                permissionStatus: normalizePermissionStatus(permissionCheck),
+                isLoggedIn: Boolean(storedToken),
+              }),
+            }).catch(() => {});
+          }
+        },
+        () => {},
+        { enableHighAccuracy: false, timeout: 15000, maximumAge: 10000 }
+      );
     } catch (e) {
-      console.log('[Background Tracker] Error starting location updates:', e.message);
+      console.log('[Location Tracker] Error starting location updates:', e.message);
     }
   };
 
   const stopBackgroundLocationReporting = async () => {
     try {
       await AsyncStorage.removeItem('active_log_id');
-      const hasStarted = await Location.hasStartedLocationUpdatesAsync(LOCATION_TRACKING_TASK);
-      if (hasStarted) {
-        await Location.stopLocationUpdatesAsync(LOCATION_TRACKING_TASK);
-        console.log('[Background Tracker] Native Android Background Service stopped.');
-      }
     } catch (e) {
-      console.log('[Background Tracker] Error stopping location updates:', e.message);
+      console.log('[Location Tracker] Error stopping location updates:', e.message);
     }
   };
 
@@ -435,6 +588,10 @@ export default function App() {
     setApiUrl(currentUrl);
     setActiveTab('home');
     setSubScreen(null);
+    registerFcmTokenWithBackend({
+      authToken: newToken,
+      apiUrl: currentUrl,
+    }).catch(() => {});
     getOrCreateDeviceId().then(async (deviceId) => {
       const nextTrackingProfile = {
         userId: newUser?.id || newUser?._id,
@@ -454,6 +611,50 @@ export default function App() {
       console.log('[Tracking Profile] Failed to initialize:', error.message);
     });
   };
+
+  useEffect(() => {
+    if (!token || !apiUrl) return undefined;
+
+    const messagingInstance = typeof messaging === 'function' ? messaging() : null;
+    if (!messagingInstance) return undefined;
+
+    const unsubscribeTokenRefresh =
+      typeof messagingInstance.onTokenRefresh === 'function'
+        ? messagingInstance.onTokenRefresh((nextToken) => {
+      fetch(`${apiUrl}/auth/push-token`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ pushToken: String(nextToken || '').trim() }),
+      })
+        .then((response) => {
+          if (!response.ok) {
+            return readJsonSafe(response).then((data) => {
+              throw new Error(data?.message || 'Failed to refresh push token');
+            });
+          }
+          return AsyncStorage.setItem(PUSH_TOKEN_KEY, String(nextToken || '').trim());
+        })
+        .catch((error) => {
+          console.log('[FCM] Token refresh sync failed:', error.message);
+        });
+    })
+        : () => {};
+
+    const unsubscribeForeground =
+      typeof messagingInstance.onMessage === 'function'
+        ? messagingInstance.onMessage(async () => {
+            fetchUnreadCount();
+          })
+        : () => {};
+
+    return () => {
+      unsubscribeTokenRefresh();
+      unsubscribeForeground();
+    };
+  }, [token, apiUrl]);
 
   if (!appReady) {
     return (
@@ -548,7 +749,7 @@ export default function App() {
     user?.role?.name ||
     (typeof user?.role === 'string' ? user.role : '')
   ).toLowerCase().replace(/[\s_-]/g, '');
-  const isDriver = normalizedRole === 'driver';
+  const isDriver = normalizedRole === 'driver' || normalizedRole === 'deliverymanager';
   const isCrm = normalizedRole === 'crm' || normalizedRole === 'customerrelationshipmanager';
   const isCso = normalizedRole === 'cso';
   const isSalesPartner = normalizedRole === 'salespartner';

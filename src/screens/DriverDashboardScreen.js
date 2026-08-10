@@ -25,7 +25,6 @@ export default function DriverDashboardScreen({
   onNavigateToProducts,
 }) {
   const [activeRoute, setActiveRoute] = useState(null);
-  const [routesHistory, setRoutesHistory] = useState([]);
   const [deliveries, setDeliveries] = useState([]);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('route'); // 'route' | 'history'
@@ -46,11 +45,23 @@ export default function DriverDashboardScreen({
   // Modal states for failure reason
   const [failureModalVisible, setFailureModalVisible] = useState(false);
   const [failureReason, setFailureReason] = useState('');
+  const [failureProof, setFailureProof] = useState(null);
   const [submittingFailure, setSubmittingFailure] = useState(false);
   const [partialModalVisible, setPartialModalVisible] = useState(false);
   const [partialRemarks, setPartialRemarks] = useState('');
   const [partialProof, setPartialProof] = useState(null);
   const [submittingPartial, setSubmittingPartial] = useState(false);
+  const [historyOrderModalVisible, setHistoryOrderModalVisible] = useState(false);
+  const [historyOrderDetail, setHistoryOrderDetail] = useState(null);
+  const [historyOrderLoading, setHistoryOrderLoading] = useState(false);
+  const getLocalDateKey = (value) => {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return '';
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  };
 
   const unitWeight = (item) => {
     if (Number(item?.baseQuantity) > 0) return Number(item.baseQuantity);
@@ -66,47 +77,84 @@ export default function DriverDashboardScreen({
     setLoading(true);
     try {
       // 1. Fetch routes assigned to this driver
-      const routesResponse = await fetch(`${apiUrl}/transportation/routes?driverId=self`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const routesData = await routesResponse.json();
+      try {
+        const routesResponse = await fetch(`${apiUrl}/transportation/routes?driverId=self`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const text = await routesResponse.text();
+        const routesData = text ? JSON.parse(text) : null;
+        if (routesResponse.ok && routesData?.success) {
+          const allRoutes = routesData.data || [];
+          const todayKey = getLocalDateKey(new Date());
+          const todayRoutes = allRoutes.filter((route) => getLocalDateKey(route.routeDate) === todayKey);
+          const active = todayRoutes.find((route) => route.status !== 'cancelled' && route.status !== 'completed')
+            || allRoutes.find((route) => route.status !== 'cancelled' && route.status !== 'completed')
+            || allRoutes[0];
 
-      // 2. Fetch driver deliveries to get Delivery IDs and statuses
-      const delivResponse = await fetch(`${apiUrl}/delivery/my`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const delivData = await delivResponse.json();
-
-      if (routesResponse.ok && routesData.success) {
-        const allRoutes = routesData.data || [];
-        // Active route is the latest one that is locked, dispatched or completed today
-        const active = allRoutes.find(r => ['locked', 'dispatched'].includes(r.status));
-        const history = allRoutes.filter(r => !['locked', 'dispatched'].includes(r.status));
-
-        if (active) {
-          // Fetch full populated active route detail
-          const detailResponse = await fetch(`${apiUrl}/transportation/routes/${active._id}`, {
-            headers: { Authorization: `Bearer ${token}` },
-          });
-          const detailData = await detailResponse.json();
-          if (detailResponse.ok && detailData.success) {
-            setActiveRoute(detailData.data);
+          if (active) {
+            const detailResponse = await fetch(`${apiUrl}/transportation/routes/${active._id}`, {
+              headers: { Authorization: `Bearer ${token}` },
+            });
+            const detailText = await detailResponse.text();
+            const detailData = detailText ? JSON.parse(detailText) : null;
+            if (detailResponse.ok && detailData?.success) {
+              setActiveRoute(detailData.data);
+            } else {
+              setActiveRoute(active);
+            }
           } else {
-            setActiveRoute(active);
+            setActiveRoute(null);
           }
-        } else {
-          setActiveRoute(null);
         }
-
-        setRoutesHistory(history);
+      } catch (err) {
+        console.log('Routes fetch info:', err.message);
       }
 
-      if (delivResponse.ok && delivData.success) {
-        setDeliveries(delivData.data || []);
+      // 2. Fetch driver deliveries to get Delivery IDs and statuses
+      try {
+        const delivResponse = await fetch(`${apiUrl}/delivery/my`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const text = await delivResponse.text();
+        const delivData = text ? JSON.parse(text) : null;
+        if (delivResponse.ok && delivData?.success) {
+          setDeliveries(delivData.data || []);
+        }
+      } catch (err) {
+        console.log('Delivery my fetch info:', err.message);
+      }
+
+      // 3. Fetch direct driver order assignments
+      try {
+        const ordersResponse = await fetch(`${apiUrl}/order/my`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const text = await ordersResponse.text();
+        const ordersData = text ? JSON.parse(text) : null;
+        if (ordersResponse.ok && ordersData?.success && Array.isArray(ordersData.data)) {
+          const directOrders = ordersData.data.map(o => ({
+            _id: o._id,
+            orderId: o,
+            status: o.status,
+            partyId: o.partyId,
+            deliveryNumber: o.orderNumber,
+            isVirtual: true,
+          }));
+          setDeliveries(prev => {
+            const map = new Map();
+            (prev || []).forEach(d => map.set(String(d.orderId?._id || d.orderId || d._id), d));
+            directOrders.forEach(d => {
+              const key = String(d.orderId?._id || d.orderId || d._id);
+              if (!map.has(key)) map.set(key, d);
+            });
+            return Array.from(map.values());
+          });
+        }
+      } catch (err) {
+        console.log('Order my fetch info:', err.message);
       }
     } catch (e) {
       console.warn('Driver data fetch error:', e.message);
-      Alert.alert('Error', 'Failed to retrieve delivery routes.');
     } finally {
       setLoading(false);
     }
@@ -118,10 +166,117 @@ export default function DriverDashboardScreen({
     }
   }, [token, apiUrl]);
 
-  // Find corresponding Delivery document for an order ID
-  const getDeliveryForOrder = (orderId) => {
-    return deliveries.find(d => String(d.orderId?._id || d.orderId) === String(orderId));
+  // Find corresponding Delivery document for an order ID or stop item
+  const getDeliveryForOrder = (orderId, stop = null) => {
+    if (stop?.deliveryRecord) return stop.deliveryRecord;
+    if (stop?.deliveryNumber) return stop;
+    if (!orderId && !stop) return null;
+
+    const targetId = String(orderId?._id || orderId || stop?.order?._id || stop?.order || stop?._id || '');
+    if (!targetId) return null;
+
+    const found = deliveries.find(d => {
+      const dOrderId = String(d.orderId?._id || d.orderId || '');
+      const dId = String(d._id || '');
+      return dOrderId === targetId || dId === targetId;
+    });
+
+    if (found) return found;
+
+    if (stop || orderId) {
+      return {
+        _id: targetId,
+        orderId: stop?.order || orderId,
+        status: stop?.status || 'dispatched',
+        isVirtual: true,
+      };
+    }
+
+    return null;
   };
+  // Exact user tab rules:
+  const assignedStatuses = ['dispatched', 'assigned', 'ready_for_delivery', 'planned', 'confirmed', 'packed', 'warehouse', 'draft'];
+  const outForDeliveryStatuses = ['out_for_delivery', 'in_transit', 'outfordelivery'];
+  const completedStatuses = ['delivered', 'cancelled', 'failed', 'returned', 'partial_delivery_return_pending'];
+
+  const getEffectiveStatus = (stopOrDelivery) => {
+    const order = stopOrDelivery?.order || stopOrDelivery?.orderId;
+    const delivery = stopOrDelivery?.deliveryRecord || getDeliveryForOrder(order?._id || order) || (stopOrDelivery?.deliveryNumber ? stopOrDelivery : null);
+    const rawStatus = order?.status || delivery?.status || stopOrDelivery?.status || 'dispatched';
+    return String(rawStatus).toLowerCase().trim();
+  };
+
+  const completedOrders = (deliveries || []).filter((d) => {
+    const status = getEffectiveStatus(d);
+    return completedStatuses.includes(status);
+  }).sort((a, b) => {
+    const timeA = new Date(a.deliveredAt || a.updatedAt || a.createdAt || 0).getTime();
+    const timeB = new Date(b.deliveredAt || b.updatedAt || b.createdAt || 0).getTime();
+    return timeB - timeA;
+  });
+
+  // 1. Out For Delivery Tab (ALL orders/stops that are in the active route and not completed)
+  const routeStops = activeRoute?.stops || [];
+  const outForDeliveryMap = new Map();
+
+  routeStops.forEach((stop) => {
+    const status = getEffectiveStatus(stop);
+    if (!completedStatuses.includes(status)) {
+      const key = String(stop.order?._id || stop.order || stop._id);
+      outForDeliveryMap.set(key, stop);
+    }
+  });
+
+  deliveries.forEach((d) => {
+    const status = getEffectiveStatus(d);
+    if (!completedStatuses.includes(status)) {
+      const key = String(d.orderId?._id || d.orderId || d._id);
+      if (!outForDeliveryMap.has(key)) {
+        outForDeliveryMap.set(key, {
+          _id: d._id,
+          order: d.orderId,
+          deliveryRecord: d,
+          party: d.partyId || d.orderId?.partyId,
+          latitude: d.partyId?.location?.latitude,
+          longitude: d.partyId?.location?.longitude,
+          status: d.status,
+        });
+      }
+    }
+  });
+
+  const outForDeliveryStops = Array.from(outForDeliveryMap.values());
+
+  // 2. Assigned Tab (ONLY dispatched, assigned, ready_for_delivery, planned)
+  const assignedMap = new Map();
+
+  routeStops.forEach((stop) => {
+    const status = getEffectiveStatus(stop);
+    if (assignedStatuses.includes(status) && !outForDeliveryStatuses.includes(status) && !completedStatuses.includes(status)) {
+      const key = String(stop.order?._id || stop.order || stop._id);
+      assignedMap.set(key, stop);
+    }
+  });
+
+  deliveries.forEach((d) => {
+    const status = getEffectiveStatus(d);
+    if (assignedStatuses.includes(status) && !outForDeliveryStatuses.includes(status) && !completedStatuses.includes(status)) {
+      const key = String(d.orderId?._id || d.orderId || d._id);
+      if (!assignedMap.has(key)) {
+        assignedMap.set(key, {
+          _id: d._id,
+          order: d.orderId,
+          deliveryRecord: d,
+          party: d.partyId || d.orderId?.partyId,
+          latitude: d.partyId?.location?.latitude,
+          longitude: d.partyId?.location?.longitude,
+          status: d.status,
+        });
+      }
+    }
+  });
+
+  const assignedRouteStops = Array.from(assignedMap.values());
 
   // Launch optimized Google Maps sequencing for all stops
   const handleOpenGoogleMapsRoute = () => {
@@ -169,14 +324,15 @@ export default function DriverDashboardScreen({
 
   // Trigger Delivery check / collection form
   const handleMarkDelivered = (stop) => {
-    const delivery = getDeliveryForOrder(stop.order?._id || stop.order);
+    const orderObj = stop?.order || stop?.orderId || stop;
+    const delivery = getDeliveryForOrder(orderObj?._id || orderObj, stop);
     if (!delivery) {
       Alert.alert('Error', 'No active delivery record found for this stop.');
       return;
     }
 
-    const order = stop.order;
-    setSelectedStop(stop);
+    const order = typeof orderObj === 'object' ? orderObj : (stop?.order || stop);
+    setSelectedStop({ ...stop, order });
     setCollectAmount(order?.paymentType === 'cod' ? String(order.netPayableAmount || order.grandTotal || 0) : '');
     setPaymentMode('cash');
     setTransactionRef('');
@@ -237,7 +393,7 @@ export default function DriverDashboardScreen({
   // Submit delivery status update (API call)
   const submitDeliveryStatus = async (deliveryId, status, payloadExtra = {}) => {
     try {
-      const response = await fetch(`${apiUrl}/delivery/${deliveryId}/status`, {
+      let response = await fetch(`${apiUrl}/delivery/${deliveryId}/status`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
@@ -248,6 +404,22 @@ export default function DriverDashboardScreen({
           ...payloadExtra,
         }),
       });
+
+      if (response.status === 404 && payloadExtra?.orderId) {
+        const targetOrderId = String(payloadExtra.orderId._id || payloadExtra.orderId);
+        response = await fetch(`${apiUrl}/order/${targetOrderId}/status`, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            status,
+            ...payloadExtra,
+          }),
+        });
+      }
+
       const data = await response.json();
       if (response.ok && data.success) {
         Alert.alert('Success', `Delivery status marked as ${status}!`);
@@ -334,8 +506,8 @@ export default function DriverDashboardScreen({
   };
 
   const submitDeliveredBill = async () => {
-    const order = selectedStop?.order;
-    const delivery = getDeliveryForOrder(order?._id);
+    const order = selectedStop?.order || selectedStop;
+    const delivery = getDeliveryForOrder(order?._id || order, selectedStop);
     if (!delivery || !billPhoto) return Alert.alert('Bill required', 'Take a photo of the delivered bill.');
     setSubmittingCollection(true);
     try {
@@ -345,7 +517,7 @@ export default function DriverDashboardScreen({
         const receiptUpload = await uploadFile({ file: receiptPhoto, module: 'delivery', relatedModel: 'Collection', token, apiUrl, onProgress: setUploadProgress });
         receiptPath = receiptUpload.storagePath;
       }
-      const saved = await submitDeliveryStatus(delivery._id, 'delivered', { ...pendingDeliveryPayment, deliveryPhoto: billUpload.storagePath, receiptPhoto: receiptPath });
+      const saved = await submitDeliveryStatus(delivery._id, 'delivered', { ...pendingDeliveryPayment, deliveryPhoto: billUpload.storagePath, receiptPhoto: receiptPath, orderId: order?._id || order });
       if (!saved) return;
       setBillModalVisible(false);
       setBillPhoto(null);
@@ -363,7 +535,30 @@ export default function DriverDashboardScreen({
   const handleMarkFailed = (stop) => {
     setSelectedStop(stop);
     setFailureReason('');
+    setFailureProof(null);
     setFailureModalVisible(true);
+  };
+
+  const openHistoryOrderDetail = async (orderId) => {
+    if (!orderId) return;
+    setHistoryOrderLoading(true);
+    setHistoryOrderDetail(null);
+    setHistoryOrderModalVisible(true);
+    try {
+      const response = await fetch(`${apiUrl}/order/${orderId}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await response.json();
+      if (response.ok && data.success) {
+        setHistoryOrderDetail(data.data);
+      } else {
+        Alert.alert('Failed', data.message || 'Could not load order details.');
+      }
+    } catch (error) {
+      Alert.alert('Error', 'Could not load order details.');
+    } finally {
+      setHistoryOrderLoading(false);
+    }
   };
 
   // Submit delivery failure details
@@ -379,14 +574,37 @@ export default function DriverDashboardScreen({
 
     setSubmittingFailure(true);
     try {
+      let proofPath;
+      if (failureProof) {
+        const proofUpload = await uploadFile({
+          file: failureProof,
+          module: 'delivery',
+          relatedModel: 'Delivery',
+          token,
+          apiUrl,
+          onProgress: (stage) => setUploadProgress(stage),
+        });
+        proofPath = proofUpload.storagePath;
+      }
       await submitDeliveryStatus(delivery._id, 'failed', {
         failureReason: failureReason.trim(),
+        deliveryPhoto: proofPath,
       });
       setFailureModalVisible(false);
     } finally {
       setSubmittingFailure(false);
     }
   };
+
+  const captureFailureProof = () => launchCamera(
+    { mediaType: 'photo', quality: 0.8, maxWidth: 1600, maxHeight: 1600, includeBase64: false },
+    (response) => {
+      if (response.didCancel) return;
+      if (response.errorCode) return Alert.alert('Camera Error', response.errorMessage || 'Failed to start camera.');
+      const asset = response.assets?.[0];
+      if (asset) setFailureProof({ uri: asset.uri, fileName: asset.fileName, type: asset.type, fileSize: asset.fileSize });
+    }
+  );
 
   return (
     <SafeAreaView style={styles.safeArea}>
@@ -435,7 +653,7 @@ export default function DriverDashboardScreen({
           onPress={() => setActiveTab('history')}
         >
           <Text style={[styles.tabText, activeTab === 'history' && styles.activeTabText]}>
-            Route History
+            Delivered History
           </Text>
         </TouchableOpacity>
       </View>
@@ -444,7 +662,7 @@ export default function DriverDashboardScreen({
         {loading ? (
           <ActivityIndicator color="#00796B" size="large" style={{ marginVertical: 40 }} />
         ) : ['route', 'assigned', 'out'].includes(activeTab) ? (
-          (activeRoute || activeTab === 'assigned') ? (
+          (activeRoute || activeTab === 'assigned' || activeTab === 'out') ? (
             <View style={{ gap: 16 }}>
               {/* Route Summary Info */}
               {activeTab === 'route' && <View style={styles.routeSummaryCard}>
@@ -483,19 +701,78 @@ export default function DriverDashboardScreen({
                   const order = stop.order;
                   const party = order?.partyId;
                   const delivery = getDeliveryForOrder(order?._id || order);
+                  const currentStatus = delivery?.status || stop.status || 'planned';
                   return <View key={stop._id || index} style={styles.stopCard}>
                     <View style={styles.stopHeader}>
                       <View style={styles.stopNumCircle}><Text style={styles.stopNumText}>{stop.sequence || index + 1}</Text></View>
                       <View style={{ flex: 1, marginLeft: 12 }}><Text style={styles.partyNameText}>{party?.partyName || 'Customer'}</Text><Text style={styles.orderNumText}>Order #{order?.orderNumber || '-'}</Text></View>
-                      <Text style={[styles.stopStatusBadge, styles.pendingBadge]}>{String(delivery?.status || stop.status || 'planned').replaceAll('_', ' ').toUpperCase()}</Text>
+                      <Text style={[
+                        styles.stopStatusBadge,
+                        currentStatus === 'delivered' ? styles.deliveredBadge :
+                        currentStatus === 'failed' ? styles.failedBadge : styles.pendingBadge
+                      ]}>{String(currentStatus).replaceAll('_', ' ').toUpperCase()}</Text>
                     </View>
+                    <View style={styles.stopBody}>
+                      <Text style={styles.addressText}>📍 {party?.address || 'No Address configured'}</Text>
+                      {party?.mobile ? <Text style={styles.mobileText}>📞 Mobile: {party.mobile}</Text> : null}
+                      <View style={styles.amountPaymentRow}>
+                        <Text style={styles.amountLabelText}>
+                          Total Due: <Text style={styles.amountValueText}>₹{(order?.netPayableAmount || order?.grandTotal || 0).toLocaleString('en-IN')}</Text>
+                        </Text>
+                        <View style={[
+                          styles.payTypeBadge,
+                          order?.paymentType === 'cod' ? styles.codPayBadge : styles.creditPayBadge
+                        ]}>
+                          <Text style={styles.payTypeText}>
+                            {order?.paymentType === 'cod' ? '💵 COD' : '💳 Credit/Prepaid'}
+                          </Text>
+                        </View>
+                      </View>
+                      <Text style={styles.mobileText}>Total load weight: {orderWeight(order).toFixed(2)} kg</Text>
+                    </View>
+                    {!['delivered', 'cancelled', 'failed', 'returned'].includes(String(currentStatus).toLowerCase()) && (
+                      <View style={styles.stopActionsRow}>
+                        <TouchableOpacity
+                          style={styles.navigateActionBtn}
+                          onPress={() => handleNavigateToStop(party?.location || stop)}
+                        >
+                          <Text style={styles.navigateActionBtnText}>📍 Maps</Text>
+                        </TouchableOpacity>
+
+                        <TouchableOpacity
+                          style={styles.failActionBtn}
+                          onPress={() => handleMarkFailed(stop)}
+                        >
+                          <Text style={styles.failActionBtnText}>Cancel</Text>
+                        </TouchableOpacity>
+
+                        <TouchableOpacity
+                          style={styles.navigateActionBtn}
+                          onPress={() => openPartialDelivery(stop)}
+                        >
+                          <Text style={styles.navigateActionBtnText}>Partial</Text>
+                        </TouchableOpacity>
+
+                        <TouchableOpacity
+                          style={styles.deliverActionBtn}
+                          onPress={() => handleMarkDelivered(stop)}
+                        >
+                          <Text style={styles.deliverActionBtnText}>✅ Deliver</Text>
+                        </TouchableOpacity>
+                      </View>
+                    )}
+                    {String(currentStatus).toLowerCase() === 'cancelled' && (
+                      <View style={styles.stopActionsRow}>
+                        <Text style={styles.mobileText}>Cancelled order</Text>
+                      </View>
+                    )}
                   </View>;
                 })}
               </View>}
-              {activeTab !== 'route' && <Text style={styles.sectionTitle}>{activeTab === 'assigned' ? 'All orders assigned to you' : 'Active-route orders currently being delivered'}</Text>}
+              {activeTab !== 'route' && <Text style={styles.sectionTitle}>{activeTab === 'assigned' ? 'Assigned orders' : 'Out for delivery orders from active route'}</Text>}
               {activeTab !== 'route' && (activeTab === 'assigned'
-                ? deliveries.filter((delivery) => ['assigned', 'dispatched'].includes(delivery.status)).map((delivery) => ({ _id: delivery._id, order: delivery.orderId, deliveryRecord: delivery }))
-                : (activeRoute.stops || []).filter((stop) => getDeliveryForOrder(stop.order?._id || stop.order)?.status === 'out_for_delivery')
+                ? assignedRouteStops
+                : outForDeliveryStops
               ).map((stop, idx) => {
                 const order = stop.order;
                 const party = order?.partyId;
@@ -548,18 +825,15 @@ export default function DriverDashboardScreen({
                       <Text style={styles.mobileText}>Total load weight: {orderWeight(order).toFixed(2)} kg</Text>
                     </View>
 
-                    {/* Quick navigation and deliver buttons */}
-                    {['assigned', 'dispatched'].includes(currentStatus) && (
+                    {/* Assigned list is read-only. Delivery actions are only available in Route and Out for Delivery tabs. */}
+                    {activeTab === 'assigned' && (
                       <View style={styles.stopActionsRow}>
-                        {belongsToActiveRoute ? <TouchableOpacity
-                          style={styles.deliverActionBtn}
-                          onPress={() => Alert.alert('Start this delivery?', 'After starting, delivery result actions will become available.', [{ text: 'Not now', style: 'cancel' }, { text: 'Start Delivery', onPress: () => submitDeliveryStatus(delivery._id, 'out_for_delivery') }])}
-                        >
-                          <Text style={styles.deliverActionBtnText}>Start Delivery</Text>
-                        </TouchableOpacity> : <Text style={styles.mobileText}>Waiting to be added to an active route</Text>}
+                        {belongsToActiveRoute
+                          ? <Text style={styles.mobileText}>Open this order from Routes / Out for Delivery to act on it</Text>
+                          : <Text style={styles.mobileText}>Waiting to be added to an active route</Text>}
                       </View>
                     )}
-                    {currentStatus === 'out_for_delivery' && (
+                    {(currentStatus === 'out_for_delivery' || currentStatus === 'dispatched' || activeTab === 'out') && (
                       <View style={styles.stopActionsRow}>
                         <TouchableOpacity
                           style={styles.navigateActionBtn}
@@ -572,7 +846,7 @@ export default function DriverDashboardScreen({
                           style={styles.failActionBtn}
                           onPress={() => handleMarkFailed(stop)}
                         >
-                          <Text style={styles.failActionBtnText}>❌ Failed</Text>
+                          <Text style={styles.failActionBtnText}>Cancel</Text>
                         </TouchableOpacity>
 
                         <TouchableOpacity
@@ -601,47 +875,87 @@ export default function DriverDashboardScreen({
               <Text style={styles.emptyDesc}>You do not have an active route assigned for today.</Text>
             </View>
           )
-        ) : routesHistory.length === 0 ? (
+        ) : completedOrders.length === 0 ? (
           <View style={styles.emptyContainer}>
             <Text style={styles.emptyIcon}>📂</Text>
-            <Text style={styles.emptyTitle}>No Route History</Text>
-            <Text style={styles.emptyDesc}>No previous delivery route assignments found.</Text>
+            <Text style={styles.emptyTitle}>No Delivered History</Text>
+            <Text style={styles.emptyDesc}>No completed or delivered orders found.</Text>
           </View>
         ) : (
           <View style={{ gap: 12 }}>
-            {routesHistory.map((route) => (
-              <View key={route._id} style={styles.historyCard}>
+            {completedOrders.map((delivery, index) => {
+              const order = delivery.orderId || delivery.order || delivery;
+              const party = order?.partyId || delivery.partyId || {};
+              const currentStatus = getEffectiveStatus(delivery);
+              return (
+              <View key={delivery._id || index} style={styles.historyCard}>
                 <View style={styles.summaryRow}>
-                  <Text style={styles.historyRouteNumber}>Route: {route.routeNumber}</Text>
+                  <Text style={styles.historyRouteNumber}>Order: {order?.orderNumber || delivery.deliveryNumber || 'Order'}</Text>
                   <Text style={[styles.statusBadge, styles.completedBadge]}>
-                    {route.status.toUpperCase()}
+                    {currentStatus.replace('_', ' ').toUpperCase()}
                   </Text>
                 </View>
                 <Text style={styles.historyMetaText}>
-                  Date: {new Date(route.routeDate).toLocaleDateString()}
+                  Party: {party.partyName || party.name || 'Customer'}
                 </Text>
                 <Text style={styles.historyMetaText}>
-                  Orders: {route.totalOrders || route.stops?.length || 0} • Distance: {Number(route.estimatedDistanceKm || 0).toFixed(1)} km
-                </Text>
-                <View style={{ marginTop: 10, gap: 6 }}>
-                  {(route.stops || []).map((stop, index) => (
-                    <View key={stop._id || index} style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
-                      <Text style={styles.historyMetaText}>{index + 1}. #{stop.order?.orderNumber || 'Order'}</Text>
-                      <Text style={styles.historyMetaText}>{String(stop.status || stop.order?.status || 'completed').replaceAll('_', ' ').toUpperCase()}</Text>
-                    </View>
-                  ))}
-                </View>
-                <Text style={styles.historyMetaText}>
-                  Warehouse: {route.warehouse?.name || 'Main Warehouse'}
+                  Date: {new Date(delivery.updatedAt || delivery.createdAt || Date.now()).toLocaleDateString()}
                 </Text>
                 <Text style={styles.historyMetaText}>
-                  Total Stops: {route.stops?.length || 0} • Amount: ₹{route.totalAmount?.toLocaleString('en-IN') || 0}
+                  Amount: ₹{Number(order?.netPayableAmount || order?.grandTotal || delivery.amount || 0).toLocaleString('en-IN')}
                 </Text>
+                <Text style={styles.historyMetaText}>
+                  Route: {delivery.routeId?.routeNumber || delivery.route?.routeNumber || 'Direct'}
+                </Text>
+                <Text style={styles.historyMetaText}>
+                  Warehouse: {delivery.warehouseId?.name || delivery.routeId?.warehouse?.name || 'Main Warehouse'}
+                </Text>
+                <TouchableOpacity style={[styles.historyViewBtn, { marginTop: 10 }]} onPress={() => openHistoryOrderDetail(order?._id || order)}>
+                  <Text style={styles.historyViewBtnText}>View Order Details</Text>
+                </TouchableOpacity>
               </View>
-            ))}
+              );
+            })}
           </View>
         )}
       </ScrollView>
+      <Modal visible={historyOrderModalVisible} transparent animationType="fade" onRequestClose={() => setHistoryOrderModalVisible(false)}>
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Order Details</Text>
+            {historyOrderLoading ? (
+              <ActivityIndicator color="#00796B" size="large" style={{ marginVertical: 24 }} />
+            ) : historyOrderDetail ? (
+              <ScrollView style={{ maxHeight: 420 }} contentContainerStyle={{ gap: 8 }}>
+                <Text style={styles.historyMetaText}>Order No: {historyOrderDetail.orderNumber}</Text>
+                <Text style={styles.historyMetaText}>Party: {historyOrderDetail.partyId?.partyName || '—'}</Text>
+                <Text style={styles.historyMetaText}>Mobile: {historyOrderDetail.partyId?.mobile || '—'}</Text>
+                <Text style={styles.historyMetaText}>Address: {historyOrderDetail.partyId?.address || '—'}</Text>
+                <Text style={styles.historyMetaText}>Status: {String(historyOrderDetail.status || '').replaceAll('_', ' ').toUpperCase()}</Text>
+                <Text style={styles.historyMetaText}>Payment: {String(historyOrderDetail.paymentType || '—').toUpperCase()}</Text>
+                <Text style={styles.historyMetaText}>Total: ₹{Number(historyOrderDetail.netPayableAmount || historyOrderDetail.grandTotal || 0).toLocaleString('en-IN')}</Text>
+                <Text style={styles.historyMetaText}>Weight: {orderWeight(historyOrderDetail).toFixed(2)} kg</Text>
+                <View style={styles.divider} />
+                {(historyOrderDetail.items || []).map((item, index) => (
+                  <View key={item._id || index} style={styles.historyItemCard}>
+                    <Text style={styles.historyMetaText}>{index + 1}. {item.productName}</Text>
+                    <Text style={styles.historyMetaText}>Variant: {item.variantName || '-'}</Text>
+                    <Text style={styles.historyMetaText}>Qty: {item.quantity}</Text>
+                    <Text style={styles.historyMetaText}>Weight: {(unitWeight(item) * Number(item.quantity || 0)).toFixed(2)} kg</Text>
+                  </View>
+                ))}
+              </ScrollView>
+            ) : (
+              <Text style={styles.historyMetaText}>No order details found.</Text>
+            )}
+            <View style={styles.modalActions}>
+              <TouchableOpacity style={styles.modalCancelBtn} onPress={() => setHistoryOrderModalVisible(false)}>
+                <Text style={styles.modalCancelBtnText}>Close</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
 
       {/* COD Payment Collection Modal */}
       {selectedStop && (
@@ -798,7 +1112,7 @@ export default function DriverDashboardScreen({
         </Modal>
       )}
 
-      {/* Delivery Failure Reason Modal */}
+      {/* Delivery Cancel Reason Modal */}
       {selectedStop && (
         <Modal
           visible={failureModalVisible}
@@ -808,23 +1122,41 @@ export default function DriverDashboardScreen({
         >
           <View style={styles.modalOverlay}>
             <View style={styles.modalCard}>
-              <Text style={styles.modalTitle}>❌ Mark Delivery Failed</Text>
+              <Text style={styles.modalTitle}>Cancel Delivery</Text>
               <Text style={styles.modalSubtitle}>
-                State the reason why order #{selectedStop.order?.orderNumber} could not be delivered.
+                Add a remark and proof photo for order #{selectedStop.order?.orderNumber}.
               </Text>
 
               <View style={styles.divider} />
 
               <View style={{ gap: 12 }}>
-                <Text style={styles.fieldLabel}>Reason for Failure *</Text>
+                <Text style={styles.fieldLabel}>Cancellation Remark *</Text>
                 <TextInput
                   style={[styles.inputField, { height: 80, textAlignVertical: 'top' }]}
-                  placeholder="e.g. Shop closed, Customer refused, Address incorrect..."
+                  placeholder="e.g. Customer refused, item missing, address issue..."
                   placeholderTextColor="#A0AEC0"
                   multiline
                   value={failureReason}
                   onChangeText={setFailureReason}
                 />
+
+                <View style={{ gap: 8 }}>
+                  <Text style={styles.fieldLabel}>Proof Photo</Text>
+                  <TouchableOpacity style={styles.navigateActionBtn} onPress={captureFailureProof} activeOpacity={0.8}>
+                    <Text style={styles.navigateActionBtnText}>
+                      {failureProof ? 'Change Proof Photo' : 'Attach Proof Photo'}
+                    </Text>
+                  </TouchableOpacity>
+                  {failureProof ? (
+                    <Text style={styles.helperText}>
+                      Attached: {failureProof.fileName || failureProof.uri?.split('/').pop() || 'Photo'}
+                    </Text>
+                  ) : (
+                    <Text style={styles.helperText}>
+                      Optional, but helpful for admin and warehouse review.
+                    </Text>
+                  )}
+                </View>
               </View>
 
               <View style={styles.divider} />
@@ -845,7 +1177,7 @@ export default function DriverDashboardScreen({
                   {submittingFailure ? (
                     <ActivityIndicator color="#FFFFFF" size="small" />
                   ) : (
-                    <Text style={styles.modalConfirmBtnText}>Save Failure</Text>
+                    <Text style={styles.modalConfirmBtnText}>Save Cancel</Text>
                   )}
                 </TouchableOpacity>
               </View>
@@ -1197,6 +1529,33 @@ const styles = StyleSheet.create({
     color: '#718096',
     marginTop: 2,
   },
+  historyOrderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    gap: 10,
+    paddingVertical: 6,
+  },
+  historyViewBtn: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 10,
+    backgroundColor: '#EBF8FF',
+    borderWidth: 1,
+    borderColor: '#90CDF4',
+  },
+  historyViewBtnText: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: '#1D4ED8',
+  },
+  historyItemCard: {
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    borderRadius: 12,
+    padding: 12,
+    backgroundColor: '#F8FAFC',
+  },
   // Modal layout
   modalOverlay: {
     flex: 1,
@@ -1304,3 +1663,5 @@ const styles = StyleSheet.create({
     fontWeight: '800',
   },
 });
+
+

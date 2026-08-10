@@ -1,6 +1,18 @@
 import React, { useState, useEffect } from 'react';
 import { Image } from 'react-native';
 
+async function safeJsonResponse(response) {
+  const text = await response.text();
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    if (text.startsWith('<')) {
+      throw new Error(`Server error (${response.status}): Check backend connection or URL.`);
+    }
+    throw new Error(text || `HTTP ${response.status} error`);
+  }
+}
+
 /**
  * Exposes the reusable Firebase Cloud Storage upload handler using signed URLs.
  * 
@@ -73,7 +85,7 @@ export async function uploadFile({
     }),
   });
 
-  const signData = await signResponse.json();
+  const signData = await safeJsonResponse(signResponse);
   if (!signResponse.ok || !signData.success) {
     throw new Error(signData.message || 'Failed to request signed upload URL');
   }
@@ -108,7 +120,7 @@ export async function uploadFile({
     }),
   });
 
-  const confirmData = await confirmResponse.json();
+  const confirmData = await safeJsonResponse(confirmResponse);
   if (!confirmResponse.ok || !confirmData.success) {
     throw new Error(confirmData.message || 'File confirmation failed on backend');
   }
@@ -144,7 +156,7 @@ export function FirebaseImage({ source, style, token, apiUrl, ...props }) {
         const res = await fetch(`${apiUrl}/uploads/${encodeURIComponent(uri)}/view-url`, {
           headers: { Authorization: `Bearer ${token}` }
         });
-        const data = await res.json();
+        const data = await safeJsonResponse(res);
         if (active && res.ok && data.success) {
           setResolvedUri(data.data.viewUrl);
         }

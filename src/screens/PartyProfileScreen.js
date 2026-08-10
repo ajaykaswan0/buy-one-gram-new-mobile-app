@@ -129,26 +129,26 @@ export default function PartyProfileScreen({ token, apiUrl, partyId, onBack, onN
 
     setSubmittingReplacement(true);
     try {
-      const response = await fetch(`${apiUrl}/order/replacement`, {
+      const response = await fetch(`${apiUrl}/sales-return`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({
-          originalOrderId: selectedOrderForReplace._id,
+          orderId: selectedOrderForReplace._id,
           items: itemsToReplace,
-          remarks: replaceRemarks,
+          reason: replaceRemarks,
         }),
       });
 
       const data = await response.json();
       if (response.ok && data.success) {
-        Alert.alert('Success', 'Replacement order created successfully!');
+        Alert.alert('Success', 'Replacement request created successfully!');
         setReplacementModalVisible(false);
         loadProfile(); // refresh profile data
       } else {
-        Alert.alert('Failed', data.message || 'Could not create replacement.');
+        Alert.alert('Failed', data.message || 'Could not create replacement request.');
       }
     } catch (e) {
       console.warn('Replacement submit error:', e.message);

@@ -12,6 +12,7 @@
     },
     "android": {
       "package": "com.sfa.mobileapp",
+      "googleServicesFile": "./google-services.json",
       "usesCleartextTraffic": true,
       "softwareKeyboardLayoutMode": "resize",
       "permissions": [
@@ -43,7 +44,11 @@
     "owner": "ajaaa",
     "plugins": [
       "expo-status-bar",
-      "expo-splash-screen"
+      "expo-splash-screen",
+      "expo-location",
+      "expo-task-manager",
+      "@react-native-firebase/app",
+      "@react-native-firebase/messaging"
     ]
   }
 }

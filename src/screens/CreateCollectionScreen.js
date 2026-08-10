@@ -12,7 +12,7 @@ import {
   KeyboardAvoidingView,
   Platform,
 } from 'react-native';
-import * as Location from 'expo-location';
+import Geolocation from '@react-native-community/geolocation';
 import { launchCamera } from 'react-native-image-picker';
 
 export default function CreateCollectionScreen({ token, apiUrl, party, onBack }) {
@@ -43,15 +43,23 @@ export default function CreateCollectionScreen({ token, apiUrl, party, onBack })
     const fetchLocation = async () => {
       setFetchingLocation(true);
       try {
-        const { status } = await Location.requestForegroundPermissionsAsync();
-        if (status === 'granted') {
-          const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
-          setLatitude(loc.coords.latitude);
-          setLongitude(loc.coords.longitude);
+        if (Platform.OS === 'android') {
+          await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION);
         }
+        Geolocation.getCurrentPosition(
+          (position) => {
+            setLatitude(position.coords.latitude);
+            setLongitude(position.coords.longitude);
+            setFetchingLocation(false);
+          },
+          (error) => {
+            console.warn('GPS location fetch for collection failed:', error.message);
+            setFetchingLocation(false);
+          },
+          { enableHighAccuracy: false, timeout: 15000, maximumAge: 10000 }
+        );
       } catch (e) {
         console.warn('GPS location fetch for collection failed:', e.message);
-      } finally {
         setFetchingLocation(false);
       }
     };
