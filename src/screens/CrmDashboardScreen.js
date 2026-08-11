@@ -176,7 +176,7 @@ export default function CrmDashboardScreen({
   };
 
   const calculateTotalOutstanding = () => {
-    return filteredParties.reduce((sum, p) => sum + (p.currentOutstanding || 0), 0);
+    return parties.reduce((sum, p) => sum + (p.currentOutstanding || 0), 0);
   };
 
   return (
@@ -256,7 +256,7 @@ export default function CrmDashboardScreen({
             <View style={styles.summaryDivider} />
             <View style={styles.summaryCell}>
               <Text style={styles.summaryLabel}>Total Parties</Text>
-              <Text style={styles.summaryValue}>{filteredParties.length}</Text>
+              <Text style={styles.summaryValue}>{parties.length}</Text>
             </View>
             <View style={styles.summaryDivider} />
             <View style={styles.summaryCell}>
