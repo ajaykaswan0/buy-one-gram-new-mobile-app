@@ -8,6 +8,7 @@ import {
   SafeAreaView,
   ScrollView,
   Animated,
+  Image,
 } from 'react-native';
 import Geolocation from '@react-native-community/geolocation';
 import { launchCamera } from 'react-native-image-picker';
@@ -277,35 +278,33 @@ export default function AttendanceScreen({ token, apiUrl, onBack }) {
   const exceeds20Hours = isCheckedIn && !isCheckedOut && elapsedHours > 20;
 
   const historyList = React.useMemo(() => {
-    const list = [];
-    history.slice(0, 5).forEach((log) => {
-      if (log.checkInTime) {
-        const inDate = new Date(log.checkInTime);
-        const onTime = inDate.getHours() < 9 || (inDate.getHours() === 9 && inDate.getMinutes() === 0);
-        list.push({
-          key: `${log._id}-in`,
-          type: 'in',
-          title: 'Clock In',
-          subtitle: `${formatDateLabel(log.date)} • ${formatTime(log.checkInTime)}`,
-          tagLabel: onTime ? 'On Time' : 'Late',
-          tagType: onTime ? 'success' : 'danger',
-          timestamp: new Date(log.checkInTime),
-        });
-      }
-      if (log.checkOutTime) {
-        list.push({
-          key: `${log._id}-out`,
-          type: 'out',
-          title: 'Clock Out',
-          subtitle: `${formatDateLabel(log.date)} • ${formatTime(log.checkOutTime)}`,
-          tagLabel: 'Standard',
-          tagType: 'info',
-          timestamp: new Date(log.checkOutTime),
-        });
-      }
-    });
+    return history.slice(0, 5).map((log) => {
+      const inTimeStr = log.checkInTime ? formatTime(log.checkInTime) : null;
+      const outTimeStr = log.checkOutTime ? formatTime(log.checkOutTime) : null;
+      
+      const inDate = log.checkInTime ? new Date(log.checkInTime) : null;
+      const onTime = inDate ? (inDate.getHours() < 9 || (inDate.getHours() === 9 && inDate.getMinutes() === 0)) : false;
 
-    return list.sort((a, b) => b.timestamp - a.timestamp);
+      let subtitle = '';
+      if (inTimeStr && outTimeStr) {
+        subtitle = `Check-in: ${inTimeStr}  Check-out: ${outTimeStr}`;
+      } else if (inTimeStr) {
+        subtitle = `Check-in: ${inTimeStr}  Check-out: --`;
+      } else if (outTimeStr) {
+        subtitle = `Check-in: --  Check-out: ${outTimeStr}`;
+      } else {
+        subtitle = 'No timestamps';
+      }
+
+      return {
+        key: log._id,
+        dateLabel: formatDateLabel(log.date || log.checkInTime),
+        subtitle,
+        tagLabel: onTime ? 'On Time' : (inDate ? 'Late' : 'Absent'),
+        tagType: onTime ? 'success' : (inDate ? 'danger' : 'info'),
+        timestamp: new Date(log.date || log.checkInTime || 0),
+      };
+    }).sort((a, b) => b.timestamp - a.timestamp);
   }, [history]);
 
   const totalPresentDays = history.filter(h => h.attendanceStatus === 'present' || h.checkInTime).length;
@@ -327,6 +326,12 @@ export default function AttendanceScreen({ token, apiUrl, onBack }) {
           <View style={[styles.corner, styles.bottomRight]} />
 
           <Text style={styles.cameraTitle}>Align your face within the frame</Text>
+
+          <Image
+            source={{ uri: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=200&q=80' }}
+            style={styles.faceGuideImage}
+            resizeMode="cover"
+          />
 
           <TouchableOpacity
             style={styles.triggerBorder}
@@ -381,11 +386,11 @@ export default function AttendanceScreen({ token, apiUrl, onBack }) {
               historyList.map((item) => (
                 <View style={styles.logCard} key={item.key}>
                   <View style={styles.cardLeft}>
-                    <View style={[styles.iconBox, item.type === 'in' ? styles.inIconBg : styles.outIconBg]}>
-                      <Text style={styles.iconText}>{item.type === 'in' ? '→' : '←'}</Text>
+                    <View style={[styles.iconBox, styles.inIconBg]}>
+                      <Text style={styles.iconText}>📅</Text>
                     </View>
                     <View>
-                      <Text style={styles.logTitle}>{item.title}</Text>
+                      <Text style={styles.logTitle}>{item.dateLabel}</Text>
                       <Text style={styles.logSubtitle}>{item.subtitle}</Text>
                     </View>
                   </View>
@@ -417,7 +422,7 @@ export default function AttendanceScreen({ token, apiUrl, onBack }) {
           </View>
           <View style={[styles.statCard, styles.slateStatBg]}>
             <Text style={styles.statLabel}>AVG TIME</Text>
-            <Text style={[styles.statNum, styles.slateStatText]}>08:35</Text>
+            <Text style={[styles.statNum, styles.slateStatText]}>08:35 Hours</Text>
           </View>
         </View>
       </ScrollView>
@@ -502,8 +507,16 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     fontSize: 14,
     fontWeight: '700',
-    marginBottom: 40,
-    marginTop: 20,
+    marginBottom: 12,
+    marginTop: 10,
+  },
+  faceGuideImage: {
+    width: 60,
+    height: 60,
+    borderRadius: 30,
+    borderWidth: 2,
+    borderColor: '#00BFA5',
+    marginBottom: 20,
   },
   triggerBorder: {
     width: 70,
