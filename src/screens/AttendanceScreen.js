@@ -10,6 +10,7 @@ import {
   Animated,
   Image,
 } from 'react-native';
+import { scale, verticalScale, responsiveFontSize, maxContainerWidth } from '../utils/responsive';
 import Geolocation from '@react-native-community/geolocation';
 import { launchCamera } from 'react-native-image-picker';
 
@@ -278,33 +279,58 @@ export default function AttendanceScreen({ token, apiUrl, onBack }) {
   const exceeds20Hours = isCheckedIn && !isCheckedOut && elapsedHours > 20;
 
   const historyList = React.useMemo(() => {
-    return history.slice(0, 5).map((log) => {
-      const inTimeStr = log.checkInTime ? formatTime(log.checkInTime) : null;
-      const outTimeStr = log.checkOutTime ? formatTime(log.checkOutTime) : null;
+    const mapByDate = new Map();
+
+    (history || []).forEach((log) => {
+      const rawDate = log.date || log.checkInTime || log.checkOutTime || log.createdAt;
+      if (!rawDate) return;
+      const dateObj = new Date(rawDate);
+      if (isNaN(dateObj.getTime())) return;
+      const dateKey = dateObj.toDateString();
+
+      if (!mapByDate.has(dateKey)) {
+        mapByDate.set(dateKey, {
+          dateObj,
+          checkInTime: log.checkInTime || null,
+          checkOutTime: log.checkOutTime || null,
+          id: log._id || dateKey,
+        });
+      } else {
+        const existing = mapByDate.get(dateKey);
+        if (!existing.checkInTime && log.checkInTime) {
+          existing.checkInTime = log.checkInTime;
+        } else if (existing.checkInTime && log.checkInTime && new Date(log.checkInTime) < new Date(existing.checkInTime)) {
+          existing.checkInTime = log.checkInTime;
+        }
+
+        if (!existing.checkOutTime && log.checkOutTime) {
+          existing.checkOutTime = log.checkOutTime;
+        } else if (existing.checkOutTime && log.checkOutTime && new Date(log.checkOutTime) > new Date(existing.checkOutTime)) {
+          existing.checkOutTime = log.checkOutTime;
+        }
+      }
+    });
+
+    const groupedArray = Array.from(mapByDate.values()).sort((a, b) => b.dateObj - a.dateObj);
+
+    return groupedArray.slice(0, 5).map((log) => {
+      const inTimeStr = log.checkInTime ? formatTime(log.checkInTime) : '--';
+      const outTimeStr = log.checkOutTime ? formatTime(log.checkOutTime) : '--';
       
       const inDate = log.checkInTime ? new Date(log.checkInTime) : null;
       const onTime = inDate ? (inDate.getHours() < 9 || (inDate.getHours() === 9 && inDate.getMinutes() === 0)) : false;
 
-      let subtitle = '';
-      if (inTimeStr && outTimeStr) {
-        subtitle = `Check-in: ${inTimeStr}  Check-out: ${outTimeStr}`;
-      } else if (inTimeStr) {
-        subtitle = `Check-in: ${inTimeStr}  Check-out: --`;
-      } else if (outTimeStr) {
-        subtitle = `Check-in: --  Check-out: ${outTimeStr}`;
-      } else {
-        subtitle = 'No timestamps';
-      }
+      const subtitle = `Check-in: ${inTimeStr}  Check-out: ${outTimeStr}`;
 
       return {
-        key: log._id,
-        dateLabel: formatDateLabel(log.date || log.checkInTime),
+        key: log.id,
+        dateLabel: formatDateLabel(log.dateObj),
         subtitle,
         tagLabel: onTime ? 'On Time' : (inDate ? 'Late' : 'Absent'),
         tagType: onTime ? 'success' : (inDate ? 'danger' : 'info'),
-        timestamp: new Date(log.date || log.checkInTime || 0),
+        timestamp: log.dateObj,
       };
-    }).sort((a, b) => b.timestamp - a.timestamp);
+    });
   }, [history]);
 
   const totalPresentDays = history.filter(h => h.attendanceStatus === 'present' || h.checkInTime).length;
@@ -436,43 +462,43 @@ const styles = StyleSheet.create({
     backgroundColor: '#F7F9FC',
   },
   header: {
-    height: 56,
+    height: verticalScale(56),
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 16,
+    paddingHorizontal: scale(16),
     borderBottomWidth: 1,
     borderBottomColor: '#E2E8F0',
     backgroundColor: '#FFFFFF',
   },
   backBtn: {
-    paddingVertical: 8,
-    paddingRight: 16,
+    paddingVertical: verticalScale(8),
+    paddingRight: scale(16),
   },
   backBtnText: {
     color: '#00796B',
     fontWeight: '700',
-    fontSize: 14.5,
+    fontSize: responsiveFontSize(14.5),
   },
   headerTitle: {
-    fontSize: 16,
+    fontSize: responsiveFontSize(16),
     fontWeight: '700',
     color: '#2D3748',
   },
   container: {
-    paddingBottom: 40,
+    paddingBottom: verticalScale(40),
   },
   cameraBox: {
     backgroundColor: '#2D3748',
-    height: 380,
+    height: verticalScale(380),
     alignItems: 'center',
     justifyContent: 'center',
-    padding: 24,
+    padding: scale(24),
     position: 'relative',
   },
   corner: {
     position: 'absolute',
-    width: 28,
-    height: 28,
+    width: scale(28),
+    height: verticalScale(28),
     borderColor: '#00BFA5',
   },
   topLeft: {
@@ -505,39 +531,39 @@ const styles = StyleSheet.create({
   },
   cameraTitle: {
     color: '#FFFFFF',
-    fontSize: 14,
+    fontSize: responsiveFontSize(14),
     fontWeight: '700',
-    marginBottom: 12,
-    marginTop: 10,
+    marginBottom: verticalScale(12),
+    marginTop: verticalScale(10),
   },
   faceGuideImage: {
-    width: 60,
-    height: 60,
+    width: scale(60),
+    height: verticalScale(60),
     borderRadius: 30,
     borderWidth: 2,
     borderColor: '#00BFA5',
-    marginBottom: 20,
+    marginBottom: verticalScale(20),
   },
   triggerBorder: {
-    width: 70,
-    height: 70,
+    width: scale(70),
+    height: verticalScale(70),
     borderRadius: 35,
     borderWidth: 5,
     borderColor: '#FFFFFF',
     alignItems: 'center',
     justifyContent: 'center',
-    marginBottom: 40,
+    marginBottom: verticalScale(40),
   },
   triggerInner: {
-    width: 52,
-    height: 52,
+    width: scale(52),
+    height: verticalScale(52),
     borderRadius: 26,
     backgroundColor: '#00897B',
   },
   checkBtn: {
     backgroundColor: '#00897B',
-    paddingVertical: 12,
-    paddingHorizontal: 40,
+    paddingVertical: verticalScale(12),
+    paddingHorizontal: scale(40),
     borderRadius: 20,
     width: '60%',
     alignItems: 'center',
@@ -555,7 +581,7 @@ const styles = StyleSheet.create({
   },
   checkBtnText: {
     color: '#FFFFFF',
-    fontSize: 14.5,
+    fontSize: responsiveFontSize(14.5),
     fontWeight: '700',
   },
   flashOverlay: {
@@ -565,59 +591,59 @@ const styles = StyleSheet.create({
   errorText: {
     color: '#E53E3E',
     backgroundColor: '#FFF5F5',
-    padding: 10,
+    padding: scale(10),
     borderRadius: 8,
-    fontSize: 12.5,
+    fontSize: responsiveFontSize(12.5),
     fontWeight: '600',
     textAlign: 'center',
-    margin: 16,
+    margin: scale(16),
   },
   lockoutText: {
     color: '#D69E2E',
     backgroundColor: '#FEFCBF',
     borderWidth: 1,
     borderColor: '#FEEBC8',
-    padding: 12,
+    padding: scale(12),
     borderRadius: 8,
-    fontSize: 12.5,
+    fontSize: responsiveFontSize(12.5),
     fontWeight: '600',
     textAlign: 'center',
-    marginHorizontal: 16,
+    marginHorizontal: scale(16),
   },
   sectionHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    paddingHorizontal: 20,
-    marginTop: 24,
-    marginBottom: 14,
+    paddingHorizontal: scale(20),
+    marginTop: verticalScale(24),
+    marginBottom: verticalScale(14),
   },
   sectionTitle: {
-    fontSize: 18,
+    fontSize: responsiveFontSize(18),
     fontWeight: '700',
     color: '#1A202C',
   },
   viewAllText: {
     color: '#00796B',
-    fontSize: 13,
+    fontSize: responsiveFontSize(13),
     fontWeight: '700',
   },
   logsList: {
-    paddingHorizontal: 20,
-    gap: 12,
+    paddingHorizontal: scale(20),
+    gap: verticalScale(12),
   },
   emptyText: {
     textAlign: 'center',
     color: '#718096',
-    marginVertical: 12,
-    fontSize: 13,
+    marginVertical: verticalScale(12),
+    fontSize: responsiveFontSize(13),
   },
   logCard: {
     backgroundColor: '#FFFFFF',
     borderRadius: 14,
     borderWidth: 1,
     borderColor: '#E2E8F0',
-    padding: 14,
+    padding: scale(14),
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
@@ -625,11 +651,11 @@ const styles = StyleSheet.create({
   cardLeft: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 12,
+    gap: verticalScale(12),
   },
   iconBox: {
-    width: 38,
-    height: 38,
+    width: scale(38),
+    height: verticalScale(38),
     borderRadius: 10,
     alignItems: 'center',
     justifyContent: 'center',
@@ -641,24 +667,24 @@ const styles = StyleSheet.create({
     backgroundColor: '#E8EAF6',
   },
   iconText: {
-    fontSize: 18,
+    fontSize: responsiveFontSize(18),
     fontWeight: '700',
     color: '#00796B',
   },
   logTitle: {
-    fontSize: 14,
+    fontSize: responsiveFontSize(14),
     fontWeight: '700',
     color: '#2D3748',
   },
   logSubtitle: {
-    fontSize: 12,
+    fontSize: responsiveFontSize(12),
     color: '#718096',
-    marginTop: 2,
+    marginTop: verticalScale(2),
     fontWeight: '500',
   },
   pillTag: {
-    paddingVertical: 4,
-    paddingHorizontal: 10,
+    paddingVertical: verticalScale(4),
+    paddingHorizontal: scale(10),
     borderRadius: 12,
   },
   successPill: {
@@ -680,21 +706,21 @@ const styles = StyleSheet.create({
     color: '#3F51B5',
   },
   pillText: {
-    fontSize: 11,
+    fontSize: responsiveFontSize(11),
     fontWeight: '700',
   },
   bottomStats: {
     flexDirection: 'row',
-    paddingHorizontal: 20,
-    gap: 12,
-    marginTop: 24,
+    paddingHorizontal: scale(20),
+    gap: verticalScale(12),
+    marginTop: verticalScale(24),
   },
   statCard: {
     flex: 1,
     borderRadius: 14,
     borderWidth: 1,
-    padding: 16,
-    gap: 4,
+    padding: scale(16),
+    gap: verticalScale(4),
   },
   greenStatBg: {
     backgroundColor: '#E0F2F1',
@@ -705,13 +731,13 @@ const styles = StyleSheet.create({
     borderColor: '#C5CAE9',
   },
   statLabel: {
-    fontSize: 10,
+    fontSize: responsiveFontSize(10),
     fontWeight: '800',
     color: '#718096',
     letterSpacing: 0.5,
   },
   statNum: {
-    fontSize: 18,
+    fontSize: responsiveFontSize(18),
     fontWeight: '800',
   },
   greenStatText: {

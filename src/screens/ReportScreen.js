@@ -9,6 +9,7 @@ import {
   ScrollView,
   Alert,
 } from 'react-native';
+import { scale, verticalScale, responsiveFontSize, maxContainerWidth } from '../utils/responsive';
 
 export default function ReportScreen({ token, apiUrl }) {
   const [loading, setLoading] = useState(true);
@@ -346,7 +347,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#F7F9FC',
   },
   topHeader: {
-    height: 56,
+    height: verticalScale(56),
     backgroundColor: '#FFFFFF',
     alignItems: 'center',
     justifyContent: 'center',
@@ -354,7 +355,7 @@ const styles = StyleSheet.create({
     borderBottomColor: '#E2E8F0',
   },
   topHeaderTitle: {
-    fontSize: 17,
+    fontSize: responsiveFontSize(17),
     fontWeight: '800',
     color: '#1A202C',
   },
@@ -362,8 +363,8 @@ const styles = StyleSheet.create({
   // Selector Bar Dropdowns
   selectorsBar: {
     flexDirection: 'row',
-    padding: 12,
-    gap: 12,
+    padding: scale(12),
+    gap: verticalScale(12),
     backgroundColor: '#FFFFFF',
     borderBottomWidth: 1,
     borderBottomColor: '#E2E8F0',
@@ -374,7 +375,7 @@ const styles = StyleSheet.create({
     position: 'relative',
   },
   selectorBtn: {
-    height: 38,
+    height: verticalScale(38),
     borderWidth: 1,
     borderColor: '#CBD5E0',
     borderRadius: 8,
@@ -383,7 +384,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#F7F9FC',
   },
   selectorBtnText: {
-    fontSize: 13,
+    fontSize: responsiveFontSize(13),
     fontWeight: '700',
     color: '#4A5568',
   },
@@ -405,13 +406,13 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
   },
   dropdownOptionItem: {
-    paddingVertical: 10,
-    paddingHorizontal: 12,
+    paddingVertical: verticalScale(10),
+    paddingHorizontal: scale(12),
     borderBottomWidth: 1,
     borderBottomColor: '#F7F9FC',
   },
   optionText: {
-    fontSize: 13.5,
+    fontSize: responsiveFontSize(13.5),
     color: '#4A5568',
     fontWeight: '600',
   },
@@ -422,9 +423,9 @@ const styles = StyleSheet.create({
 
   // Main Scrollable Area
   scrollContainer: {
-    padding: 16,
-    gap: 16,
-    paddingBottom: 40,
+    padding: scale(16),
+    gap: verticalScale(16),
+    paddingBottom: verticalScale(40),
   },
 
   // Report Cards
@@ -433,7 +434,7 @@ const styles = StyleSheet.create({
     borderRadius: 16,
     borderWidth: 1,
     borderColor: '#E2E8F0',
-    padding: 18,
+    padding: scale(18),
     shadowColor: '#1A202C',
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.02,
@@ -444,26 +445,26 @@ const styles = StyleSheet.create({
     borderLeftWidth: 6,
   },
   cardHeaderTitle: {
-    fontSize: 13,
+    fontSize: responsiveFontSize(13),
     fontWeight: '800',
     color: '#718096',
     textTransform: 'uppercase',
-    marginBottom: 12,
+    marginBottom: verticalScale(12),
     letterSpacing: 0.5,
   },
   gradeBadge: {
     alignSelf: 'flex-start',
-    paddingHorizontal: 12,
-    paddingVertical: 6,
+    paddingHorizontal: scale(12),
+    paddingVertical: verticalScale(6),
     borderRadius: 12,
-    marginBottom: 8,
+    marginBottom: verticalScale(8),
   },
   gradeText: {
-    fontSize: 14,
+    fontSize: responsiveFontSize(14),
     fontWeight: '800',
   },
   gradeDesc: {
-    fontSize: 12.5,
+    fontSize: responsiveFontSize(12.5),
     color: '#4A5568',
     lineHeight: 18,
     fontWeight: '600',
@@ -474,35 +475,35 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: 12,
+    marginBottom: verticalScale(12),
   },
   valueLabel: {
-    fontSize: 11,
+    fontSize: responsiveFontSize(11),
     color: '#A0AEC0',
     fontWeight: '700',
-    marginBottom: 3,
+    marginBottom: verticalScale(3),
   },
   valueNumber: {
-    fontSize: 18,
+    fontSize: responsiveFontSize(18),
     fontWeight: '800',
     color: '#2D3748',
   },
   subValueNumber: {
-    fontSize: 14,
+    fontSize: responsiveFontSize(14),
     fontWeight: '750',
     color: '#4A5568',
   },
 
   // Progress Bar
   progressContainer: {
-    marginBottom: 4,
+    marginBottom: verticalScale(4),
   },
   progressBarBg: {
-    height: 10,
+    height: verticalScale(10),
     backgroundColor: '#EDF2F7',
     borderRadius: 5,
     overflow: 'hidden',
-    marginBottom: 6,
+    marginBottom: verticalScale(6),
   },
   progressBarFill: {
     height: '100%',
@@ -514,26 +515,26 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   progressPctText: {
-    fontSize: 12,
+    fontSize: responsiveFontSize(12),
     fontWeight: '800',
     color: '#2D3748',
   },
   pipelineText: {
-    fontSize: 11.5,
+    fontSize: responsiveFontSize(11.5),
     fontWeight: '700',
     color: '#A0AEC0',
   },
   qtyStatsDivider: {
     height: 1,
     backgroundColor: '#EDF2F7',
-    marginVertical: 12,
+    marginVertical: verticalScale(12),
   },
   attendanceNoteText: {
-    fontSize: 11,
+    fontSize: responsiveFontSize(11),
     color: '#A0AEC0',
     lineHeight: 15,
     fontWeight: '550',
-    marginTop: 10,
+    marginTop: verticalScale(10),
   },
 
   // Loading indicator states
@@ -541,10 +542,10 @@ const styles = StyleSheet.create({
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 12,
+    gap: verticalScale(12),
   },
   loadingText: {
-    fontSize: 13.5,
+    fontSize: responsiveFontSize(13.5),
     color: '#718096',
     fontWeight: '650',
   },

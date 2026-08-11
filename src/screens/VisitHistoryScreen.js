@@ -10,6 +10,7 @@ import {
   RefreshControl,
   FlatList,
 } from 'react-native';
+import { scale, verticalScale, responsiveFontSize, maxContainerWidth } from '../utils/responsive';
 
 export default function VisitHistoryScreen({ token, apiUrl, user }) {
   const [loading, setLoading] = useState(true);
@@ -305,7 +306,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#F7F9FC',
   },
   topHeader: {
-    height: 56,
+    height: verticalScale(56),
     backgroundColor: '#FFFFFF',
     alignItems: 'center',
     justifyContent: 'center',
@@ -313,7 +314,7 @@ const styles = StyleSheet.create({
     borderBottomColor: '#E2E8F0',
   },
   topHeaderTitle: {
-    fontSize: 17,
+    fontSize: responsiveFontSize(17),
     fontWeight: '800',
     color: '#1A202C',
   },
@@ -323,15 +324,15 @@ const styles = StyleSheet.create({
     backgroundColor: '#FFFFFF',
     borderBottomWidth: 1,
     borderBottomColor: '#E2E8F0',
-    paddingVertical: 12,
+    paddingVertical: verticalScale(12),
   },
   dateSelectorScroll: {
-    paddingHorizontal: 16,
-    gap: 10,
+    paddingHorizontal: scale(16),
+    gap: verticalScale(10),
   },
   dateCard: {
-    width: 60,
-    height: 80,
+    width: scale(60),
+    height: verticalScale(80),
     backgroundColor: '#F7F9FC',
     borderRadius: 12,
     alignItems: 'center',
@@ -348,20 +349,20 @@ const styles = StyleSheet.create({
     borderWidth: 1.5,
   },
   dayText: {
-    fontSize: 10,
+    fontSize: responsiveFontSize(10),
     fontWeight: '700',
     color: '#718096',
     textTransform: 'uppercase',
-    marginBottom: 4,
+    marginBottom: verticalScale(4),
   },
   dateNumberText: {
-    fontSize: 18,
+    fontSize: responsiveFontSize(18),
     fontWeight: '800',
     color: '#2D3748',
-    marginBottom: 4,
+    marginBottom: verticalScale(4),
   },
   monthText: {
-    fontSize: 9,
+    fontSize: responsiveFontSize(9),
     fontWeight: '700',
     color: '#A0AEC0',
     textTransform: 'uppercase',
@@ -372,18 +373,18 @@ const styles = StyleSheet.create({
 
   // Content styles
   scrollContent: {
-    padding: 16,
-    paddingBottom: 40,
-    gap: 16,
+    padding: scale(16),
+    paddingBottom: verticalScale(40),
+    gap: verticalScale(16),
   },
   centered: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 10,
+    gap: verticalScale(10),
   },
   loadingText: {
-    fontSize: 13,
+    fontSize: responsiveFontSize(13),
     color: '#718096',
     fontWeight: '600',
   },
@@ -394,7 +395,7 @@ const styles = StyleSheet.create({
     borderRadius: 16,
     borderWidth: 1,
     borderColor: '#E2E8F0',
-    padding: 16,
+    padding: scale(16),
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.02,
@@ -402,10 +403,10 @@ const styles = StyleSheet.create({
     elevation: 1,
   },
   summaryTitle: {
-    fontSize: 11,
+    fontSize: responsiveFontSize(11),
     fontWeight: '800',
     color: '#718096',
-    marginBottom: 12,
+    marginBottom: verticalScale(12),
     letterSpacing: 0.5,
   },
   statsRow: {
@@ -418,19 +419,19 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   statVal: {
-    fontSize: 18,
+    fontSize: responsiveFontSize(18),
     fontWeight: '800',
     color: '#2D3748',
-    marginBottom: 2,
+    marginBottom: verticalScale(2),
   },
   statLbl: {
-    fontSize: 10,
+    fontSize: responsiveFontSize(10),
     color: '#A0AEC0',
     fontWeight: '700',
   },
   statCellDivider: {
     width: 1,
-    height: 24,
+    height: verticalScale(24),
     backgroundColor: '#E2E8F0',
   },
 
@@ -438,22 +439,22 @@ const styles = StyleSheet.create({
   emptyContainer: {
     alignItems: 'center',
     justifyContent: 'center',
-    paddingVertical: 80,
-    paddingHorizontal: 20,
+    paddingVertical: verticalScale(80),
+    paddingHorizontal: scale(20),
   },
   emptyIcon: {
-    fontSize: 48,
-    marginBottom: 16,
+    fontSize: responsiveFontSize(48),
+    marginBottom: verticalScale(16),
     opacity: 0.7,
   },
   emptyTitle: {
-    fontSize: 17,
+    fontSize: responsiveFontSize(17),
     fontWeight: '700',
     color: '#2D3748',
-    marginBottom: 6,
+    marginBottom: verticalScale(6),
   },
   emptyDesc: {
-    fontSize: 12.5,
+    fontSize: responsiveFontSize(12.5),
     color: '#718096',
     textAlign: 'center',
     lineHeight: 18,
@@ -461,22 +462,22 @@ const styles = StyleSheet.create({
 
   // Timeline list
   timelineList: {
-    paddingLeft: 4,
+    paddingLeft: scale(4),
   },
   visitTimelineWrapper: {
     flexDirection: 'row',
     minHeight: 140,
   },
   timelineIndicatorsColumn: {
-    width: 16,
+    width: scale(16),
     alignItems: 'center',
-    marginRight: 12,
+    marginRight: scale(12),
   },
   timelineNode: {
-    width: 12,
-    height: 12,
+    width: scale(12),
+    height: verticalScale(12),
     borderRadius: 6,
-    marginTop: 20,
+    marginTop: verticalScale(20),
     zIndex: 2,
     borderWidth: 2,
     borderColor: '#FFFFFF',
@@ -490,7 +491,7 @@ const styles = StyleSheet.create({
     flex: 1,
     width: 2,
     backgroundColor: '#CBD5E0',
-    marginVertical: 4,
+    marginVertical: verticalScale(4),
   },
 
   // Visit card
@@ -500,8 +501,8 @@ const styles = StyleSheet.create({
     borderRadius: 14,
     borderWidth: 1,
     borderColor: '#E2E8F0',
-    padding: 16,
-    marginBottom: 12,
+    padding: scale(16),
+    marginBottom: verticalScale(12),
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.02,
@@ -512,33 +513,33 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'flex-start',
-    gap: 12,
+    gap: verticalScale(12),
   },
   shopNameText: {
-    fontSize: 14.5,
+    fontSize: responsiveFontSize(14.5),
     fontWeight: '800',
     color: '#2D3748',
     flex: 1,
   },
   statusBadge: {
-    paddingHorizontal: 8,
-    paddingVertical: 3,
+    paddingHorizontal: scale(8),
+    paddingVertical: verticalScale(3),
     borderRadius: 8,
   },
   statusText: {
-    fontSize: 10,
+    fontSize: responsiveFontSize(10),
     fontWeight: '800',
   },
   addressText: {
-    fontSize: 11.5,
+    fontSize: responsiveFontSize(11.5),
     color: '#718096',
-    marginTop: 4,
+    marginTop: verticalScale(4),
     lineHeight: 16,
   },
   divider: {
     height: 1,
     backgroundColor: '#EDF2F7',
-    marginVertical: 12,
+    marginVertical: verticalScale(12),
   },
   timeInfoRow: {
     flexDirection: 'row',
@@ -548,30 +549,30 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   timeLbl: {
-    fontSize: 9.5,
+    fontSize: responsiveFontSize(9.5),
     color: '#A0AEC0',
     fontWeight: '700',
     textTransform: 'uppercase',
-    marginBottom: 3,
+    marginBottom: verticalScale(3),
   },
   timeVal: {
-    fontSize: 12.5,
+    fontSize: responsiveFontSize(12.5),
     fontWeight: '800',
     color: '#2D3748',
   },
   tagsContainer: {
     flexDirection: 'row',
     flexWrap: 'wrap',
-    gap: 8,
-    marginTop: 12,
+    gap: verticalScale(8),
+    marginTop: verticalScale(12),
   },
   indicatorTag: {
-    paddingHorizontal: 8,
-    paddingVertical: 4,
+    paddingHorizontal: scale(8),
+    paddingVertical: verticalScale(4),
     borderRadius: 6,
   },
   indicatorTagText: {
-    fontSize: 10,
+    fontSize: responsiveFontSize(10),
     fontWeight: '800',
   },
 });

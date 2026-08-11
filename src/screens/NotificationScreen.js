@@ -10,6 +10,7 @@ import {
   Alert,
   SafeAreaView,
 } from 'react-native';
+import { scale, verticalScale, responsiveFontSize, maxContainerWidth } from '../utils/responsive';
 
 export default function NotificationScreen({ token, apiUrl, onBack, onClearBadge }) {
   const [notifications, setNotifications] = useState([]);
@@ -203,8 +204,8 @@ const styles = StyleSheet.create({
     backgroundColor: '#F7F9FC',
   },
   loadingText: {
-    marginTop: 12,
-    fontSize: 14,
+    marginTop: verticalScale(12),
+    fontSize: responsiveFontSize(14),
     color: '#718096',
     fontWeight: '600',
   },
@@ -214,35 +215,35 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: 16,
-    paddingVertical: 12,
+    paddingHorizontal: scale(16),
+    paddingVertical: verticalScale(12),
     backgroundColor: '#FFFFFF',
     borderBottomWidth: 1,
     borderBottomColor: '#E2E8F0',
   },
   backBtn: {
-    width: 36,
-    height: 36,
+    width: scale(36),
+    height: verticalScale(36),
     borderRadius: 18,
     backgroundColor: '#F7F9FC',
     alignItems: 'center',
     justifyContent: 'center',
   },
   backBtnText: {
-    fontSize: 20,
+    fontSize: responsiveFontSize(20),
     color: '#2D3748',
     fontWeight: '600',
   },
   topBarTitle: {
-    fontSize: 18,
+    fontSize: responsiveFontSize(18),
     fontWeight: '700',
     color: '#1A202C',
   },
 
   // List Container
   listContainer: {
-    padding: 16,
-    gap: 12,
+    padding: scale(16),
+    gap: verticalScale(12),
   },
 
   // Notification Card
@@ -251,7 +252,7 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     borderWidth: 1,
     borderColor: '#E2E8F0',
-    padding: 16,
+    padding: scale(16),
     shadowColor: '#1A202C',
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.02,
@@ -267,10 +268,10 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: 6,
+    marginBottom: verticalScale(6),
   },
   notificationTitle: {
-    fontSize: 15,
+    fontSize: responsiveFontSize(15),
     fontWeight: '750',
     color: '#2D3748',
     flex: 1,
@@ -280,16 +281,16 @@ const styles = StyleSheet.create({
     height: 8,
     borderRadius: 4,
     backgroundColor: '#00BFA5',
-    marginLeft: 10,
+    marginLeft: scale(10),
   },
   notificationMessage: {
-    fontSize: 13.5,
+    fontSize: responsiveFontSize(13.5),
     color: '#4A5568',
     lineHeight: 18,
-    marginBottom: 8,
+    marginBottom: verticalScale(8),
   },
   notificationDate: {
-    fontSize: 11,
+    fontSize: responsiveFontSize(11),
     color: '#A0AEC0',
     fontWeight: '650',
   },
@@ -298,57 +299,57 @@ const styles = StyleSheet.create({
   loadMoreBtn: {
     alignItems: 'center',
     justifyContent: 'center',
-    paddingVertical: 12,
+    paddingVertical: verticalScale(12),
     backgroundColor: '#FFFFFF',
     borderRadius: 8,
     borderWidth: 1,
     borderColor: '#E2E8F0',
-    marginTop: 10,
-    marginBottom: 20,
+    marginTop: verticalScale(10),
+    marginBottom: verticalScale(20),
   },
   loadMoreText: {
-    fontSize: 13.5,
+    fontSize: responsiveFontSize(13.5),
     fontWeight: '700',
     color: '#00796B',
   },
   noMoreText: {
     textAlign: 'center',
     color: '#A0AEC0',
-    fontSize: 12,
+    fontSize: responsiveFontSize(12),
     fontWeight: '600',
-    marginTop: 10,
-    marginBottom: 20,
+    marginTop: verticalScale(10),
+    marginBottom: verticalScale(20),
   },
 
   // Empty State
   emptyContainer: {
     alignItems: 'center',
     justifyContent: 'center',
-    paddingVertical: 80,
+    paddingVertical: verticalScale(80),
   },
   emptyIcon: {
-    fontSize: 48,
-    marginBottom: 16,
+    fontSize: responsiveFontSize(48),
+    marginBottom: verticalScale(16),
     opacity: 0.5,
   },
   emptyTitle: {
-    fontSize: 18,
+    fontSize: responsiveFontSize(18),
     fontWeight: '700',
     color: '#2D3748',
-    marginBottom: 6,
+    marginBottom: verticalScale(6),
   },
   emptyDesc: {
-    fontSize: 13,
+    fontSize: responsiveFontSize(13),
     color: '#718096',
   },
   cardFooter: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginTop: 4,
+    marginTop: verticalScale(4),
   },
   expandHintText: {
-    fontSize: 11,
+    fontSize: responsiveFontSize(11),
     color: '#A0AEC0',
     fontWeight: '700',
   },

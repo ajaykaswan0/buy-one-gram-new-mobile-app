@@ -11,6 +11,7 @@ import {
   RefreshControl,
   Alert,
 } from 'react-native';
+import { scale, verticalScale, responsiveFontSize, maxContainerWidth } from '../utils/responsive';
 import PartyProfileScreen from './PartyProfileScreen';
 
 export default function OutstandingListScreen({ token, apiUrl, onBack, onNavigateToOrder }) {
@@ -183,66 +184,66 @@ const styles = StyleSheet.create({
     backgroundColor: '#F7F9FC',
   },
   topHeader: {
-    height: 56,
+    height: verticalScale(56),
     backgroundColor: '#FFFFFF',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: 16,
+    paddingHorizontal: scale(16),
     flexDirection: 'row',
     borderBottomWidth: 1,
     borderBottomColor: '#E2E8F0',
   },
   backBtn: {
-    width: 36,
-    height: 36,
+    width: scale(36),
+    height: verticalScale(36),
     borderRadius: 18,
     backgroundColor: '#F7F9FC',
     alignItems: 'center',
     justifyContent: 'center',
   },
   backBtnText: {
-    fontSize: 20,
+    fontSize: responsiveFontSize(20),
     color: '#2D3748',
     fontWeight: '600',
   },
   topHeaderTitle: {
-    fontSize: 16.5,
+    fontSize: responsiveFontSize(16.5),
     fontWeight: '800',
     color: '#1A202C',
   },
 
   // Search
   searchRow: {
-    paddingHorizontal: 16,
-    paddingVertical: 12,
+    paddingHorizontal: scale(16),
+    paddingVertical: verticalScale(12),
     backgroundColor: '#FFFFFF',
     borderBottomWidth: 1,
     borderBottomColor: '#E2E8F0',
   },
   searchInput: {
-    height: 40,
+    height: verticalScale(40),
     backgroundColor: '#F7F9FC',
     borderWidth: 1,
     borderColor: '#E2E8F0',
     borderRadius: 8,
-    paddingHorizontal: 12,
+    paddingHorizontal: scale(12),
     color: '#2D3748',
-    fontSize: 13.5,
+    fontSize: responsiveFontSize(13.5),
   },
 
   // Content
   scrollContent: {
-    padding: 16,
-    paddingBottom: 40,
+    padding: scale(16),
+    paddingBottom: verticalScale(40),
   },
   centered: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 10,
+    gap: verticalScale(10),
   },
   loadingText: {
-    fontSize: 13.5,
+    fontSize: responsiveFontSize(13.5),
     color: '#718096',
     fontWeight: '650',
   },
@@ -251,22 +252,22 @@ const styles = StyleSheet.create({
   emptyContainer: {
     alignItems: 'center',
     justifyContent: 'center',
-    paddingVertical: 80,
-    paddingHorizontal: 20,
+    paddingVertical: verticalScale(80),
+    paddingHorizontal: scale(20),
   },
   emptyIcon: {
-    fontSize: 48,
-    marginBottom: 16,
+    fontSize: responsiveFontSize(48),
+    marginBottom: verticalScale(16),
     opacity: 0.7,
   },
   emptyTitle: {
-    fontSize: 18,
+    fontSize: responsiveFontSize(18),
     fontWeight: '700',
     color: '#2D3748',
-    marginBottom: 6,
+    marginBottom: verticalScale(6),
   },
   emptyDesc: {
-    fontSize: 13,
+    fontSize: responsiveFontSize(13),
     color: '#718096',
     textAlign: 'center',
     lineHeight: 18,
@@ -274,14 +275,14 @@ const styles = StyleSheet.create({
 
   // Cards
   listContainer: {
-    gap: 12,
+    gap: verticalScale(12),
   },
   partyCard: {
     backgroundColor: '#FFFFFF',
     borderRadius: 14,
     borderWidth: 1,
     borderColor: '#E2E8F0',
-    padding: 16,
+    padding: scale(16),
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.02,
@@ -292,46 +293,46 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'flex-start',
-    gap: 12,
+    gap: verticalScale(12),
   },
   partyName: {
-    fontSize: 14.5,
+    fontSize: responsiveFontSize(14.5),
     fontWeight: '800',
     color: '#2D3748',
   },
   partyCode: {
-    fontSize: 11,
+    fontSize: responsiveFontSize(11),
     color: '#A0AEC0',
     fontWeight: '600',
-    marginTop: 2,
+    marginTop: verticalScale(2),
   },
   outstandingVal: {
-    fontSize: 17,
+    fontSize: responsiveFontSize(17),
     fontWeight: '850',
     color: '#E53E3E',
   },
   divider: {
     height: 1,
     backgroundColor: '#EDF2F7',
-    marginVertical: 12,
+    marginVertical: verticalScale(12),
   },
   detailsRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    gap: 10,
+    gap: verticalScale(10),
   },
   detailBlock: {
     flex: 1,
   },
   detailLabel: {
-    fontSize: 9.5,
+    fontSize: responsiveFontSize(9.5),
     color: '#A0AEC0',
     fontWeight: '700',
     textTransform: 'uppercase',
-    marginBottom: 3,
+    marginBottom: verticalScale(3),
   },
   detailVal: {
-    fontSize: 12.5,
+    fontSize: responsiveFontSize(12.5),
     fontWeight: '750',
     color: '#4A5568',
   },

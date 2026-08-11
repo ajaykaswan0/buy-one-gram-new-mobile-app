@@ -12,6 +12,7 @@ import {
   Alert,
   FlatList,
 } from 'react-native';
+import { scale, verticalScale, responsiveFontSize, maxContainerWidth } from '../utils/responsive';
 import { FirebaseImage } from '../services/firebaseUploadService';
 
 export default function CrmDashboardScreen({
@@ -33,9 +34,12 @@ export default function CrmDashboardScreen({
   const [selectedSalesman, setSelectedSalesman] = useState(null); // null = All Salesmen
 
   const [parties, setParties] = useState([]);
-  const [filteredParties, setFilteredParties] = useState([]);
-  const [searchQuery, setSearchQuery] = useState('');
+  const [page, setPage] = useState(1);
+  const [hasMore, setHasMore] = useState(true);
   const [loadingParties, setLoadingParties] = useState(false);
+  const [loadingMoreParties, setLoadingMoreParties] = useState(false);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
   const [error, setError] = useState('');
 
   // Selected party for profile view
@@ -46,29 +50,18 @@ export default function CrmDashboardScreen({
   const [partyRateList, setPartyRateList] = useState([]);
   const [loadingProfileData, setLoadingProfileData] = useState(false);
 
-  // CRM sees only parties explicitly assigned to this CRM manager.
+  // Initial load
   useEffect(() => {
-    fetchParties();
+    fetchParties(1, '');
   }, [apiUrl, token]);
 
-  // Filter parties by search query
+  // Debounced server-side search
   useEffect(() => {
-    if (!searchQuery.trim()) {
-      setFilteredParties(parties);
-    } else {
-      const q = searchQuery.toLowerCase().trim();
-      setFilteredParties(
-        parties.filter(
-          (p) =>
-            (p.partyName && p.partyName.toLowerCase().includes(q)) ||
-            (p.ownerName && p.ownerName.toLowerCase().includes(q)) ||
-            (p.mobile && p.mobile.includes(q)) ||
-            (p.area && p.area.toLowerCase().includes(q)) ||
-            (p.city && p.city.toLowerCase().includes(q))
-        )
-      );
-    }
-  }, [searchQuery, parties]);
+    const timer = setTimeout(() => {
+      fetchParties(1, searchQuery);
+    }, 350);
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
 
   const fetchSalesmen = async () => {
     try {
@@ -92,27 +85,48 @@ export default function CrmDashboardScreen({
     }
   };
 
-  const fetchParties = async () => {
-    setLoadingParties(true);
+  const fetchParties = async (pageNum = 1, query = '') => {
+    const isSearchActive = query.trim().length > 0;
+    if (pageNum === 1) {
+      if (isSearchActive) setSearchLoading(true);
+      else setLoadingParties(true);
+    } else {
+      setLoadingMoreParties(true);
+    }
     setError('');
+
     try {
-      const endpoint = `${apiUrl}/parties/my?limit=300`;
+      const endpoint = isSearchActive
+        ? `${apiUrl}/parties?search=${encodeURIComponent(query.trim())}&page=${pageNum}&limit=20`
+        : `${apiUrl}/parties/my?page=${pageNum}&limit=20`;
+
       const res = await fetch(endpoint, {
         headers: { Authorization: `Bearer ${token}` },
       });
       const data = await res.json();
 
       if (res.ok && data.success && Array.isArray(data.data)) {
-        setParties(data.data);
+        const newItems = data.data;
+        const meta = data.meta || {};
+        setParties(prev => pageNum === 1 ? newItems : [...prev, ...newItems]);
+        setPage(pageNum);
+        setHasMore(meta.totalPages ? pageNum < meta.totalPages : newItems.length >= 20);
       } else {
         throw new Error(data.message || 'Failed to fetch parties');
       }
     } catch (err) {
       console.log('[CrmDashboardScreen] Error fetching parties:', err.message);
-      setError('Could not load parties list.');
     } finally {
       setLoadingParties(false);
+      setLoadingMoreParties(false);
+      setSearchLoading(false);
       setLoading(false);
+    }
+  };
+
+  const handleLoadMoreParties = () => {
+    if (!loadingParties && !loadingMoreParties && hasMore) {
+      fetchParties(page + 1, searchQuery);
     }
   };
 
@@ -263,7 +277,9 @@ export default function CrmDashboardScreen({
             value={searchQuery}
             onChangeText={setSearchQuery}
           />
-          {searchQuery ? (
+          {searchLoading ? (
+            <ActivityIndicator size="small" color="#00796B" style={{ marginRight: 6 }} />
+          ) : searchQuery ? (
             <TouchableOpacity onPress={() => setSearchQuery('')}>
               <Text style={styles.clearSearchText}>✕</Text>
             </TouchableOpacity>
@@ -279,11 +295,11 @@ export default function CrmDashboardScreen({
         ) : error ? (
           <View style={styles.errorCard}>
             <Text style={styles.errorText}>{error}</Text>
-            <TouchableOpacity style={styles.retryBtn} onPress={fetchParties}>
+            <TouchableOpacity style={styles.retryBtn} onPress={() => fetchParties(1, searchQuery)}>
               <Text style={styles.retryBtnText}>Retry</Text>
             </TouchableOpacity>
           </View>
-        ) : filteredParties.length === 0 ? (
+        ) : parties.length === 0 ? (
           <View style={styles.emptyContainer}>
             <Text style={{ fontSize: 40, marginBottom: 8 }}>🏬</Text>
             <Text style={styles.emptyTitle}>No Parties Found</Text>
@@ -296,11 +312,16 @@ export default function CrmDashboardScreen({
         ) : (
           <View>
             <Text style={styles.listHeader}>
-              Parties List ({filteredParties.length})
+              Parties List ({parties.length})
             </Text>
 
-            {filteredParties.map((party) => (
-              <View key={party._id} style={styles.partyCard}>
+            {parties.map((party) => (
+              <TouchableOpacity
+                activeOpacity={0.85}
+                key={party._id}
+                style={styles.partyCard}
+                onPress={() => onNavigateToPartyProfile ? onNavigateToPartyProfile(party._id) : handleOpenPartyProfile(party)}
+              >
                 <View style={styles.partyCardHeader}>
                   <View style={{ flex: 1 }}>
                     <Text style={styles.partyName}>{party.partyName}</Text>
@@ -324,21 +345,18 @@ export default function CrmDashboardScreen({
                 {/* Party Actions Row */}
                 <View style={styles.partyActionsRow}>
                   <TouchableOpacity
-                    style={[styles.partyActionBtn, styles.profileBtn]}
-                    onPress={() => onNavigateToPartyProfile ? onNavigateToPartyProfile(party._id) : handleOpenPartyProfile(party)}
-                  >
-                    <Text style={styles.profileBtnText}>👁️ View Profile</Text>
-                  </TouchableOpacity>
-
-                  <TouchableOpacity
-                    style={[styles.partyActionBtn, styles.collectBtn]}
+                    style={[styles.partyActionBtn, styles.collectBtn, { flex: 1 }]}
                     onPress={() => onNavigateToCollection && onNavigateToCollection(party)}
                   >
                     <Text style={styles.collectBtnText}>💵 Collect Money</Text>
                   </TouchableOpacity>
                 </View>
-              </View>
+              </TouchableOpacity>
             ))}
+
+            {loadingMoreParties ? (
+              <ActivityIndicator size="small" color="#00796B" style={{ marginVertical: 16 }} />
+            ) : null}
           </View>
         )}
       </ScrollView>
@@ -523,63 +541,63 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: 16,
-    paddingVertical: 14,
+    paddingHorizontal: scale(16),
+    paddingVertical: verticalScale(14),
     backgroundColor: '#00796B',
   },
   headerTitle: {
     color: '#FFF',
-    fontSize: 18,
+    fontSize: responsiveFontSize(18),
     fontWeight: '700',
   },
   headerSubtitle: {
     color: '#E6FFFA',
-    fontSize: 12,
-    marginTop: 2,
+    fontSize: responsiveFontSize(12),
+    marginTop: verticalScale(2),
   },
   logoutBtn: {
     backgroundColor: 'rgba(255, 255, 255, 0.2)',
-    paddingHorizontal: 12,
-    paddingVertical: 6,
+    paddingHorizontal: scale(12),
+    paddingVertical: verticalScale(6),
     borderRadius: 6,
   },
   logoutBtnText: {
     color: '#FFF',
-    fontSize: 12,
+    fontSize: responsiveFontSize(12),
     fontWeight: '700',
   },
   container: {
-    padding: 16,
+    padding: scale(16),
   },
   sectionCard: {
     backgroundColor: '#FFF',
     borderRadius: 12,
-    padding: 14,
-    marginBottom: 14,
+    padding: scale(14),
+    marginBottom: verticalScale(14),
     elevation: 1,
   },
   sectionTitle: {
-    fontSize: 15,
+    fontSize: responsiveFontSize(15),
     fontWeight: '700',
     color: '#2D3748',
-    marginBottom: 10,
+    marginBottom: verticalScale(10),
   },
   salesmenChipRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
+    gap: verticalScale(8),
   },
   salesmanChip: {
     backgroundColor: '#EDF2F7',
-    paddingHorizontal: 12,
-    paddingVertical: 8,
+    paddingHorizontal: scale(12),
+    paddingVertical: verticalScale(8),
     borderRadius: 20,
   },
   activeSalesmanChip: {
     backgroundColor: '#00796B',
   },
   salesmanChipText: {
-    fontSize: 13,
+    fontSize: responsiveFontSize(13),
     fontWeight: '600',
     color: '#4A5568',
   },
@@ -590,8 +608,8 @@ const styles = StyleSheet.create({
   summaryCard: {
     backgroundColor: '#FFF',
     borderRadius: 12,
-    padding: 14,
-    marginBottom: 14,
+    padding: scale(14),
+    marginBottom: verticalScale(14),
     elevation: 1,
   },
   summaryRow: {
@@ -604,18 +622,18 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   summaryLabel: {
-    fontSize: 11,
+    fontSize: responsiveFontSize(11),
     color: '#718096',
-    marginBottom: 2,
+    marginBottom: verticalScale(2),
   },
   summaryValue: {
-    fontSize: 15,
+    fontSize: responsiveFontSize(15),
     fontWeight: '700',
     color: '#1A202C',
   },
   summaryDivider: {
     width: 1,
-    height: 24,
+    height: verticalScale(24),
     backgroundColor: '#E2E8F0',
   },
   searchContainer: {
@@ -623,28 +641,28 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     backgroundColor: '#FFF',
     borderRadius: 8,
-    paddingHorizontal: 12,
-    marginBottom: 14,
+    paddingHorizontal: scale(12),
+    marginBottom: verticalScale(14),
     borderWidth: 1,
     borderColor: '#E2E8F0',
   },
   searchInput: {
     flex: 1,
-    height: 44,
-    fontSize: 14,
+    height: verticalScale(44),
+    fontSize: responsiveFontSize(14),
     color: '#2D3748',
   },
   clearSearchText: {
-    fontSize: 16,
+    fontSize: responsiveFontSize(16),
     color: '#A0AEC0',
-    padding: 4,
+    padding: scale(4),
   },
   loaderContainer: {
     alignItems: 'center',
-    marginVertical: 40,
+    marginVertical: verticalScale(40),
   },
   loaderText: {
-    marginTop: 10,
+    marginTop: verticalScale(10),
     color: '#718096',
   },
   errorCard: {
@@ -652,17 +670,17 @@ const styles = StyleSheet.create({
     borderColor: '#FEB2B2',
     borderWidth: 1,
     borderRadius: 8,
-    padding: 14,
+    padding: scale(14),
     alignItems: 'center',
   },
   errorText: {
     color: '#E53E3E',
-    marginBottom: 8,
+    marginBottom: verticalScale(8),
   },
   retryBtn: {
     backgroundColor: '#E53E3E',
-    paddingHorizontal: 14,
-    paddingVertical: 6,
+    paddingHorizontal: scale(14),
+    paddingVertical: verticalScale(6),
     borderRadius: 6,
   },
   retryBtnText: {
@@ -671,30 +689,30 @@ const styles = StyleSheet.create({
   },
   emptyContainer: {
     alignItems: 'center',
-    marginVertical: 40,
+    marginVertical: verticalScale(40),
   },
   emptyTitle: {
-    fontSize: 18,
+    fontSize: responsiveFontSize(18),
     fontWeight: '700',
     color: '#2D3748',
   },
   emptySubtitle: {
-    fontSize: 13,
+    fontSize: responsiveFontSize(13),
     color: '#718096',
     textAlign: 'center',
-    marginTop: 4,
+    marginTop: verticalScale(4),
   },
   listHeader: {
-    fontSize: 15,
+    fontSize: responsiveFontSize(15),
     fontWeight: '700',
     color: '#2D3748',
-    marginBottom: 10,
+    marginBottom: verticalScale(10),
   },
   partyCard: {
     backgroundColor: '#FFF',
     borderRadius: 12,
-    padding: 14,
-    marginBottom: 12,
+    padding: scale(14),
+    marginBottom: verticalScale(12),
     elevation: 2,
   },
   partyCardHeader: {
@@ -702,52 +720,52 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   partyName: {
-    fontSize: 16,
+    fontSize: responsiveFontSize(16),
     fontWeight: '700',
     color: '#1A202C',
   },
   partyCode: {
-    fontSize: 12,
+    fontSize: responsiveFontSize(12),
     color: '#718096',
-    marginTop: 2,
+    marginTop: verticalScale(2),
   },
   partyAddress: {
-    fontSize: 12,
+    fontSize: responsiveFontSize(12),
     color: '#4A5568',
-    marginTop: 4,
+    marginTop: verticalScale(4),
   },
   outstandingBadge: {
     backgroundColor: '#FFFAF0',
     borderColor: '#FBD38D',
     borderWidth: 1,
     borderRadius: 8,
-    paddingHorizontal: 10,
-    paddingVertical: 6,
+    paddingHorizontal: scale(10),
+    paddingVertical: verticalScale(6),
     alignItems: 'flex-end',
     alignSelf: 'flex-start',
   },
   outstandingBadgeLabel: {
-    fontSize: 10,
+    fontSize: responsiveFontSize(10),
     color: '#C05621',
     fontWeight: '600',
   },
   outstandingBadgeValue: {
-    fontSize: 14,
+    fontSize: responsiveFontSize(14),
     fontWeight: '700',
     color: '#DD6B20',
   },
   partyDivider: {
     height: 1,
     backgroundColor: '#EDF2F7',
-    marginVertical: 12,
+    marginVertical: verticalScale(12),
   },
   partyActionsRow: {
     flexDirection: 'row',
-    gap: 8,
+    gap: verticalScale(8),
   },
   partyActionBtn: {
     flex: 1,
-    paddingVertical: 9,
+    paddingVertical: verticalScale(9),
     borderRadius: 6,
     alignItems: 'center',
   },
@@ -756,7 +774,7 @@ const styles = StyleSheet.create({
   },
   profileBtnText: {
     color: '#2D3748',
-    fontSize: 13,
+    fontSize: responsiveFontSize(13),
     fontWeight: '700',
   },
   collectBtn: {
@@ -764,7 +782,7 @@ const styles = StyleSheet.create({
   },
   collectBtnText: {
     color: '#FFF',
-    fontSize: 13,
+    fontSize: responsiveFontSize(13),
     fontWeight: '700',
   },
 
@@ -773,60 +791,60 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    padding: 16,
+    padding: scale(16),
     borderBottomWidth: 1,
     borderBottomColor: '#E2E8F0',
   },
   modalCloseText: {
-    fontSize: 16,
+    fontSize: responsiveFontSize(16),
     color: '#E53E3E',
     fontWeight: '700',
   },
   modalTitle: {
-    fontSize: 16,
+    fontSize: responsiveFontSize(16),
     fontWeight: '700',
     color: '#2D3748',
   },
   profileBanner: {
     flexDirection: 'row',
     alignItems: 'center',
-    padding: 16,
+    padding: scale(16),
     backgroundColor: '#E6FFFA',
     borderBottomWidth: 1,
     borderBottomColor: '#B2F5EA',
   },
   shopPhoto: {
-    width: 60,
-    height: 60,
+    width: scale(60),
+    height: verticalScale(60),
     borderRadius: 8,
   },
   photoPlaceholder: {
-    width: 60,
-    height: 60,
+    width: scale(60),
+    height: verticalScale(60),
     borderRadius: 8,
     backgroundColor: '#CBD5E0',
     alignItems: 'center',
     justifyContent: 'center',
   },
   profilePartyName: {
-    fontSize: 17,
+    fontSize: responsiveFontSize(17),
     fontWeight: '700',
     color: '#004D40',
   },
   profileCodeText: {
-    fontSize: 12,
+    fontSize: responsiveFontSize(12),
     color: '#00796B',
   },
   profileSubText: {
-    fontSize: 13,
+    fontSize: responsiveFontSize(13),
     color: '#2D3748',
-    marginTop: 2,
+    marginTop: verticalScale(2),
   },
   profileOutText: {
-    fontSize: 14,
+    fontSize: responsiveFontSize(14),
     fontWeight: '700',
     color: '#C05621',
-    marginTop: 2,
+    marginTop: verticalScale(2),
   },
   profileTabsHeader: {
     flexDirection: 'row',
@@ -836,7 +854,7 @@ const styles = StyleSheet.create({
   },
   pTab: {
     flex: 1,
-    paddingVertical: 12,
+    paddingVertical: verticalScale(12),
     alignItems: 'center',
   },
   activePTab: {
@@ -845,7 +863,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#FFF',
   },
   pTabText: {
-    fontSize: 12,
+    fontSize: responsiveFontSize(12),
     color: '#718096',
     fontWeight: '600',
   },
@@ -857,108 +875,108 @@ const styles = StyleSheet.create({
     color: '#A0AEC0',
     fontStyle: 'italic',
     textAlign: 'center',
-    marginVertical: 30,
+    marginVertical: verticalScale(30),
   },
   orderCard: {
     backgroundColor: '#F7F9FC',
     borderRadius: 8,
-    padding: 12,
-    marginBottom: 8,
+    padding: scale(12),
+    marginBottom: verticalScale(8),
   },
   orderCardHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
   },
   orderNo: {
-    fontSize: 14,
+    fontSize: responsiveFontSize(14),
     fontWeight: '700',
     color: '#2D3748',
   },
   orderAmount: {
-    fontSize: 14,
+    fontSize: responsiveFontSize(14),
     fontWeight: '700',
     color: '#00796B',
   },
   orderSub: {
-    fontSize: 12,
+    fontSize: responsiveFontSize(12),
     color: '#718096',
-    marginTop: 4,
+    marginTop: verticalScale(4),
   },
   orderDate: {
-    fontSize: 11,
+    fontSize: responsiveFontSize(11),
     color: '#A0AEC0',
-    marginTop: 2,
+    marginTop: verticalScale(2),
   },
   colCard: {
     backgroundColor: '#F7F9FC',
     borderRadius: 8,
-    padding: 12,
-    marginBottom: 8,
+    padding: scale(12),
+    marginBottom: verticalScale(8),
   },
   colCardHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
   },
   colMode: {
-    fontSize: 14,
+    fontSize: responsiveFontSize(14),
     fontWeight: '700',
     color: '#2D3748',
   },
   colAmount: {
-    fontSize: 14,
+    fontSize: responsiveFontSize(14),
     fontWeight: '700',
     color: '#38A169',
   },
   colSub: {
-    fontSize: 12,
+    fontSize: responsiveFontSize(12),
     color: '#718096',
-    marginTop: 4,
+    marginTop: verticalScale(4),
   },
   colDate: {
-    fontSize: 11,
+    fontSize: responsiveFontSize(11),
     color: '#A0AEC0',
-    marginTop: 2,
+    marginTop: verticalScale(2),
   },
   rateListTitle: {
-    fontSize: 14,
+    fontSize: responsiveFontSize(14),
     fontWeight: '700',
     color: '#2D3748',
-    marginBottom: 10,
+    marginBottom: verticalScale(10),
   },
   rateCard: {
     backgroundColor: '#F7F9FC',
     borderRadius: 8,
-    padding: 12,
-    marginBottom: 8,
+    padding: scale(12),
+    marginBottom: verticalScale(8),
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
   },
   prodName: {
-    fontSize: 14,
+    fontSize: responsiveFontSize(14),
     fontWeight: '600',
     color: '#2D3748',
   },
   prodPrice: {
-    fontSize: 14,
+    fontSize: responsiveFontSize(14),
     fontWeight: '700',
     color: '#00796B',
   },
   modalFooter: {
-    padding: 16,
+    padding: scale(16),
     borderTopWidth: 1,
     borderTopColor: '#E2E8F0',
     backgroundColor: '#FFF',
   },
   footerCollectBtn: {
     backgroundColor: '#00796B',
-    paddingVertical: 14,
+    paddingVertical: verticalScale(14),
     borderRadius: 8,
     alignItems: 'center',
   },
   footerCollectBtnText: {
     color: '#FFF',
-    fontSize: 16,
+    fontSize: responsiveFontSize(16),
     fontWeight: '700',
   },
 });
