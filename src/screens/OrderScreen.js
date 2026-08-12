@@ -155,7 +155,15 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
       inventoryRows
         .filter((item) => !warehouseId || String(item.warehouse?._id || item.warehouse) === String(warehouseId))
         .forEach((item) => {
-          nextStock[String(item.variantId)] = Math.max(0, Number(item.availableQuantity ?? (Number(item.quantity || 0) - Number(item.reservedQuantity || 0))));
+          const rawVId = item.variantId?._id || item.variantId;
+          const vKey = rawVId ? String(rawVId) : null;
+          const avail = Math.max(0, Number(item.availableQuantity ?? (Number(item.quantity || 0) - Number(item.reservedQuantity || 0))));
+          if (vKey) {
+            nextStock[vKey] = (nextStock[vKey] || 0) + avail;
+          }
+          if (item.sku) {
+            nextStock[String(item.sku)] = (nextStock[String(item.sku)] || 0) + avail;
+          }
         });
       setStockMap(nextStock);
 
@@ -300,6 +308,14 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
     });
   };
 
+  // Helper to resolve stock value
+  const getResolvedStock = (variantId, sku) => {
+    const vIdStr = String(variantId);
+    if (stockMap[vIdStr] !== undefined) return stockMap[vIdStr];
+    if (sku && stockMap[String(sku)] !== undefined) return stockMap[String(sku)];
+    return loadingProducts ? undefined : 0;
+  };
+
   // Price updates
   const handlePriceChange = (product, variant, newPrice, minPrice) => {
     const finalPrice = newPrice < minPrice ? minPrice : newPrice;
@@ -314,7 +330,12 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
           rate: finalPrice,
         };
       } else {
-        // Auto-add to order if price is adjusted
+        const avail = getResolvedStock(variant._id, variant.sku);
+        if (avail === undefined || avail <= 0) {
+          Alert.alert('Out of Stock', `${variant.variantName} is out of stock.`);
+          return updated;
+        }
+        // Auto-add to order if price is adjusted and stock exists
         updated[variantId] = {
           product: {
             _id: product._id,
@@ -351,6 +372,10 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
             rate: parsed,
           };
         } else {
+          const avail = getResolvedStock(variant._id, variant.sku);
+          if (avail === undefined || avail <= 0) {
+            return updated;
+          }
           // Auto-add to order
           updated[variantId] = {
             product: {
@@ -381,7 +406,7 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
     let finalPrice = isNaN(parsed) ? minPrice : parsed;
     if (finalPrice < minPrice) {
       finalPrice = minPrice;
-      Alert.alert('Price Notice', `Price cannot be less than the fixed price of ₹${minPrice}`);
+      Alert.alert('Price Notice', `Price cannot be reduced by more than ₹1 below default rate (Min: ₹${minPrice})`);
     }
 
     setCustomRates(prev => ({ ...prev, [variantId]: finalPrice }));
@@ -394,6 +419,10 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
           rate: finalPrice,
         };
       } else {
+        const avail = getResolvedStock(variant._id, variant.sku);
+        if (avail === undefined || avail <= 0) {
+          return updated;
+        }
         // Auto-add to order
         updated[variantId] = {
           product: {
@@ -646,8 +675,13 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
                               const qty = orderItems[v._id]?.quantity || 0;
                               const currentRateVal = customRates[v._id] !== undefined ? customRates[v._id] : v.salesPrice;
                               const rate = typeof currentRateVal === 'number' ? currentRateVal : (parseFloat(currentRateVal) || v.salesPrice);
-                              const stockVal = stockMap[v._id];
+                              
+                              const stockVal = getResolvedStock(v._id, v.sku);
                               const isOutOfStock = stockVal === 0;
+                              const isAddDisabled = stockVal === undefined || stockVal <= 0;
+
+                              const defaultRate = Number(v.salesPrice || 0);
+                              const minRate = Math.max(0, defaultRate - 1);
 
                               return (
                                 <View key={v._id} style={styles.variantItemRow}>
@@ -673,8 +707,8 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
                                     <View style={styles.priceInputRow}>
                                       <TouchableOpacity
                                         style={styles.priceStepBtn}
-                                        onPress={() => handlePriceChange(product, v, rate - 1, v.salesPrice)}
-                                        disabled={rate <= v.salesPrice}
+                                        onPress={() => handlePriceChange(product, v, rate - 1, minRate)}
+                                        disabled={rate <= minRate}
                                       >
                                         <Text style={styles.priceStepText}>−</Text>
                                       </TouchableOpacity>
@@ -682,17 +716,17 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
                                         style={styles.priceTextInput}
                                         keyboardType="numeric"
                                         value={String(currentRateVal)}
-                                        onChangeText={(val) => handlePriceTextChange(product, v, val, v.salesPrice)}
-                                        onBlur={() => handlePriceBlur(product, v, currentRateVal, v.salesPrice)}
+                                        onChangeText={(val) => handlePriceTextChange(product, v, val, minRate)}
+                                        onBlur={() => handlePriceBlur(product, v, currentRateVal, minRate)}
                                       />
                                       <TouchableOpacity
                                         style={styles.priceStepBtn}
-                                        onPress={() => handlePriceChange(product, v, rate + 1, v.salesPrice)}
+                                        onPress={() => handlePriceChange(product, v, rate + 1, minRate)}
                                       >
                                         <Text style={styles.priceStepText}>+</Text>
                                       </TouchableOpacity>
                                     </View>
-                                    <Text style={styles.minPriceWarn}>Min: ₹{v.salesPrice}</Text>
+                                    <Text style={styles.minPriceWarn}>Min: ₹{minRate}</Text>
                                   </View>
 
                                   {/* Quantity Controls */}
@@ -701,9 +735,9 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
                                       <TouchableOpacity
                                         style={[
                                           styles.catalogAddBtn,
-                                          isOutOfStock && styles.disabledAddBtn
+                                          isAddDisabled && styles.disabledAddBtn
                                         ]}
-                                        disabled={isOutOfStock}
+                                        disabled={isAddDisabled}
                                         onPress={() => updateQuantity(product, v, 1)}
                                       >
                                         <Text style={styles.catalogAddBtnText}>+ ADD</Text>
