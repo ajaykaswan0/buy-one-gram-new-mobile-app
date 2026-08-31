@@ -1,4 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { useLanguage } from '../i18n';
+import OrderPaymentDetails from '../components/OrderPaymentDetails';
+import OrderStageTracker from '../components/OrderStageTracker';
 import {
   StyleSheet,
   Text,
@@ -23,7 +26,8 @@ const STATUS_OPTIONS = [
   { label: 'Cancelled', value: 'cancelled' },
 ];
 
-export default function OrderListScreen({ token, apiUrl, onBack }) {
+export default function OrderListScreen({ token, apiUrl, user, onBack }) {
+  const { t, term, name } = useLanguage();
   const [orders, setOrders] = useState([]);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -74,7 +78,18 @@ export default function OrderListScreen({ token, apiUrl, onBack }) {
 
     try {
       const { startDate, endDate } = getDateRange(dateTab);
-      let queryUrl = `${apiUrl}/order/my?page=${pageNum}&limit=10`;
+      /**
+       * "My Orders" means his own, even for a manager.
+       *
+       * Without this a CSO opening My Orders saw every order his whole team
+       * had written, which is what Team Performance is for. `scope=own` is
+       * what the server calls the caller's own book.
+       */
+      const role = String(user?.roleName || user?.role?.name || user?.role || '')
+        .toLowerCase().replace(/[\s_-]/g, '');
+      const ownScope = ['cso', 'crm', 'salespartner'].includes(role) ? '&scope=own' : '';
+
+      let queryUrl = `${apiUrl}/order/my?page=${pageNum}&limit=10${ownScope}`;
 
       if (searchQuery.trim()) {
         queryUrl += `&search=${encodeURIComponent(searchQuery.trim())}`;
@@ -151,28 +166,8 @@ export default function OrderListScreen({ token, apiUrl, onBack }) {
   };
 
   // Get status color tone
-  const getStatusStyle = (status) => {
-    switch (status) {
-      case 'draft':
-        return { bg: '#EDF2F7', text: '#4A5568' };
-      case 'confirmed':
-        return { bg: '#EBF8FF', text: '#2B6CB0' };
-      case 'packed':
-        return { bg: '#FEFCBF', text: '#975A16' };
-      case 'dispatched':
-        return { bg: '#EBF4FF', text: '#1A365D' };
-      case 'delivered':
-        return { bg: '#C6F6D5', text: '#22543D' };
-      case 'cancelled':
-        return { bg: '#FED7D7', text: '#9B2C2C' };
-      default:
-        return { bg: '#EDF2F7', text: '#4A5568' };
-    }
-  };
-
   const renderOrderItem = ({ item }) => {
     const isExpanded = !!expandedOrders[item._id];
-    const statusTone = getStatusStyle(item.status);
     const dateStr = new Date(item.createdAt).toLocaleDateString('en-IN', {
       day: '2-digit',
       month: 'short',
@@ -182,30 +177,38 @@ export default function OrderListScreen({ token, apiUrl, onBack }) {
     });
 
     return (
-      <View style={styles.orderCard}>
-        {/* Card Header clickable to expand */}
-        <TouchableOpacity
-          style={styles.cardHeader}
-          activeOpacity={0.7}
-          onPress={() => toggleExpandOrder(item._id)}
-        >
+      /**
+       * The whole card opens it, not just the top strip.
+       *
+       * The order number and total were the only tappable part, which is a
+       * small target on a phone held one-handed in a shop — tapping the
+       * customer's name, the obvious thing to aim at, did nothing at all.
+       * Nothing inside the card is itself tappable, so there is nothing here
+       * for the card to swallow.
+       */
+      <TouchableOpacity
+        style={styles.orderCard}
+        activeOpacity={0.85}
+        onPress={() => toggleExpandOrder(item._id)}
+      >
+        <View style={styles.cardHeader}>
           <View style={styles.headerLeft}>
             <Text style={styles.orderNumber}>{item.orderNumber}</Text>
             <Text style={styles.orderDate}>{dateStr}</Text>
           </View>
           <View style={styles.headerRight}>
-            <View style={[styles.statusBadge, { backgroundColor: statusTone.bg }]}>
-              <Text style={[styles.statusText, { color: statusTone.text }]}>
-                {item.status?.toUpperCase()}
-              </Text>
-            </View>
             <Text style={styles.grandTotal}>₹{item.grandTotal?.toFixed(2)}</Text>
           </View>
-        </TouchableOpacity>
+        </View>
+
+        {/* Where the order has got to, in the four steps that matter. */}
+        <View style={styles.trackerWrap}>
+          <OrderStageTracker order={item} />
+        </View>
 
         {/* Short info (Customer Name) */}
         <View style={styles.partyContainer}>
-          <Text style={styles.partyName} numberOfLines={1}>
+          <Text style={name(styles.partyName)} numberOfLines={1}>
             👤 {item.partyId?.partyName || 'Unknown Customer'}
           </Text>
           <Text style={styles.expandHint}>
@@ -219,13 +222,13 @@ export default function OrderListScreen({ token, apiUrl, onBack }) {
             <View style={styles.divider} />
             
             {/* Items list header */}
-            <Text style={styles.detailsTitle}>Items Ordered</Text>
+            <Text style={styles.detailsTitle}>{t('Items Ordered')}</Text>
             {(item.items || []).map((subItem, index) => (
               <View key={index} style={styles.itemRow}>
                 <View style={{ flex: 1.8 }}>
-                  <Text style={styles.itemName}>{subItem.productName}</Text>
+                  <Text style={styles.itemName}>{name(subItem.productName)}</Text>
                   <Text style={styles.itemVariant}>
-                    {subItem.variantName} • {subItem.packSize}
+                    {name(subItem.variantName)} • {subItem.packSize}
                   </Text>
                 </View>
                 <Text style={styles.itemQty}>Qty: {subItem.quantity}</Text>
@@ -237,17 +240,21 @@ export default function OrderListScreen({ token, apiUrl, onBack }) {
 
             {/* Calculations */}
             <View style={styles.calcRow}>
-              <Text style={styles.calcLabel}>Sub Total</Text>
+              <Text style={styles.calcLabel}>{t('Sub Total')}</Text>
               <Text style={styles.calcValue}>₹{item.subtotal?.toFixed(2)}</Text>
             </View>
             <View style={styles.calcRow}>
-              <Text style={styles.calcLabel}>GST Tax</Text>
+              <Text style={styles.calcLabel}>{t('GST Tax')}</Text>
               <Text style={styles.calcValue}>₹{item.gstAmount?.toFixed(2)}</Text>
             </View>
             <View style={[styles.calcRow, styles.finalCalcRow]}>
               <Text style={styles.finalCalcLabel}>Net Total</Text>
               <Text style={styles.finalCalcValue}>₹{item.grandTotal?.toFixed(2)}</Text>
             </View>
+
+            {/* What has been paid, credited and delivered — the same block the
+                party profile shows, so an order reads the same in both places. */}
+            <OrderPaymentDetails order={item} apiUrl={apiUrl} token={token} />
 
             {/* Notes and details */}
             {item.remarks ? (
@@ -258,7 +265,7 @@ export default function OrderListScreen({ token, apiUrl, onBack }) {
             ) : null}
           </View>
         )}
-      </View>
+      </TouchableOpacity>
     );
   };
 
@@ -269,7 +276,7 @@ export default function OrderListScreen({ token, apiUrl, onBack }) {
         <TouchableOpacity onPress={onBack} style={styles.backBtn}>
           <Text style={styles.backBtnText}>←</Text>
         </TouchableOpacity>
-        <Text style={styles.topBarTitle}>My Orders</Text>
+        <Text style={styles.topBarTitle}>{t('My Orders')}</Text>
         <View style={{ width: 36 }} />
       </View>
 
@@ -299,7 +306,7 @@ export default function OrderListScreen({ token, apiUrl, onBack }) {
           onPress={() => setDateTab('today')}
         >
           <Text style={[styles.tabBtnText, dateTab === 'today' && styles.tabBtnTextActive]}>
-            Today
+            {t('Today')}
           </Text>
         </TouchableOpacity>
         <TouchableOpacity
@@ -571,6 +578,7 @@ const styles = StyleSheet.create({
   headerLeft: {
     flex: 1.2,
   },
+  trackerWrap: { paddingHorizontal: 14, paddingBottom: 4 },
   orderNumber: {
     fontSize: responsiveFontSize(15),
     fontWeight: '800',
@@ -586,16 +594,6 @@ const styles = StyleSheet.create({
     flex: 1,
     alignItems: 'flex-end',
     justifyContent: 'space-between',
-  },
-  statusBadge: {
-    paddingHorizontal: scale(8),
-    paddingVertical: verticalScale(3),
-    borderRadius: 6,
-    marginBottom: verticalScale(4),
-  },
-  statusText: {
-    fontSize: responsiveFontSize(10),
-    fontWeight: '800',
   },
   grandTotal: {
     fontSize: responsiveFontSize(15),

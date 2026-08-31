@@ -1,4 +1,8 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import { getCurrentLocation } from '../services/currentLocation';
+import { openPartyOnMap, partyCoordinates } from '../services/openOnMap';
+import { getActiveLogId, hasActiveLog } from '../services/activeLog';
+import { useLanguage } from '../i18n';
 import {
   StyleSheet,
   Text,
@@ -11,23 +15,37 @@ import {
   Modal,
   Alert,
   FlatList,
+  Animated,
+  Easing,
+  RefreshControl,
 } from 'react-native';
 import { scale, verticalScale, responsiveFontSize, maxContainerWidth } from '../utils/responsive';
+import { bottomBarPadding } from '../utils/systemBars';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Geolocation from '@react-native-community/geolocation';
 import { PermissionsAndroid, Platform, BackHandler } from 'react-native';
 import { launchCamera } from 'react-native-image-picker';
 import PartyProfileScreen from './PartyProfileScreen';
 import { uploadFile } from '../services/firebaseUploadService';
+import { uploadPhoto } from '../services/photoUpload';
 
 export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToOrder, onNavigateToCollection }) {
+  const { t, term, name } = useLanguage();
+  const ownPartyScope = ['cso', 'crm', 'salespartner'].includes(
+    String(user?.roleName || user?.role?.name || user?.role || '').toLowerCase().replace(/[\s_-]/g, '')
+  ) ? '&scope=own' : '';
   const [partiesList, setPartiesList] = useState([]);
   const [page, setPage] = useState(1);
   const [hasMore, setHasMore] = useState(true);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [searchingLoading, setSearchingLoading] = useState(false);
+  // The party list's own error — a failed fetch, with a Retry.
   const [error, setError] = useState('');
+  // The Add-Party form's error, kept apart from the list's. One shared string
+  // meant a validation message from the modal stayed on screen after closing
+  // it, and appeared above the party list where it made no sense.
+  const [formError, setFormError] = useState('');
   const [success, setSuccess] = useState('');
 
   // Search & Filters
@@ -65,6 +83,12 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
   const [locationWarning, setLocationWarning] = useState('');
   const [newPartyPhotoAsset, setNewPartyPhotoAsset] = useState(null);
   const [creatingPartyLoading, setCreatingPartyLoading] = useState(false);
+  // What the save is doing right now, and how far along it is. The bar is
+  // driven by the actual stages below rather than by a timer, so it never sits
+  // at 90% while something is still uploading.
+  const [createStep, setCreateStep] = useState('');
+  const createProgress = useState(() => new Animated.Value(0))[0];
+  const [createdParty, setCreatedParty] = useState(null);
 
   // Duplication & Assignment states
   const [existingPartyId, setExistingPartyId] = useState(null);
@@ -73,6 +97,20 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
   const [selectedProfilePartyId, setSelectedProfilePartyId] = useState(null);
 
   // ── Paginated Party Fetch & Server-Side Search ──
+  // Pull down to reload, so the screen can be refreshed in place rather than
+  // by navigating away and back.
+  const [refreshing, setRefreshing] = useState(false);
+  const onPullRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await loadMyParties();
+    } catch (e) {
+      console.log('[Refresh] failed:', e.message);
+    } finally {
+      setRefreshing(false);
+    }
+  }, [loadMyParties]);
+
   const fetchPartiesPage = useCallback(async (pageNum = 1, query = '') => {
     const isSearchActive = query.trim().length > 0;
     if (pageNum === 1) {
@@ -89,7 +127,9 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
     try {
       const endpoint = isSearchActive
         ? `${apiUrl}/parties?search=${encodeURIComponent(query.trim())}&page=${pageNum}&limit=20`
-        : `${apiUrl}/parties/my?page=${pageNum}&limit=20`;
+        // A CSO's party list is the parties assigned to him, not his team's
+        // book — the team's parties are reached through Team Performance.
+        : `${apiUrl}/parties/my?page=${pageNum}&limit=20${ownPartyScope}`;
 
       const response = await fetch(endpoint, {
         headers: { Authorization: `Bearer ${token}` },
@@ -170,15 +210,32 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
     setLocationWarning('');
     setFetchingLocation(false);
     setExistingPartyId(null);
-    setError('');
+    setFormError('');
     setSuccess('');
     setAddModalVisible(true);
+  };
+
+  /**
+   * Leaves the Add-Party form and clears what belonged to it.
+   *
+   * Every exit goes through here — the ✕, Cancel, the Android back gesture and
+   * a successful save — because a message left behind used to reappear over the
+   * party list, describing a form the salesman had already closed.
+   */
+  const closeAddPartyModal = () => {
+    setAddModalVisible(false);
+    setFormError('');
+    setSuccess('');
+    setExistingPartyId(null);
   };
 
   const startPreciseLocationCapture = async () => {
     setFetchingLocation(true);
     setLocationStatusText('Getting precise location (waiting for accuracy ≤10m)...');
     setLocationWarning('');
+    // A retry must not leave the previous failure on screen, or a fix that
+    // worked still reads as broken.
+    setFormError('');
     setLat(null);
     setLng(null);
     setLocationAccuracy(null);
@@ -213,7 +270,7 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
           );
         } else {
           setFetchingLocation(false);
-          setError('Could not obtain GPS location within 30 seconds.');
+          setFormError('Could not obtain GPS location within 30 seconds.');
         }
       }, 30000);
 
@@ -245,7 +302,7 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
     } catch (e) {
       console.warn('GPS request failed:', e.message);
       setFetchingLocation(false);
-      setError('GPS permission or hardware error.');
+      setFormError('GPS permission or hardware error.');
     }
   };
 
@@ -278,6 +335,23 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
     );
   };
 
+  // A usable pin, and whether the form may be submitted at all. Kept here so
+  // the button, its label and the note beneath it can never disagree.
+  const hasPin = lat != null && lng != null;
+  const canSubmitParty = hasPin && !fetchingLocation && !creatingPartyLoading;
+
+  /** Moves the bar to a stage. Animated, so it reads as progress, not as jumps. */
+  const advance = (to, label) => {
+    setCreateStep(label);
+    Animated.timing(createProgress, {
+      toValue: to,
+      duration: 320,
+      easing: Easing.out(Easing.quad),
+      // width cannot be driven on the native thread.
+      useNativeDriver: false,
+    }).start();
+  };
+
   const handleCreateParty = async () => {
     if (
       !newPartyName.trim() ||
@@ -288,26 +362,29 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
       !newPartyState.trim() ||
       !newPartyPincode.trim()
     ) {
-      setError('Please fill in all required text fields (*).');
+      setFormError('Please fill in all required text fields (*).');
       return;
     }
 
     if (!newPartyPhoto) {
-      setError('Shop Front Photo is mandatory to create a new party.');
+      setFormError('Shop Front Photo is mandatory to create a new party.');
       return;
     }
 
     if (!lat || !lng) {
-      setError('GPS coordinates are mandatory to register a new party.');
+      setFormError('GPS coordinates are mandatory to register a new party.');
       return;
     }
 
-    setError('');
+    setFormError('');
     setSuccess('');
+    createProgress.setValue(0);
     setCreatingPartyLoading(true);
+    advance(0.08, 'Checking details');
 
     try {
       let finalShopPhotoUrl = '';
+      if (newPartyPhotoAsset || newPartyPhoto) advance(0.25, 'Uploading shop photo');
       if (newPartyPhotoAsset) {
         try {
           const uploadRes = await uploadFile({
@@ -323,8 +400,10 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
         }
       }
       if (!finalShopPhotoUrl && newPartyPhoto) {
-        finalShopPhotoUrl = newPartyPhoto.startsWith('data:') ? newPartyPhoto : `data:image/jpeg;base64,${newPartyPhoto}`;
+        finalShopPhotoUrl = await uploadPhoto({ base64: newPartyPhoto, apiUrl, token, module: 'parties' });
       }
+
+      advance(0.6, 'Saving party');
 
       const response = await fetch(`${apiUrl}/parties`, {
         method: 'POST',
@@ -365,20 +444,35 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
         throw new Error(data.message || 'Failed to create party.');
       }
 
-      setSuccess('Party created successfully!');
+      advance(0.85, 'Refreshing your parties');
+      await loadMyParties();
+
+      advance(1, 'Done');
+      // A beat at 100% so the bar is seen to finish rather than vanishing full.
+      await new Promise((resolve) => setTimeout(resolve, 350));
+
       setAddModalVisible(false);
-      loadMyParties();
+      setCreatedParty({
+        partyName: newPartyName.trim(),
+        mobile: newPartyMobile.trim(),
+        area: newPartyArea.trim(),
+        city: newPartyCity.trim(),
+        latitude: lat,
+        longitude: lng,
+        accuracy: locationAccuracy,
+      });
     } catch (err) {
-      setError(err.message || 'Network error.');
+      setFormError(err.message || 'Network error.');
     } finally {
       setCreatingPartyLoading(false);
+      setCreateStep('');
     }
   };
 
   const handleRequestAssignment = async () => {
     if (!existingPartyId || existingPartyId === 'duplicate') return;
     setAssignmentSubmitting(true);
-    setError('');
+    setFormError('');
     setSuccess('');
     try {
       const response = await fetch(`${apiUrl}/parties/${existingPartyId}/request-assignment`, {
@@ -395,7 +489,7 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
         throw new Error(data.message || 'Failed to request assignment.');
       }
     } catch (err) {
-      setError(err.message || 'Error sending request.');
+      setFormError(err.message || 'Error sending request.');
     } finally {
       setAssignmentSubmitting(false);
     }
@@ -427,7 +521,7 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
   const handleVisitParty = async (party) => {
     // Prevent double visit
     if (party.visitedToday) {
-      Alert.alert('Already Visited', `You have already visited "${party.partyName}" today.`);
+      Alert.alert('Already Visited', `You have already visited "${name(party.partyName)}" today.`);
       return;
     }
 
@@ -453,9 +547,30 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
         setError('');
 
         try {
-          const logId = await AsyncStorage.getItem('active_log_id');
-          if (!logId) {
-            Alert.alert('Error', 'Please check in first to start daily visits.');
+          // Checked in is one question; a usable id is another. A stale id
+          // must not stop a visit — it only costs the link to the day's log.
+          const logId = await getActiveLogId();
+          if (!(await hasActiveLog())) {
+            Alert.alert(
+              'Attendance not marked',
+              'Mark your attendance first. A visit is part of a working day, so the day has to be started before one can be recorded.'
+            );
+            setVisitStartingId(null);
+            return;
+          }
+
+          /**
+           * Where the visitor actually is, read before the visit is claimed.
+           *
+           * The server decides whether that is close enough — the phone only
+           * reports its position. Checking here as well would just be a second
+           * opinion that a modified app could skip.
+           */
+          let here;
+          try {
+            here = await getCurrentLocation();
+          } catch (locationError) {
+            Alert.alert('Location needed', locationError.message);
             setVisitStartingId(null);
             return;
           }
@@ -468,14 +583,34 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
             },
             body: JSON.stringify({
               partyId: party._id,
-              shopPhoto: `data:image/jpeg;base64,${base64Photo}`,
+              shopPhoto: await uploadPhoto({ base64: base64Photo, apiUrl, token, module: 'visits' }),
               logId,
+              // The server checks this against the shop's own coordinates and
+              // refuses a visit started from somewhere else.
+              latitude: here.latitude,
+              longitude: here.longitude,
             }),
           });
 
           const startData = await startRes.json();
+          // Being too far away is a normal situation, not a failure to report
+          // as one — it gets its own message rather than "Visit Failed".
+          if (!startRes.ok && startData?.data?.reason === 'attendance_required') {
+            Alert.alert('Attendance not marked', startData.message);
+            setVisitStartingId(null);
+            return;
+          }
+          if (!startRes.ok && startData?.data?.reason === 'too_far_from_party') {
+            Alert.alert(
+              'Too far from the shop',
+              startData.message,
+              [{ text: 'OK' }],
+            );
+            setVisitStartingId(null);
+            return;
+          }
           if (startRes.ok) {
-            Alert.alert('Visit Started', `Your visit at "${party.partyName}" is now active!`);
+            Alert.alert('Visit Started', `Your visit at "${name(party.partyName)}" is now active!`);
             loadMyParties();
           } else {
             throw new Error(startData.message || 'Failed to register visit arrival.');
@@ -505,7 +640,7 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
         <View style={styles.cardHeader}>
           <View style={{ flex: 1 }}>
             <View style={styles.nameRow}>
-              <Text style={styles.partyName}>{item.partyName}</Text>
+              <Text style={name(styles.partyName)}>{name(item.partyName)}</Text>
               {item.visitedToday && (
                 <View style={styles.visitedBadge}>
                   <Text style={styles.visitedBadgeText}>✓ Visited</Text>
@@ -514,12 +649,31 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
             </View>
             <Text style={styles.partyCode}>Code: {item.partyCode || 'Generating...'}</Text>
           </View>
+
+          {/*
+            The pin sits in the corner rather than in the button row below.
+            It is a shortcut, not one of the card's main actions, and putting
+            it beside Order and Collect would give it the same weight as them.
+
+            `stopPropagation` matters: the whole card opens the profile, and
+            without it a tap here would do both.
+          */}
+          <TouchableOpacity
+            style={[styles.mapPinBtn, !partyCoordinates(item) && styles.mapPinBtnMuted]}
+            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+            onPress={(event) => {
+              event.stopPropagation();
+              openPartyOnMap(item, name(item.partyName));
+            }}
+          >
+            <Text style={styles.mapPinBtnText}>📍</Text>
+          </TouchableOpacity>
         </View>
 
         <View style={styles.cardBody}>
           <Text style={styles.partyDetail}>📞 Mobile: <Text style={styles.bold}>{item.mobile}</Text></Text>
           {item.ownerName ? (
-            <Text style={styles.partyDetail}>👤 Owner: <Text style={styles.bold}>{item.ownerName}</Text></Text>
+            <Text style={styles.partyDetail}>👤 Owner: <Text style={styles.bold}>{name(item.ownerName)}</Text></Text>
           ) : null}
           <Text style={styles.partyDetail}>📍 Address: <Text style={styles.bold}>{item.address}</Text></Text>
           {!isAssignedToMe && (
@@ -581,6 +735,26 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
   };
 
   // If a profile is selected, show the profile screen
+
+  /**
+   * The hardware back button, while a party profile is open inside this screen.
+   *
+   * This screen shows the profile itself rather than asking App to change
+   * screens, so App still believes we are on the list and its own back handler
+   * takes us to the home tab. Handled here, where the state actually lives.
+   *
+   * Registered only while the profile is open, and Android calls the most
+   * recently added handler first, so this runs before App's and stops there.
+   */
+  useEffect(() => {
+    if (!selectedProfilePartyId) return undefined;
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      setSelectedProfilePartyId(null);
+      return true;
+    });
+    return () => subscription.remove();
+  }, [selectedProfilePartyId]);
+
   if (selectedProfilePartyId) {
     return (
       <PartyProfileScreen
@@ -591,6 +765,10 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
         onNavigateToOrder={(party) => {
           setSelectedProfilePartyId(null);
           onNavigateToOrder && onNavigateToOrder(party);
+        }}
+        onNavigateToCollection={(party) => {
+          setSelectedProfilePartyId(null);
+          onNavigateToCollection && onNavigateToCollection(party);
         }}
       />
     );
@@ -639,6 +817,9 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
 
       {/* Parties List with Infinite Scroll & Consistent Loaders */}
       <FlatList
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onPullRefresh} colors={['#00796B']} tintColor="#00796B" />
+        }
         data={partiesList}
         keyExtractor={(item) => item._id}
         renderItem={({ item }) => renderPartyCard(item)}
@@ -650,7 +831,7 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
             <View style={styles.errorCard}>
               <Text style={styles.errorText}>{error}</Text>
               <TouchableOpacity style={styles.retryBtn} onPress={() => fetchPartiesPage(1, searchQuery)}>
-                <Text style={styles.retryBtnText}>Retry</Text>
+                <Text style={styles.retryBtnText}>{t('Retry')}</Text>
               </TouchableOpacity>
             </View>
           ) : null
@@ -680,19 +861,19 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
         visible={addModalVisible}
         transparent
         animationType="slide"
-        onRequestClose={() => setAddModalVisible(false)}
+        onRequestClose={closeAddPartyModal}
       >
         <SafeAreaView style={styles.modalSafeArea}>
           <View style={styles.modalWrapper}>
             <View style={styles.modalHeader}>
               <Text style={styles.modalTitleText}>Add New Party</Text>
-              <TouchableOpacity style={styles.closeXBtn} onPress={() => setAddModalVisible(false)}>
+              <TouchableOpacity style={styles.closeXBtn} onPress={closeAddPartyModal}>
                 <Text style={styles.closeXText}>✕</Text>
               </TouchableOpacity>
             </View>
 
             <ScrollView contentContainerStyle={styles.modalFormContent}>
-              {error ? <Text style={styles.errorText}>{error}</Text> : null}
+              {formError ? <Text style={styles.errorText}>{formError}</Text> : null}
               {success ? <Text style={styles.successText}>{success}</Text> : null}
 
               {/* 1. Required Section */}
@@ -738,6 +919,45 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
               ) : (
                 <Text style={styles.photoErrorText}>Photo is mandatory to create party *</Text>
               )}
+
+              {/*
+                The GPS pin is normally taken the moment the photo is, but a
+                fix indoors or under a roof often does not arrive in time. The
+                photo is fine — only the pin failed — so retrying must not mean
+                walking back out and taking the picture again.
+              */}
+              {newPartyPhoto ? (
+                <View style={styles.gpsBlock}>
+                  <Text style={styles.gpsStatusText}>
+                    {fetchingLocation
+                      ? (locationStatusText || 'Getting precise location…')
+                      : hasPin
+                        ? `📍 Location pinned${locationAccuracy ? ` · accurate to about ${Math.round(locationAccuracy)}m` : ''}`
+                        : '📍 No location yet — the shop photo is saved, so just fetch the pin again.'}
+                  </Text>
+
+                  <TouchableOpacity
+                    style={[styles.gpsRetryBtn, fetchingLocation && styles.disabledBtn]}
+                    onPress={startPreciseLocationCapture}
+                    disabled={fetchingLocation}
+                  >
+                    {fetchingLocation ? (
+                      <View style={styles.row}>
+                        <ActivityIndicator color="#FFFFFF" size="small" style={{ marginRight: 8 }} />
+                        <Text style={styles.gpsRetryBtnText}>Getting location…</Text>
+                      </View>
+                    ) : (
+                      <Text style={styles.gpsRetryBtnText}>
+                        {hasPin ? '🎯 Pin location again' : '🎯 Get GPS location'}
+                      </Text>
+                    )}
+                  </TouchableOpacity>
+
+                  {locationWarning ? (
+                    <Text style={styles.gpsWarningText}>{locationWarning}</Text>
+                  ) : null}
+                </View>
+              ) : null}
 
               {/* 2. Contact Details */}
               <Text style={styles.sectionHeading}>Contact Details</Text>
@@ -865,7 +1085,7 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
                 onChangeText={setNewPartyCreditLimit}
               />
 
-              <Text style={styles.fieldLabel}>Payment Terms</Text>
+              <Text style={styles.fieldLabel}>{t('Payment Terms')}</Text>
               <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginVertical: 6 }}>
                 <View style={{ flexDirection: 'row', gap: 8 }}>
                   {['Advance', 'Cash', '7 Days', '14 Days'].map((opt) => {
@@ -919,38 +1139,111 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
               ) : null}
             </ScrollView>
 
+            {/* Why the button is not available yet, said once, above it. */}
+            {!canSubmitParty && (
+              <Text style={styles.submitBlockedNote}>
+                {fetchingLocation
+                  ? 'Pinning the exact shop location — hold still for a moment.'
+                  : newPartyPhoto
+                    ? 'The photo is saved. Tap "Get GPS location" above — near a window or outside works best.'
+                    : 'Take the shop front photo to capture the GPS pin. A party cannot be created without it.'}
+              </Text>
+            )}
+
             {/* Bottom Actions Row */}
             <View style={styles.modalActionsFooter}>
               <TouchableOpacity
                 style={styles.cancelBtn}
-                onPress={() => setAddModalVisible(false)}
+                onPress={closeAddPartyModal}
               >
-                <Text style={styles.cancelBtnText}>Cancel</Text>
+                <Text style={styles.cancelBtnText}>{t('Cancel')}</Text>
               </TouchableOpacity>
 
+              {/* A party without a pin is a party nobody can be routed to or
+                  visit-verified against, so the button waits for one. */}
               <TouchableOpacity
-                style={styles.submitBtn}
+                style={[styles.submitBtn, !canSubmitParty && styles.submitBtnDisabled]}
                 onPress={handleCreateParty}
+                disabled={!canSubmitParty}
               >
-                <Text style={styles.submitBtnText}>Create Party</Text>
+                {fetchingLocation ? (
+                  <View style={styles.row}>
+                    <ActivityIndicator color="#FFFFFF" size="small" style={{ marginRight: 8 }} />
+                    <Text style={styles.submitBtnText}>{t('Getting location…')}</Text>
+                  </View>
+                ) : (
+                  <Text style={styles.submitBtnText}>
+                    {hasPin ? 'Create Party' : 'Location needed'}
+                  </Text>
+                )}
               </TouchableOpacity>
             </View>
           </View>
         </SafeAreaView>
       </Modal>
 
-      {/* Non-cancellable loading progress modal on Create Party */}
+      {/* Frosted, non-cancellable overlay while the party is being saved. The
+          form stays visible behind it but is unreachable, so it is obvious the
+          app is working rather than stuck. */}
       <Modal
         visible={creatingPartyLoading}
         transparent
         animationType="fade"
         onRequestClose={() => {}}
       >
-        <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.65)', justifyContent: 'center', alignItems: 'center', padding: 24 }}>
-          <View style={{ backgroundColor: '#FFFFFF', borderRadius: 16, padding: 24, width: '85%', alignItems: 'center', gap: 12 }}>
+        <View style={styles.savingScrim}>
+          <View style={styles.savingCard}>
             <ActivityIndicator color="#00796B" size="large" />
-            <Text style={{ fontSize: 16, fontWeight: '700', color: '#1A202C' }}>Creating Party...</Text>
-            <Text style={{ fontSize: 13, color: '#718096', textAlign: 'center' }}>Please wait while your party details and outlet photo are being saved.</Text>
+            <Text style={styles.savingTitle}>{t('Creating party')}</Text>
+            <Text style={styles.savingStep}>{createStep || 'Starting…'}</Text>
+
+            <View style={styles.progressTrack}>
+              <Animated.View
+                style={[
+                  styles.progressFill,
+                  {
+                    width: createProgress.interpolate({
+                      inputRange: [0, 1],
+                      outputRange: ['0%', '100%'],
+                    }),
+                  },
+                ]}
+              />
+            </View>
+
+            <Text style={styles.savingHint}>Please keep the app open.</Text>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Confirmation, with the pin that was recorded */}
+      <Modal
+        visible={!!createdParty}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setCreatedParty(null)}
+      >
+        <View style={styles.savingScrim}>
+          <View style={styles.createdCard}>
+            <View style={styles.createdTick}><Text style={styles.createdTickText}>✓</Text></View>
+            <Text style={styles.createdTitle}>{t('Party created')}</Text>
+            <Text style={styles.createdName}>{name(createdParty?.partyName)}</Text>
+            {!!createdParty?.mobile && <Text style={styles.createdSub}>📱 {createdParty.mobile}</Text>}
+            {!!(createdParty?.area || createdParty?.city) && (
+              <Text style={styles.createdSub}>
+                {[createdParty.area, createdParty.city].filter(Boolean).join(', ')}
+              </Text>
+            )}
+            {createdParty?.latitude != null && (
+              <Text style={styles.createdPin}>
+                📍 Pinned at {createdParty.latitude.toFixed(5)}, {createdParty.longitude.toFixed(5)}
+                {createdParty.accuracy ? ` (~${Math.round(createdParty.accuracy)}m)` : ''}
+              </Text>
+            )}
+
+            <TouchableOpacity style={styles.createdBtn} onPress={() => setCreatedParty(null)}>
+              <Text style={styles.createdBtnText}>{t('Done')}</Text>
+            </TouchableOpacity>
           </View>
         </View>
       </Modal>
@@ -1079,9 +1372,25 @@ const styles = StyleSheet.create({
     borderWidth: 1.5,
     backgroundColor: '#F0FFF4',
   },
+  mapPinBtn: {
+    width: scale(30),
+    height: scale(30),
+    borderRadius: scale(15),
+    backgroundColor: '#EBF4FF',
+    borderWidth: 1,
+    borderColor: '#BEE3F8',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginLeft: scale(8),
+  },
+  mapPinBtnMuted: { opacity: 0.35 },
+  mapPinBtnText: { fontSize: responsiveFontSize(13) },
   cardHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
+    // Top, not centre: the pin belongs in the corner, and a long party name
+    // wrapping to two lines would otherwise drag it down the card.
+    alignItems: 'flex-start',
     borderBottomWidth: 1,
     borderBottomColor: '#EDF2F7',
     paddingBottom: verticalScale(10),
@@ -1283,6 +1592,17 @@ const styles = StyleSheet.create({
   halfInput: {
     flex: 1,
   },
+  gpsBlock: { marginTop: 10, marginBottom: 4 },
+  gpsStatusText: { fontSize: responsiveFontSize(11), color: '#4A5568', marginBottom: 6 },
+  gpsRetryBtn: {
+    backgroundColor: '#3182CE',
+    paddingVertical: verticalScale(10),
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  gpsRetryBtnText: { color: '#FFFFFF', fontWeight: '700', fontSize: responsiveFontSize(12) },
+  gpsWarningText: { fontSize: responsiveFontSize(10), color: '#D69E2E', marginTop: 6 },
   photoCaptureBtn: {
     height: verticalScale(44),
     backgroundColor: '#E2E8F0',
@@ -1356,6 +1676,9 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     gap: verticalScale(12),
     padding: scale(16),
+    // Pinned to the bottom of a full-screen modal, so it clears the system
+    // navigation bar rather than sitting under it.
+    paddingBottom: scale(16) + bottomBarPadding(),
     borderTopWidth: 1,
     borderTopColor: '#EDF2F7',
     backgroundColor: '#FFFFFF',
@@ -1374,6 +1697,108 @@ const styles = StyleSheet.create({
     fontSize: responsiveFontSize(14),
     fontWeight: '700',
   },
+  submitBtnDisabled: {
+    backgroundColor: '#B2C7C4',
+  },
+  submitBlockedNote: {
+    paddingHorizontal: scale(16),
+    paddingTop: verticalScale(8),
+    fontSize: responsiveFontSize(11),
+    color: '#C05621',
+    textAlign: 'center',
+  },
+
+  savingScrim: {
+    flex: 1,
+    // Heavy frosted wash rather than a plain dim: the form stays readable
+    // behind it, which makes the wait feel like part of the same screen.
+    backgroundColor: 'rgba(247, 249, 252, 0.94)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: scale(24),
+  },
+  savingCard: {
+    width: '88%',
+    backgroundColor: '#FFFFFF',
+    borderRadius: 18,
+    padding: scale(24),
+    alignItems: 'center',
+    gap: verticalScale(10),
+    shadowColor: '#000',
+    shadowOpacity: 0.14,
+    shadowRadius: 20,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 8,
+  },
+  savingTitle: {
+    fontSize: responsiveFontSize(16),
+    fontWeight: '800',
+    color: '#1A202C',
+  },
+  savingStep: {
+    fontSize: responsiveFontSize(13),
+    color: '#4A5568',
+  },
+  progressTrack: {
+    width: '100%',
+    height: 8,
+    borderRadius: 999,
+    backgroundColor: '#EDF2F7',
+    overflow: 'hidden',
+    marginTop: verticalScale(4),
+  },
+  progressFill: {
+    height: 8,
+    borderRadius: 999,
+    backgroundColor: '#00796B',
+  },
+  savingHint: {
+    fontSize: responsiveFontSize(11),
+    color: '#A0AEC0',
+  },
+
+  createdCard: {
+    width: '88%',
+    backgroundColor: '#FFFFFF',
+    borderRadius: 18,
+    padding: scale(24),
+    alignItems: 'center',
+    gap: verticalScale(6),
+    shadowColor: '#000',
+    shadowOpacity: 0.14,
+    shadowRadius: 20,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 8,
+  },
+  createdTick: {
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    backgroundColor: '#E6F6EF',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: verticalScale(6),
+  },
+  createdTickText: { fontSize: 30, color: '#00796B', fontWeight: '800' },
+  createdTitle: { fontSize: responsiveFontSize(17), fontWeight: '800', color: '#1A202C' },
+  createdName: { fontSize: responsiveFontSize(15), fontWeight: '700', color: '#00796B', textAlign: 'center' },
+  createdSub: { fontSize: responsiveFontSize(12), color: '#4A5568' },
+  createdPin: {
+    fontSize: responsiveFontSize(11),
+    color: '#718096',
+    marginTop: verticalScale(4),
+    textAlign: 'center',
+  },
+  createdBtn: {
+    marginTop: verticalScale(14),
+    alignSelf: 'stretch',
+    backgroundColor: '#00796B',
+    paddingVertical: verticalScale(13),
+    borderRadius: 10,
+    alignItems: 'center',
+  },
+  createdBtnText: { color: '#FFFFFF', fontWeight: '800', fontSize: responsiveFontSize(14) },
+
   submitBtn: {
     flex: 1,
     height: verticalScale(44),

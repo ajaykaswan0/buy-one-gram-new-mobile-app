@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback} from 'react';
 import {
   StyleSheet,
   Text,
@@ -9,12 +9,41 @@ import {
   ScrollView,
   Animated,
   Image,
+  Platform,
+  PermissionsAndroid,
+  RefreshControl,
 } from 'react-native';
 import { scale, verticalScale, responsiveFontSize, maxContainerWidth } from '../utils/responsive';
 import Geolocation from '@react-native-community/geolocation';
 import { launchCamera } from 'react-native-image-picker';
+import { uploadPhoto } from '../services/photoUpload';
 
-export default function AttendanceScreen({ token, apiUrl, onBack }) {
+/**
+ * Asks for location permission before reading GPS.
+ *
+ * Android refuses getCurrentPosition outright without this, and it was never
+ * requested here - check-in silently produced no coordinates on a device that had
+ * not been asked by some other screen first.
+ */
+const ensureLocationPermission = async () => {
+  if (Platform.OS !== 'android') return true;
+  try {
+    const granted = await PermissionsAndroid.request(
+      PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+      {
+        title: 'Location needed for attendance',
+        message: 'Your attendance is recorded with the location you marked it from.',
+        buttonPositive: 'Allow',
+      },
+    );
+    return granted === PermissionsAndroid.RESULTS.GRANTED;
+  } catch (error) {
+    console.warn('Location permission request failed:', error.message);
+    return false;
+  }
+};
+
+export default function AttendanceScreen({ token, apiUrl, onBack, onAttendanceMarked }) {
   const [todayRecord, setTodayRecord] = useState(null);
   const [history, setHistory] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -30,6 +59,20 @@ export default function AttendanceScreen({ token, apiUrl, onBack }) {
     }, 10000);
     return () => clearInterval(timer);
   }, []);
+
+  // Pull down to reload, so the screen can be refreshed in place rather than
+  // by navigating away and back.
+  const [refreshing, setRefreshing] = useState(false);
+  const onPullRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await loadAttendanceData();
+    } catch (e) {
+      console.log('[Refresh] failed:', e.message);
+    } finally {
+      setRefreshing(false);
+    }
+  }, [loadAttendanceData]);
 
   const loadAttendanceData = async () => {
     setLoading(true);
@@ -122,6 +165,12 @@ export default function AttendanceScreen({ token, apiUrl, onBack }) {
         triggerCameraFlash();
 
         // 2. Fetch live native GPS location coordinates
+        const allowed = await ensureLocationPermission();
+        if (!allowed) {
+          setMarking(false);
+          setError('Location permission is required to mark attendance.');
+          return;
+        }
         Geolocation.getCurrentPosition(
           async (position) => {
             const { latitude, longitude, accuracy } = position.coords;
@@ -137,7 +186,7 @@ export default function AttendanceScreen({ token, apiUrl, onBack }) {
                   latitude,
                   longitude,
                   address: `GPS Coordinate: ${latitude.toFixed(4)}, ${longitude.toFixed(4)} (Accuracy: ${accuracy.toFixed(1)}m)`,
-                  photo: `data:image/jpeg;base64,${base64Photo}`,
+                  photo: await uploadPhoto({ base64: base64Photo, apiUrl, token, module: 'attendance' }),
                 }),
               });
 
@@ -147,6 +196,9 @@ export default function AttendanceScreen({ token, apiUrl, onBack }) {
               }
 
               setTodayRecord(checkinData.data);
+              // The day has started: tell the app so it flips to ONLINE and
+              // opens the beat plan now, rather than at the next poll.
+              onAttendanceMarked?.();
               
               // Reload history logs
               const historyRes = await fetch(`${apiUrl}/attendance/my`, {
@@ -203,6 +255,12 @@ export default function AttendanceScreen({ token, apiUrl, onBack }) {
         triggerCameraFlash();
 
         // 2. Fetch live native GPS location coordinates
+        const allowed = await ensureLocationPermission();
+        if (!allowed) {
+          setMarking(false);
+          setError('Location permission is required to mark attendance.');
+          return;
+        }
         Geolocation.getCurrentPosition(
           async (position) => {
             const { latitude, longitude, accuracy } = position.coords;
@@ -218,7 +276,7 @@ export default function AttendanceScreen({ token, apiUrl, onBack }) {
                   latitude,
                   longitude,
                   address: `GPS Coordinate: ${latitude.toFixed(4)}, ${longitude.toFixed(4)} (Accuracy: ${accuracy.toFixed(1)}m)`,
-                  photo: `data:image/jpeg;base64,${base64Photo}`,
+                  photo: await uploadPhoto({ base64: base64Photo, apiUrl, token, module: 'attendance' }),
                 }),
               });
 
@@ -228,6 +286,9 @@ export default function AttendanceScreen({ token, apiUrl, onBack }) {
               }
 
               setTodayRecord(checkoutData.data);
+              // Same on the way out, so the app reflects the end of the day
+              // without waiting for the next poll either.
+              onAttendanceMarked?.();
               
               // Reload history logs
               const historyRes = await fetch(`${apiUrl}/attendance/my`, {
@@ -344,7 +405,11 @@ export default function AttendanceScreen({ token, apiUrl, onBack }) {
         <Text style={styles.headerTitle}>Attendance</Text>
       </View>
 
-      <ScrollView contentContainerStyle={styles.container}>
+      <ScrollView contentContainerStyle={styles.container}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onPullRefresh} colors={['#00796B']} tintColor="#00796B" />
+        }
+      >
         <View style={styles.cameraBox}>
           <View style={[styles.corner, styles.topLeft]} />
           <View style={[styles.corner, styles.topRight]} />

@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback} from 'react';
+import { useLanguage } from '../i18n';
 import {
   StyleSheet,
   Text,
@@ -11,6 +12,7 @@ import {
   TextInput,
   Alert,
   FlatList,
+  RefreshControl,
 } from 'react-native';
 import { scale, verticalScale, responsiveFontSize, maxContainerWidth } from '../utils/responsive';
 import { FirebaseImage } from '../services/firebaseUploadService';
@@ -29,6 +31,7 @@ export default function CrmDashboardScreen({
   onNavigateToPartyProfile,
   onNavigateToOrder,
 }) {
+  const { t, term, name } = useLanguage();
   const [loading, setLoading] = useState(true);
   const [salesmen, setSalesmen] = useState([]);
   const [selectedSalesman, setSelectedSalesman] = useState(null); // null = All Salesmen
@@ -62,6 +65,20 @@ export default function CrmDashboardScreen({
     }, 350);
     return () => clearTimeout(timer);
   }, [searchQuery]);
+
+  // Pull down to reload, so the screen can be refreshed in place rather than
+  // by navigating away and back.
+  const [refreshing, setRefreshing] = useState(false);
+  const onPullRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await fetchParties(1, searchQuery);
+    } catch (e) {
+      console.log('[Refresh] failed:', e.message);
+    } finally {
+      setRefreshing(false);
+    }
+  }, [fetchParties]);
 
   const fetchSalesmen = async () => {
     try {
@@ -148,7 +165,9 @@ export default function CrmDashboardScreen({
       }
 
       // 2. Fetch Collections for this party
-      const colRes = await fetch(`${apiUrl}/collection/all?partyId=${party._id}&limit=50`, {
+      // /collection/all is not a route — it fell through to /collection/:id and
+      // cast "all" to an ObjectId, so the collections tab was always empty.
+      const colRes = await fetch(`${apiUrl}/collection/party/${party._id}?limit=50`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       const colData = await colRes.json();
@@ -196,7 +215,11 @@ export default function CrmDashboardScreen({
         ) : null}
       </View>
 
-      <ScrollView contentContainerStyle={styles.container}>
+      <ScrollView contentContainerStyle={styles.container}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onPullRefresh} colors={['#00796B']} tintColor="#00796B" />
+        }
+      >
         {/* Salesman Filter Section */}
         {false && <View style={styles.sectionCard}>
           <Text style={styles.sectionTitle}>👔 Filter Parties By Salesman</Text>
@@ -324,7 +347,7 @@ export default function CrmDashboardScreen({
               >
                 <View style={styles.partyCardHeader}>
                   <View style={{ flex: 1 }}>
-                    <Text style={styles.partyName}>{party.partyName}</Text>
+                    <Text style={name(styles.partyName)}>{name(party.partyName)}</Text>
                     <Text style={styles.partyCode}>
                       {party.partyCode} • Owner: {party.ownerName || 'N/A'}
                     </Text>
@@ -394,7 +417,7 @@ export default function CrmDashboardScreen({
               )}
 
               <View style={{ flex: 1, marginLeft: 12 }}>
-                <Text style={styles.profilePartyName}>{selectedParty.partyName}</Text>
+                <Text style={styles.profilePartyName}>{name(selectedParty.partyName)}</Text>
                 <Text style={styles.profileCodeText}>{selectedParty.partyCode}</Text>
                 <Text style={styles.profileSubText}>📱 {selectedParty.mobile}</Text>
                 <Text style={styles.profileOutText}>
@@ -466,7 +489,7 @@ export default function CrmDashboardScreen({
                       <View key={col._id} style={styles.colCard}>
                         <View style={styles.colCardHeader}>
                           <Text style={styles.colMode}>
-                            💳 Payment ({col.paymentMode?.toUpperCase()})
+                            💳 Payment ({term(col.paymentMode)})
                           </Text>
                           <Text style={styles.colAmount}>
                             ₹{(col.amount || 0).toLocaleString('en-IN')}
@@ -490,7 +513,7 @@ export default function CrmDashboardScreen({
                   ) : (
                     partyRateList.map((prod) => (
                       <View key={prod._id} style={styles.rateCard}>
-                        <Text style={styles.prodName}>{prod.productName}</Text>
+                        <Text style={styles.prodName}>{name(prod.productName)}</Text>
                         <Text style={styles.prodPrice}>
                           Base Price: ₹{(prod.basePrice || prod.mrp || 0).toLocaleString('en-IN')} / {prod.baseUnit || 'Unit'}
                         </Text>
@@ -521,7 +544,7 @@ export default function CrmDashboardScreen({
                 }}
               >
                 <Text style={styles.footerCollectBtnText}>
-                  💵 Collect Money From {selectedParty.partyName}
+                  💵 Collect Money From {name(selectedParty.partyName)}
                 </Text>
               </TouchableOpacity>
             </View>

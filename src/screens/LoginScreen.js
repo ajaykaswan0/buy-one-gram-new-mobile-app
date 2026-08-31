@@ -8,43 +8,38 @@ import {
   ActivityIndicator,
   Modal,
   SafeAreaView,
+  Image,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+
+import { API_URL, fileUrl } from '../config/api';
 
 export default function LoginScreen({ onLoginSuccess }) {
   const [mobile, setMobile] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const [apiUrl, setApiUrl] = useState('http://200.141.9.159:5000/api');
-  const [tempUrl, setTempUrl] = useState('');
-  const [settingsVisible, setSettingsVisible] = useState(false);
+  /**
+   * What the company calls itself, read from the server.
+   *
+   * The name and logo live in admin Settings, so they can be changed without
+   * building and shipping a new app. Only the label under the launcher icon is
+   * fixed at build time — Android compiles that one in, and nothing can change
+   * it from the server.
+   *
+   * The built-in name below is the fallback: it is what shows before the call
+   * returns, and on a phone with no signal.
+   */
+  const [branding, setBranding] = useState(null);
 
   useEffect(() => {
-    const loadSettings = async () => {
-      try {
-        const savedUrl = await AsyncStorage.getItem('api_url');
-        if (savedUrl) {
-          setApiUrl(savedUrl);
-        }
-      } catch (e) {
-        console.error(e);
-      }
-    };
-    loadSettings();
+    let alive = true;
+    fetch(`${API_URL}/app-settings/branding`)
+      .then((response) => (response.ok ? response.json() : null))
+      .then((data) => { if (alive && data?.data) setBranding(data.data); })
+      .catch(() => { /* offline, or an older server: the built-in name stands */ });
+    return () => { alive = false; };
   }, []);
-
-  const handleSaveSettings = async () => {
-    if (!tempUrl.trim()) return;
-    try {
-      const cleanUrl = tempUrl.trim().replace(/\/$/, '');
-      await AsyncStorage.setItem('api_url', cleanUrl);
-      setApiUrl(cleanUrl);
-      setSettingsVisible(false);
-    } catch (e) {
-      console.error(e);
-    }
-  };
 
   const handleLogin = async () => {
     if (!mobile.trim() || !password.trim()) {
@@ -56,7 +51,7 @@ export default function LoginScreen({ onLoginSuccess }) {
     setLoading(true);
 
     try {
-      const response = await fetch(`${apiUrl}/auth/login`, {
+      const response = await fetch(`${API_URL}/auth/login`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -76,7 +71,7 @@ export default function LoginScreen({ onLoginSuccess }) {
       await AsyncStorage.setItem('token', data.token);
       await AsyncStorage.setItem('user', JSON.stringify(data.user));
 
-      onLoginSuccess(data.token, data.user, apiUrl);
+      onLoginSuccess(data.token, data.user, API_URL);
     } catch (err) {
       setError(err.message || 'Network error. Check connection or local Wi-Fi URL.');
     } finally {
@@ -87,9 +82,15 @@ export default function LoginScreen({ onLoginSuccess }) {
   return (
     <SafeAreaView style={styles.container}>
       <View style={styles.headerContainer}>
-        <Text style={styles.logoText}>BYG</Text>
-        <Text style={styles.appName}>Sales Force Management</Text>
-        <Text style={styles.subtitle}>Enter credentials to access your terminal</Text>
+        {branding?.logo ? (
+          <Image source={{ uri: fileUrl(branding.logo) }} style={styles.logoImage} resizeMode="contain" />
+        ) : (
+          <Text style={styles.logoText}>Buy1Gram</Text>
+        )}
+        <Text style={styles.appName}>{branding?.appName || 'Buy 1 Gram'}</Text>
+        <Text style={styles.subtitle}>
+          {branding?.loginHeadline || 'Enter credentials to access your terminal'}
+        </Text>
       </View>
 
       <View style={styles.formContainer}>
@@ -130,51 +131,7 @@ export default function LoginScreen({ onLoginSuccess }) {
         </TouchableOpacity>
       </View>
 
-      <TouchableOpacity
-        style={styles.settingsIcon}
-        onPress={() => {
-          setTempUrl(apiUrl);
-          setSettingsVisible(true);
-        }}
-      >
-        <Text style={styles.settingsIconText}>⚙️ Wi-Fi Server Connection Settings</Text>
-      </TouchableOpacity>
 
-      <Modal
-        visible={settingsVisible}
-        transparent
-        animationType="fade"
-        onRequestClose={() => setSettingsVisible(false)}
-      >
-        <View style={styles.modalOverlay}>
-          <View style={styles.modalBox}>
-            <Text style={styles.modalTitle}>Local Server Config</Text>
-            <Text style={styles.modalDesc}>
-              Enter your computer's local IP address (e.g., http://192.168.1.100:5000/api) to connect via local Wi-Fi.
-            </Text>
-
-            <TextInput
-              style={styles.modalInput}
-              value={tempUrl}
-              onChangeText={setTempUrl}
-              autoCapitalize="none"
-              keyboardType="url"
-            />
-
-            <View style={styles.modalButtons}>
-              <TouchableOpacity
-                style={styles.cancelBtn}
-                onPress={() => setSettingsVisible(false)}
-              >
-                <Text style={styles.cancelBtnText}>Cancel</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.saveBtn} onPress={handleSaveSettings}>
-                <Text style={styles.saveBtnText}>Save</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        </View>
-      </Modal>
     </SafeAreaView>
   );
 }
@@ -190,11 +147,14 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginBottom: 36,
   },
+  logoImage: { width: 190, height: 62, marginBottom: 4 },
   logoText: {
-    fontSize: 48,
+    // 48pt fitted "BYG"; a full word needs to come down or it runs off the
+    // edge on a narrow phone.
+    fontSize: 34,
     fontWeight: '800',
     color: '#00796B',
-    letterSpacing: 2,
+    letterSpacing: 1,
   },
   appName: {
     fontSize: 18,

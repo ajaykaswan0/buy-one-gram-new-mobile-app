@@ -11,10 +11,14 @@ import {
   Alert,
   KeyboardAvoidingView,
   Platform,
+  PermissionsAndroid,
 } from 'react-native';
 import { scale, verticalScale, responsiveFontSize, maxContainerWidth } from '../utils/responsive';
 import Geolocation from '@react-native-community/geolocation';
 import { launchCamera } from 'react-native-image-picker';
+import { uploadPhoto } from '../services/photoUpload';
+import CalendarPicker from '../components/CalendarPicker';
+import AllocationSheet from '../components/AllocationSheet';
 
 export default function CreateCollectionScreen({ token, apiUrl, party, onBack }) {
   const [amount, setAmount] = useState('');
@@ -33,6 +37,15 @@ export default function CreateCollectionScreen({ token, apiUrl, party, onBack })
 
   const [remarks, setRemarks] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
+
+  /**
+   * The payment just recorded, waiting to be put against bills.
+   *
+   * Recording the money used to drop straight back to the previous screen, so
+   * nothing was ever allocated unless somebody remembered to go and do it on
+   * another screen. That is where payments went missing.
+   */
+  const [collected, setCollected] = useState(null);
 
   // GPS Coordinates
   const [fetchingLocation, setFetchingLocation] = useState(false);
@@ -91,6 +104,14 @@ export default function CreateCollectionScreen({ token, apiUrl, party, onBack })
       return;
     }
 
+    // The photo is the only evidence the money changed hands at the shop, so
+    // it is asked for before anything is sent. The server refuses without it
+    // too - this only saves the salesman a round trip.
+    if (!receiptPhoto) {
+      Alert.alert('Photo needed', 'Take a photo of the cash, cheque or transfer before recording this collection.');
+      return;
+    }
+
     if (paymentMode === 'cheque') {
       if (!chequeNumber.trim()) {
         Alert.alert('Required', 'Please enter the cheque number.');
@@ -118,7 +139,7 @@ export default function CreateCollectionScreen({ token, apiUrl, party, onBack })
           chequeDate: paymentMode === 'cheque' ? chequeDate.trim() || undefined : undefined,
           bankName: paymentMode === 'cheque' ? bankName.trim() : undefined,
           transactionRef: ['upi', 'bank_transfer'].includes(paymentMode) ? transactionRef.trim() : undefined,
-          receiptPhoto: receiptPhoto ? `data:image/jpeg;base64,${receiptPhoto}` : undefined,
+          receiptPhoto: await uploadPhoto({ base64: receiptPhoto, apiUrl, token, module: 'collections' }),
           latitude,
           longitude,
           remarks: remarks.trim() || undefined,
@@ -127,8 +148,7 @@ export default function CreateCollectionScreen({ token, apiUrl, party, onBack })
 
       const data = await response.json();
       if (response.ok && data.success) {
-        Alert.alert('Success', 'Collection logged successfully!');
-        onBack();
+        setCollected(data.data);
       } else {
         Alert.alert('Failed', data.message || 'Could not record collection.');
       }
@@ -217,13 +237,14 @@ export default function CreateCollectionScreen({ token, apiUrl, party, onBack })
               onChangeText={setChequeNumber}
             />
 
-            <Text style={styles.fieldLabel}>Cheque Date (Optional)</Text>
-            <TextInput
-              style={styles.input}
-              placeholder="e.g. YYYY-MM-DD"
-              placeholderTextColor="#A0AEC0"
+            <Text style={styles.fieldLabel}>Cheque Date</Text>
+            {/* A cheque dated before today cannot be banked, so those days are
+                not tappable. It used to be a free-text box asking for
+                "YYYY-MM-DD", which took a typo or yesterday just as happily. */}
+            <CalendarPicker
               value={chequeDate}
-              onChangeText={setChequeDate}
+              onChange={setChequeDate}
+              label="Pick the cheque date"
             />
 
             <Text style={styles.fieldLabel}>Bank Name *</Text>
@@ -252,13 +273,15 @@ export default function CreateCollectionScreen({ token, apiUrl, party, onBack })
         )}
 
         {/* Receipt photo */}
-        <Text style={styles.fieldLabel}>Proof / Receipt Photo (Optional)</Text>
+        <Text style={styles.fieldLabel}>Proof / Receipt Photo *</Text>
         <TouchableOpacity style={styles.photoBtn} onPress={handleCapturePhoto}>
           <Text style={styles.photoBtnText}>📸 Capture Cash/Cheque Photo</Text>
         </TouchableOpacity>
         {receiptPhoto ? (
           <Text style={styles.photoSuccessText}>✓ Receipt photo attached successfully</Text>
-        ) : null}
+        ) : (
+          <Text style={styles.photoNeededText}>A photo is needed before this collection can be recorded</Text>
+        )}
 
         {/* Remarks */}
         <Text style={styles.fieldLabel}>Remarks / Special Notes</Text>
@@ -287,9 +310,9 @@ export default function CreateCollectionScreen({ token, apiUrl, party, onBack })
 
         {/* Submit */}
         <TouchableOpacity
-          style={[styles.submitBtn, isSubmitting && styles.disabledBtn]}
+          style={[styles.submitBtn, (isSubmitting || !receiptPhoto) && styles.disabledBtn]}
           onPress={handleRecordCollection}
-          disabled={isSubmitting}
+          disabled={isSubmitting || !receiptPhoto}
         >
           {isSubmitting ? (
             <ActivityIndicator color="#FFFFFF" size="small" />
@@ -299,6 +322,30 @@ export default function CreateCollectionScreen({ token, apiUrl, party, onBack })
         </TouchableOpacity>
       </ScrollView>
       </KeyboardAvoidingView>
+
+      {/* Opens on the payment being recorded, not on a menu somewhere else. */}
+      <AllocationSheet
+        visible={Boolean(collected)}
+        token={token}
+        apiUrl={apiUrl}
+        partyId={party._id}
+        payment={collected}
+        onDone={(used, left) => {
+          setCollected(null);
+          Alert.alert(
+            'Payment recorded',
+            left > 0.01
+              ? `₹${used.toLocaleString('en-IN')} put against bills. ₹${left.toLocaleString('en-IN')} stays in the party wallet.`
+              : `₹${used.toLocaleString('en-IN')} put against bills.`,
+          );
+          onBack();
+        }}
+        onSkip={() => {
+          setCollected(null);
+          Alert.alert('Payment recorded', 'Nothing was put against a bill, so it sits in the party wallet until somebody allocates it.');
+          onBack();
+        }}
+      />
     </SafeAreaView>
   );
 }
@@ -456,6 +503,12 @@ const styles = StyleSheet.create({
     fontSize: responsiveFontSize(13),
     color: '#4A5568',
     fontWeight: '700',
+  },
+  photoNeededText: {
+    color: '#B45309',
+    fontWeight: '700',
+    fontSize: 12,
+    marginTop: 6,
   },
   photoSuccessText: {
     fontSize: responsiveFontSize(12),

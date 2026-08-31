@@ -135,9 +135,17 @@ export async function uploadFile({
 }
 
 /**
- * FirebaseImage component resolves and displays private image paths using view-url keys.
+ * FirebaseImage component resolves and displays private image paths.
  */
-export function FirebaseImage({ source, style, token, apiUrl, ...props }) {
+/**
+ * An image stored by path rather than URL.
+ *
+ * A stored photo is a path like `parties/2026-08/abc.jpg`, which no <Image>
+ * can load — it has to be exchanged for a signed URL first. `fallback` is what
+ * shows while that is happening or if it fails, because rendering nothing at
+ * all just leaves a hole where the photo should be.
+ */
+export function FirebaseImage({ source, style, token, apiUrl, fallback = null, ...props }) {
   const [resolvedUri, setResolvedUri] = useState(null);
 
   useEffect(() => {
@@ -153,12 +161,28 @@ export function FirebaseImage({ source, style, token, apiUrl, ...props }) {
         return;
       }
       try {
-        const res = await fetch(`${apiUrl}/uploads/${encodeURIComponent(uri)}/view-url`, {
-          headers: { Authorization: `Bearer ${token}` }
+        /**
+         * The path travels in the body, not in the URL.
+         *
+         * A stored path is `parties/2026-08/abc.jpg` — it contains slashes.
+         * Putting it in the URL means percent-encoding them, and a proxy that
+         * decodes `%2F` before passing the request on turns the route into
+         * `/uploads/parties/2026-08/abc.jpg/view-url`, which matches nothing
+         * and returns 404. That is exactly what happened to every party photo.
+         *
+         * The admin panel has always used this endpoint and never had the
+         * problem. Same one here now.
+         */
+        const res = await fetch(`${apiUrl}/uploads/resolve`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ module: 'parties', storagePath: uri }),
         });
         const data = await safeJsonResponse(res);
         if (active && res.ok && data.success) {
           setResolvedUri(data.data.viewUrl);
+        } else if (active) {
+          console.warn('FirebaseImage could not resolve', uri, data?.message || res.status);
         }
       } catch (err) {
         console.warn('FirebaseImage resolve error:', err.message);
@@ -170,7 +194,7 @@ export function FirebaseImage({ source, style, token, apiUrl, ...props }) {
     };
   }, [source?.uri, token, apiUrl]);
 
-  if (!resolvedUri) return null;
+  if (!resolvedUri) return fallback;
 
   return <Image source={{ uri: resolvedUri }} style={style} {...props} />;
 }

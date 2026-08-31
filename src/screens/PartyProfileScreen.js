@@ -1,4 +1,11 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback} from 'react';
+import { useLanguage } from '../i18n';
+import Pdf from 'react-native-pdf';
+import CreditLimitRequestModal from '../components/CreditLimitRequestModal';
+import { readJson } from '../services/apiResponse';
+import { FirebaseImage } from '../services/firebaseUploadService';
+import OrderPaymentDetails from '../components/OrderPaymentDetails';
+import OrderStageTracker from '../components/OrderStageTracker';
 import {
   StyleSheet,
   Text,
@@ -13,25 +20,83 @@ import {
   Alert,
   KeyboardAvoidingView,
   Platform,
+  Linking,
+  RefreshControl,
 } from 'react-native';
+import WalletAllocationSheet from '../components/WalletAllocationSheet';
+import PartyIssuesSheet, { OPEN_STATUSES } from '../components/PartyIssuesSheet';
 import { scale, verticalScale, responsiveFontSize, maxContainerWidth } from '../utils/responsive';
+import { bottomBarPadding } from '../utils/systemBars';
+
+/**
+ * Whether a stored file is something we can simply draw.
+ *
+ * Read from the extension on the stored name first, since a signed URL buries
+ * it behind query parameters.
+ */
+// Held in memory as base64, which costs about a third more than the file
+// itself. A statement is a page or two; something enormous is refused rather
+// than risking the app being killed mid-read.
+const MAX_LEDGER_BYTES = 25 * 1024 * 1024;
+
+const kindOfFile = (storagePath, url = '') => {
+  const name = String(storagePath || url || '').split('?')[0].toLowerCase();
+  if (/\.(jpe?g|png|webp|gif|heic|bmp)$/.test(name)) return 'image';
+  if (/\.pdf$/.test(name)) return 'pdf';
+  // Nothing conclusive: an image is the safer guess, because it degrades to a
+  // blank frame rather than a native download error.
+  return 'image';
+};
+
+/**
+ * Formatting helpers, at module scope on purpose.
+ *
+ * They used to be declared inside the component, below the allocation list that
+ * calls them. Hermes does not enforce the temporal dead zone in a release
+ * build, so the `const` read as `undefined` instead of throwing a clear
+ * "used before initialization" — and calling it crashed the whole screen with
+ * "Trying to call a non-function". It only showed up for a party that actually
+ * had an open bill, because that is the only time the callback runs.
+ *
+ * None of them touch component state, so there is no reason for them to live
+ * inside the component at all.
+ */
+const formatDate = (dateStr) => {
+  if (!dateStr) return '—';
+  const d = new Date(dateStr);
+  return d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+};
+
+const formatDateTime = (dateStr) => {
+  if (!dateStr) return '—';
+  const d = new Date(dateStr);
+  return d.toLocaleDateString('en-IN', {
+    day: '2-digit', month: 'short', year: 'numeric',
+    hour: '2-digit', minute: '2-digit',
+  });
+};
+
+const formatCurrency = (amount) => {
+  if (amount == null) return '₹0';
+  return '₹' + Number(amount).toLocaleString('en-IN');
+};
 
 export default function PartyProfileScreen({ token, apiUrl, partyId, onBack, onNavigateToOrder, onNavigateToCollection }) {
+  const { t, term, name } = useLanguage();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [profile, setProfile] = useState(null);
-  const [activeTab, setActiveTab] = useState('overview');
+  // Nothing is open until a card is tapped. The screen used to land on the
+  // order list every time, which buried the numbers the salesman came for.
+  const [activeTab, setActiveTab] = useState(null);
+  const [detailsOpen, setDetailsOpen] = useState(false);
 
   // Expanded orders in profile
   const [expandedOrders, setExpandedOrders] = useState({});
 
   // Allocation modal states
   const [allocationModalVisible, setAllocationModalVisible] = useState(false);
-  const [loadingFinance, setLoadingFinance] = useState(false);
   const [financeData, setFinanceData] = useState(null);
-  const [selectedPaymentId, setSelectedPaymentId] = useState(null);
-  const [allocationInputs, setAllocationInputs] = useState({}); // { [invoiceId]: amount }
-  const [submittingAllocation, setSubmittingAllocation] = useState(false);
 
   // Replacement modal states
   const [replacementModalVisible, setReplacementModalVisible] = useState(false);
@@ -40,6 +105,10 @@ export default function PartyProfileScreen({ token, apiUrl, partyId, onBack, onN
   const [replaceRemarks, setReplaceRemarks] = useState('');
   const [submittingReplacement, setSubmittingReplacement] = useState(false);
   const [issueModalVisible, setIssueModalVisible] = useState(false);
+  const [issueListVisible, setIssueListVisible] = useState(false);
+  // Only the count is loaded with the profile; the issues themselves are
+  // fetched when the card is opened.
+  const [issueCounts, setIssueCounts] = useState({ total: 0, open: 0 });
   const [issueCategory, setIssueCategory] = useState('service');
   const [issuePriority, setIssuePriority] = useState('medium');
   const [issueSubject, setIssueSubject] = useState('');
@@ -72,6 +141,7 @@ export default function PartyProfileScreen({ token, apiUrl, partyId, onBack, onN
       setIssueSubject('');
       setIssueDescription('');
       Alert.alert('Issue Raised', `${result.data?.issueNumber || 'Issue'} has been sent to Admin.`);
+      loadIssueCounts();
     } catch (err) {
       Alert.alert('Failed', err.message || 'Could not raise issue.');
     } finally {
@@ -159,107 +229,42 @@ export default function PartyProfileScreen({ token, apiUrl, partyId, onBack, onN
     }
   };
 
-  const handleOpenAllocationModal = async () => {
-    setAllocationModalVisible(true);
-    setLoadingFinance(true);
-    setSelectedPaymentId(null);
-    setAllocationInputs({});
-    setFinanceData(null);
-    try {
-      const response = await fetch(`${apiUrl}/finance/party/${partyId}`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const data = await response.json();
-      if (response.ok && data.success) {
-        setFinanceData(data.data);
-        const unallocatedPayments = (data.data.payments || []).filter(
-          (p) => (p.unallocatedAmount || 0) > 0 && !['bounced', 'completed'].includes(p.status)
-        );
-        if (unallocatedPayments.length > 0) {
-          setSelectedPaymentId(unallocatedPayments[0]._id);
-        }
-      } else {
-        Alert.alert('Error', 'Could not load finance records.');
-      }
-    } catch (e) {
-      console.warn('Finance fetch error:', e.message);
-      Alert.alert('Error', 'Failed to retrieve billing records.');
-    } finally {
-      setLoadingFinance(false);
-    }
-  };
-
-  const handleSubmitAllocation = async () => {
-    if (!selectedPaymentId) {
-      Alert.alert('Required', 'Please select a payment receipt to allocate.');
-      return;
-    }
-
-    const payment = (financeData.payments || []).find((p) => p._id === selectedPaymentId);
-    if (!payment) return;
-
-    const allocationsList = [];
-    let totalAllocated = 0;
-
-    Object.keys(allocationInputs).forEach((invId) => {
-      const amt = parseFloat(allocationInputs[invId]);
-      if (amt > 0) {
-        allocationsList.push({
-          invoiceId: invId,
-          amount: amt,
-        });
-        totalAllocated += amt;
-      }
-    });
-
-    if (allocationsList.length === 0) {
-      Alert.alert('Required', 'Please allocate a positive amount to at least one bill.');
-      return;
-    }
-
-    if (totalAllocated > payment.unallocatedAmount + 0.01) {
-      Alert.alert(
-        'Validation Error',
-        `Total allocations (₹${totalAllocated}) cannot exceed the payment's unallocated amount (₹${payment.unallocatedAmount}).`
-      );
-      return;
-    }
-
-    setSubmittingAllocation(true);
-    try {
-      const response = await fetch(`${apiUrl}/finance/payment/${selectedPaymentId}/allocate`, {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          allocations: allocationsList,
-        }),
-      });
-
-      const data = await response.json();
-      if (response.ok && data.success) {
-        Alert.alert(
-          'Success',
-          'Payment allocation request submitted! Settlements will show once authorized by accounting.'
-        );
-        setAllocationModalVisible(false);
-        loadProfile();
-      } else {
-        Alert.alert('Failed', data.message || 'Could not complete allocation.');
-      }
-    } catch (e) {
-      console.warn('Allocation error:', e.message);
-      Alert.alert('Error', 'Connection error.');
-    } finally {
-      setSubmittingAllocation(false);
-    }
-  };
+  /**
+   * How many issues this shop has raised, and how many are still open.
+   *
+   * Its own small fetch rather than part of the profile, because the profile
+   * endpoint is shared with screens that have no use for it and it already
+   * carries more than it needs.
+   */
+  const loadIssueCounts = useCallback(() => {
+    fetch(`${apiUrl}/feedback/party/${partyId}?limit=100`, { headers: { Authorization: `Bearer ${token}` } })
+      .then((r) => r.json())
+      .then((data) => {
+        if (!data?.success) return;
+        const rows = Array.isArray(data.data) ? data.data : [];
+        setIssueCounts({ total: rows.length, open: rows.filter((row) => OPEN_STATUSES.includes(row.status)).length });
+      })
+      .catch(() => {});
+  }, [apiUrl, partyId, token]);
 
   useEffect(() => {
     loadProfile();
+    loadIssueCounts();
   }, [partyId]);
+
+  // Pull down to reload, so the screen can be refreshed in place rather than
+  // by navigating away and back.
+  const [refreshing, setRefreshing] = useState(false);
+  const onPullRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await loadProfile();
+    } catch (e) {
+      console.log('[Refresh] failed:', e.message);
+    } finally {
+      setRefreshing(false);
+    }
+  }, [loadProfile]);
 
   const loadProfile = async () => {
     setLoading(true);
@@ -270,6 +275,11 @@ export default function PartyProfileScreen({ token, apiUrl, partyId, onBack, onN
         fetch(`${apiUrl}/parties/${partyId}/profile`, { headers }),
         fetch(`${apiUrl}/finance/party/${partyId}`, { headers }),
       ]);
+      fetch(`${apiUrl}/credit-limit-requests?partyId=${partyId}`, { headers })
+        .then((res) => res.json())
+        .then((body) => setCreditRequests(Array.isArray(body?.data) ? body.data : []))
+        .catch(() => setCreditRequests([]));
+
       const [data, financeResult] = await Promise.all([
         response.json(),
         financeResponse.json(),
@@ -287,24 +297,123 @@ export default function PartyProfileScreen({ token, apiUrl, partyId, onBack, onN
     }
   };
 
-  const formatDate = (dateStr) => {
-    if (!dateStr) return '—';
-    const d = new Date(dateStr);
-    return d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+  // ── Ledger statement ──
+  const [ledgerBusy, setLedgerBusy] = useState(false);
+  // The statement is shown inside the app rather than handed to a browser, so
+  // a company document never leaves for a download folder or another app.
+  const [ledgerDoc, setLedgerDoc] = useState(null); // { url, kind, data }
+  const [sharingLedger, setSharingLedger] = useState(false);
+  const [creditRequests, setCreditRequests] = useState([]);
+  const [creditRequestOpen, setCreditRequestOpen] = useState(false);
+
+  /**
+   * The running account — the same statement the admin panel's Ledger tab
+   * shows, not the uploaded PDF. Fetched only when opened, because most visits
+   * never need it.
+   */
+
+  const openLedger = async (storagePath) => {
+    if (!storagePath) return;
+    setLedgerBusy(true);
+    try {
+      const response = await fetch(`${apiUrl}/uploads/resolve`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ module: 'parties', storagePath }),
+      });
+      const data = await response.json();
+      if (!response.ok || !data.success) throw new Error(data.message || 'Could not open the ledger');
+      // Worked out from the stored file name, which the app already holds.
+      //
+      // The server also reports a `kind`, but only a newer build does — and
+      // defaulting to PDF when it is missing sent every uploaded screenshot
+      // to the PDF renderer, which failed on a PNG. Deciding here works
+      // against any server version; the server's answer is used when given.
+      const kind = data.data.kind || kindOfFile(storagePath, data.data.viewUrl);
+
+      /**
+       * A PDF is fetched here, not by the viewer.
+       *
+       * Left to download the link itself, the PDF component goes through
+       * react-native-blob-util, which on Android calls a transfer incomplete
+       * whenever its byte count disagrees with the Content-Length header and
+       * reports only "Download interrupted." Storage serves these files with a
+       * correct length and no compression, so the miscount is on the device.
+       * Plain fetch does not have the problem.
+       *
+       * The statement still never leaves the app: it is held in memory, written
+       * only to the app's own cache by the viewer, and handed to nothing else.
+       */
+      let inlineData = '';
+      if (kind !== 'image') {
+        const file = await fetch(data.data.viewUrl);
+        if (!file.ok) throw new Error(`The statement could not be fetched (${file.status}).`);
+        const blob = await file.blob();
+        if (!blob.size) throw new Error('The statement came back empty.');
+        if (blob.size > MAX_LEDGER_BYTES) throw new Error('This statement is too large to open on a phone.');
+
+        const dataUri = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result || ''));
+          reader.onerror = () => reject(new Error('The statement could not be read.'));
+          reader.readAsDataURL(blob);
+        });
+        // The viewer matches this one prefix exactly; storage may label the
+        // file octet-stream, which would not match.
+        inlineData = dataUri.replace(/^data:[^;]*;base64,/i, 'data:application/pdf;base64,');
+      }
+
+      setLedgerDoc({ url: data.data.viewUrl, kind, data: inlineData });
+    } catch (err) {
+      Alert.alert('Ledger', err.message || 'Could not open the ledger');
+    } finally {
+      setLedgerBusy(false);
+    }
   };
 
-  const formatDateTime = (dateStr) => {
-    if (!dateStr) return '—';
-    const d = new Date(dateStr);
-    return d.toLocaleDateString('en-IN', {
-      day: '2-digit', month: 'short', year: 'numeric',
-      hour: '2-digit', minute: '2-digit',
-    });
+  /**
+   * Sends the statement to the party from the company's own WhatsApp.
+   *
+   * The server does the sending, so it goes out on the business number and is
+   * recorded — rather than the salesman forwarding a company document from his
+   * personal account.
+   */
+  const shareLedger = async () => {
+    setSharingLedger(true);
+    try {
+      const response = await fetch(`${apiUrl}/parties/${partyId}/share-ledger`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      });
+      const data = await readJson(response, 'The server');
+      Alert.alert('Sent', data.message);
+      loadProfile();
+    } catch (err) {
+      // Hitting the limit is a rule working, not something going wrong.
+      const isCooldown = /share again|already sent/i.test(err.message || '');
+      Alert.alert(isCooldown ? 'Already shared' : 'Could not send', err.message);
+      if (isCooldown) loadProfile();
+    } finally {
+      setSharingLedger(false);
+    }
   };
 
-  const formatCurrency = (amount) => {
-    if (amount == null) return '₹0';
-    return '₹' + Number(amount).toLocaleString('en-IN');
+  const requestLedger = async () => {
+    setLedgerBusy(true);
+    try {
+      const response = await fetch(`${apiUrl}/parties/${partyId}/request-ledger`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      });
+      const data = await response.json();
+      if (!response.ok || !data.success) throw new Error(data.message || 'Could not request the ledger');
+      Alert.alert('Ledger requested', 'Accounts will upload the statement shortly.');
+      loadProfile();
+    } catch (err) {
+      Alert.alert('Ledger', err.message || 'Could not request the ledger');
+    } finally {
+      setLedgerBusy(false);
+    }
   };
 
   const getStatusColor = (status) => {
@@ -329,7 +438,7 @@ export default function PartyProfileScreen({ token, apiUrl, partyId, onBack, onN
           <TouchableOpacity style={styles.backBtn} onPress={onBack}>
             <Text style={styles.backBtnText}>← Back</Text>
           </TouchableOpacity>
-          <Text style={styles.headerTitle}>Party Profile</Text>
+          <Text style={styles.headerTitle}>{t('Party Profile')}</Text>
         </View>
         <View style={styles.loadingContainer}>
           <ActivityIndicator color="#00796B" size="large" />
@@ -346,12 +455,12 @@ export default function PartyProfileScreen({ token, apiUrl, partyId, onBack, onN
           <TouchableOpacity style={styles.backBtn} onPress={onBack}>
             <Text style={styles.backBtnText}>← Back</Text>
           </TouchableOpacity>
-          <Text style={styles.headerTitle}>Party Profile</Text>
+          <Text style={styles.headerTitle}>{t('Party Profile')}</Text>
         </View>
         <View style={styles.loadingContainer}>
           <Text style={styles.errorText}>{error || 'Profile not available.'}</Text>
           <TouchableOpacity style={styles.retryBtn} onPress={loadProfile}>
-            <Text style={styles.retryBtnText}>Retry</Text>
+            <Text style={styles.retryBtnText}>{t('Retry')}</Text>
           </TouchableOpacity>
         </View>
       </SafeAreaView>
@@ -359,23 +468,6 @@ export default function PartyProfileScreen({ token, apiUrl, partyId, onBack, onN
   }
 
   const { party, recentOrders, recentVisits, recentCollections, stats } = profile;
-
-  let pendingUnallocated = 0;
-  let pendingAllocated = Number(financeData?.summary?.pendingAllocated || 0);
-
-  (financeData?.payments || recentCollections || []).forEach((c) => {
-    if (['pending', 'unallocated', 'allocated_pending', 'pending_verification', 'pending_handover', 'received'].includes(c.status)) {
-      const allocations = c.allocations || [];
-      const pendingAllocationsAmt = allocations
-        .filter((a) => a.status === 'pending')
-        .reduce((sum, a) => sum + Number(a.amount || 0), 0);
-
-      const totalUnallocated = Number(c.unallocatedAmount ?? c.amount ?? 0);
-
-      if (!financeData) pendingAllocated += pendingAllocationsAmt;
-      pendingUnallocated += Math.max(0, totalUnallocated - pendingAllocationsAmt);
-    }
-  });
 
   const invoiceByOrderId = new Map();
   (financeData?.invoices || []).forEach((invoice) => {
@@ -395,6 +487,62 @@ export default function PartyProfileScreen({ token, apiUrl, partyId, onBack, onN
     });
   });
   const netOutstanding = Number(financeData?.summary?.netOutstanding ?? party.currentOutstanding ?? 0);
+
+  /**
+   * Money that can still be pointed at a bill.
+   *
+   * Two pots, deliberately not added twice: an unsettled collection's
+   * unallocated slice is cash the salesman is holding, while a settled one's
+   * leftover has already been added to the party's advance balance — summing
+   * both would show that money in the wallet twice over.
+   */
+  // One open request at a time — the server refuses a second, so the card
+  // says it is waiting rather than offering a button that would error.
+  const pendingCreditRequests = creditRequests.filter((row) => row.status === 'pending');
+  const creditRequestPending = pendingCreditRequests.length > 0;
+
+  /**
+   * The wallet is money in hand that no bill has taken.
+   *
+   * Four cheques of 10,000 collected and not yet allocated read as a wallet of
+   * 40,000, which is what the salesman is actually holding. Any advance on
+   * account is added in, because it is the same thing by another route.
+   *
+   * These were two cards side by side for a while, Wallet and Unallocated,
+   * which read as two pots when there is only one.
+   */
+  const unallocatedOnReceipts = Number((financeData?.payments || recentCollections || [])
+    .filter((payment) => !['bounced', 'returned', 'rejected', 'cancelled'].includes(payment.status))
+    .reduce((sum, payment) => sum + Number(payment.unallocatedAmount ?? 0), 0)
+    .toFixed(2));
+
+  const walletBalance = Number((Number(party.advanceBalance || 0) + unallocatedOnReceipts).toFixed(2));
+
+  // Three days must pass after a statement is uploaded before another can be
+  // asked for. The server enforces the same rule; this only keeps the button
+  // honest so the salesman is not refused after tapping.
+  const ledgerAvailableAt = stats.ledgerRequestAvailableAt
+    ? new Date(stats.ledgerRequestAvailableAt)
+    : null;
+  const canRequestLedger = !ledgerAvailableAt || Date.now() >= ledgerAvailableAt.getTime();
+  /**
+   * A ledger may go out once every three days, per party.
+   *
+   * Within those three days the button is simply dead — greyed out and doing
+   * nothing. It deliberately says nothing about when it will work again: a
+   * countdown on a button reads as an error the salesman has to solve, when in
+   * fact the statement has already been sent and there is nothing to do.
+   *
+   * The server refuses either way; this only spares a wasted tap.
+   */
+  const shareAvailableAt = stats.ledgerShareAvailableAt ? new Date(stats.ledgerShareAvailableAt) : null;
+  const canShareLedger = !shareAvailableAt || Date.now() >= shareAvailableAt.getTime();
+
+  const ledgerCooldownText = (() => {
+    if (!ledgerAvailableAt) return '';
+    const days = Math.ceil((ledgerAvailableAt.getTime() - Date.now()) / (24 * 60 * 60 * 1000));
+    return days > 1 ? `in ${days} days` : 'tomorrow';
+  })();
 
   const getOrderPaymentState = (order) => {
     if (order.paymentType === 'prepaid') return { label: 'PAID', color: '#38A169' };
@@ -423,7 +571,7 @@ export default function PartyProfileScreen({ token, apiUrl, partyId, onBack, onN
           <TouchableOpacity style={styles.backBtn} onPress={onBack}>
             <Text style={styles.backBtnText}>← Back</Text>
           </TouchableOpacity>
-          <Text style={styles.headerTitle}>Party Profile</Text>
+          <Text style={styles.headerTitle}>{t('Party Profile')}</Text>
         </View>
         <TouchableOpacity
           style={styles.headerOrderBtn}
@@ -439,125 +587,351 @@ export default function PartyProfileScreen({ token, apiUrl, partyId, onBack, onN
         </TouchableOpacity>
       </View>
 
-      <ScrollView contentContainerStyle={styles.scrollContent}>
-        {/* Party Info Card */}
+      <ScrollView contentContainerStyle={styles.scrollContent}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onPullRefresh} colors={['#00796B']} tintColor="#00796B" />
+        }
+      >
+        {/* Party Info Card — the identity stays, the rest folds away so the
+            numbers below sit on the first screen rather than under a scroll. */}
         <View style={styles.profileCard}>
-          {party.shopPhoto ? (
-            <Image
-              source={{ uri: party.shopPhoto }}
-              style={styles.shopPhoto}
-              resizeMode="cover"
-            />
-          ) : (
-            <View style={styles.shopPhotoPlaceholder}>
-              <Text style={styles.shopPhotoPlaceholderText}>📷 No Photo</Text>
+          <View style={styles.profileHeadRow}>
+            {party.shopPhoto ? (
+              <FirebaseImage
+                source={{ uri: party.shopPhoto }}
+                style={styles.shopPhotoSmall}
+                resizeMode="cover"
+                token={token}
+                apiUrl={apiUrl}
+                fallback={
+                  <View style={styles.shopPhotoSmallPlaceholder}>
+                    <Text style={styles.shopPhotoPlaceholderText}>📷</Text>
+                  </View>
+                }
+              />
+            ) : (
+              <View style={styles.shopPhotoSmallPlaceholder}>
+                <Text style={styles.shopPhotoPlaceholderText}>📷</Text>
+              </View>
+            )}
+            <View style={{ flex: 1, minWidth: 0 }}>
+              <Text style={styles.profileName} numberOfLines={2}>{name(party.partyName)}</Text>
+              <Text style={styles.profileCode}>{party.partyCode}</Text>
+              <Text style={styles.profileDetail} numberOfLines={1}>📞 {party.mobile}</Text>
+            </View>
+          </View>
+
+          <TouchableOpacity style={styles.viewMoreBtn} onPress={() => setDetailsOpen((v) => !v)}>
+            <Text style={styles.viewMoreBtnText}>{detailsOpen ? 'View less ▲' : 'View more ▼'}</Text>
+          </TouchableOpacity>
+
+          {detailsOpen && (
+            <View style={styles.profileDetailsBlock}>
+              {party.shopPhoto ? (
+                <FirebaseImage
+                  source={{ uri: party.shopPhoto }}
+                  style={styles.shopPhoto}
+                  resizeMode="cover"
+                  token={token}
+                  apiUrl={apiUrl}
+                />
+              ) : null}
+              {party.ownerName ? <Text style={styles.profileDetail}>👤 {name(party.ownerName)}</Text> : null}
+              <Text style={styles.profileDetail}>📍 {party.address}</Text>
+              {party.area ? <Text style={styles.profileDetail}>🏘️ {party.area}, {party.city}, {party.state} - {party.pincode}</Text> : null}
+              {party.email ? <Text style={styles.profileDetail}>✉️ {party.email}</Text> : null}
+              {party.gstNo ? <Text style={styles.profileDetail}>🏛️ GST: {party.gstNo}</Text> : null}
+              {party.paymentTerms ? <Text style={styles.profileDetail}>🧾 Terms: {party.paymentTerms}</Text> : null}
+              {party.assignedSalesman ? (
+                <Text style={styles.profileDetail}>👨‍💼 Salesman: {party.assignedSalesman.name} ({party.assignedSalesman.mobile})</Text>
+              ) : null}
             </View>
           )}
-
-          <Text style={styles.profileName}>{party.partyName}</Text>
-          <Text style={styles.profileCode}>{party.partyCode}</Text>
-
-          {party.ownerName ? (
-            <Text style={styles.profileDetail}>👤 {party.ownerName}</Text>
-          ) : null}
-          <Text style={styles.profileDetail}>📞 {party.mobile}</Text>
-          <Text style={styles.profileDetail}>📍 {party.address}</Text>
-          {party.area ? <Text style={styles.profileDetail}>🏘️ {party.area}, {party.city}, {party.state} - {party.pincode}</Text> : null}
-          {party.email ? <Text style={styles.profileDetail}>✉️ {party.email}</Text> : null}
-          {party.gstNo ? <Text style={styles.profileDetail}>🏛️ GST: {party.gstNo}</Text> : null}
-          {party.assignedSalesman ? (
-            <Text style={styles.profileDetail}>👨‍💼 Salesman: {party.assignedSalesman.name} ({party.assignedSalesman.mobile})</Text>
-          ) : null}
         </View>
 
         <TouchableOpacity style={styles.raiseIssueBtn} onPress={() => setIssueModalVisible(true)}>
-          <Text style={styles.raiseIssueBtnText}>⚠ Raise Issue for {party.partyName}</Text>
+          <Text style={styles.raiseIssueBtnText}>⚠ Raise Issue for {name(party.partyName)}</Text>
         </TouchableOpacity>
 
-        {/* Stats Cards */}
-        <View style={styles.statsRow}>
-          <View style={[styles.statCard, { backgroundColor: '#FFF5F5', padding: 12 }]}>
-            <Text style={[styles.statValue, { color: '#E53E3E', fontSize: 15 }]}>{formatCurrency(netOutstanding)}</Text>
-            <Text style={[styles.statLabel, { fontSize: 9.5 }]}>Outstanding</Text>
-          </View>
-          <View style={[styles.statCard, { backgroundColor: '#EBF8FF', padding: 12 }]}>
-            <Text style={[styles.statValue, { color: '#3182CE', fontSize: 15 }]}>{formatCurrency(party.advanceBalance || 0)}</Text>
-            <Text style={[styles.statLabel, { fontSize: 9.5 }]}>Wallet Balance</Text>
-          </View>
-          <View style={[styles.statCard, { backgroundColor: '#F0FFF4', padding: 12 }]}>
-            <Text style={[styles.statValue, { color: '#38A169', fontSize: 15 }]}>{formatCurrency(party.creditLimit)}</Text>
-            <Text style={[styles.statLabel, { fontSize: 9.5 }]}>Credit Limit</Text>
-          </View>
-        </View>
-
-        {/* Bill Allocation Callout */}
-        <View style={styles.allocationCard}>
-          <View style={{ flex: 1 }}>
-            <Text style={styles.allocationCardTitle}>Settle Bills / Allocate Wallet</Text>
-            <Text style={styles.allocationCardDesc}>
-              Map unallocated collections of {formatCurrency(party.advanceBalance || 0)} to unpaid bills.
-            </Text>
-          </View>
+        {/* The six numbers. Three of them are buttons: tapping opens the
+            matching list underneath, tapping again closes it. */}
+        <View style={styles.statGrid}>
           <TouchableOpacity
-            style={styles.allocationActionBtn}
-            onPress={handleOpenAllocationModal}
+            style={[styles.gridCard, { backgroundColor: '#F0FFF4' }, activeTab === 'orders' && styles.gridCardActive]}
+            onPress={() => setActiveTab((t) => (t === 'orders' ? null : 'orders'))}
           >
-            <Text style={styles.allocationActionBtnText}>Settle Bills</Text>
+            <Text style={[styles.gridValue, { color: '#2F855A' }]}>{formatCurrency(stats.totalSale || 0)}</Text>
+            <Text style={styles.gridLabel}>{t('Total Sale')}</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.gridCard, { backgroundColor: '#FEFCBF' }, activeTab === 'visits' && styles.gridCardActive]}
+            onPress={() => setActiveTab((t) => (t === 'visits' ? null : 'visits'))}
+          >
+            <Text style={[styles.gridValue, { color: '#B7791F' }]}>{stats.totalVisits ?? 0}</Text>
+            <Text style={styles.gridLabel}>Total Visits ›</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.gridCard, { backgroundColor: '#EBF8FF' }, activeTab === 'orders' && styles.gridCardActive]}
+            onPress={() => setActiveTab((t) => (t === 'orders' ? null : 'orders'))}
+          >
+            <Text style={[styles.gridValue, { color: '#2B6CB0' }]}>{stats.totalBills ?? stats.totalOrders ?? 0}</Text>
+            <Text style={styles.gridLabel}>Total Bills ›</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.gridCard, { backgroundColor: '#FFF5F5' }, activeTab === 'collections' && styles.gridCardActive]}
+            onPress={() => setActiveTab((t) => (t === 'collections' ? null : 'collections'))}
+          >
+            <Text style={[styles.gridValue, { color: '#C53030' }]}>{formatCurrency(netOutstanding)}</Text>
+            <Text style={styles.gridLabel}>Outstanding ›</Text>
+          </TouchableOpacity>
+
+          {/* Collected and not yet on a bill. Tapping it is the way in to
+              allocate - losing that entry point would strand 64 lakh. */}
+          <TouchableOpacity
+            style={[styles.gridCard, { backgroundColor: '#EBF4FF' }, walletBalance <= 0 && styles.gridCardMuted]}
+            onPress={() => setAllocationModalVisible(true)}
+            disabled={walletBalance <= 0}
+          >
+            <Text style={[styles.gridValue, { color: '#3182CE' }]}>{formatCurrency(walletBalance)}</Text>
+            <Text style={styles.gridLabel}>{walletBalance > 0 ? 'Wallet · allocate ›' : 'Wallet Balance'}</Text>
+          </TouchableOpacity>
+
+          {/* What this shop has raised. An open issue is the first thing the
+              salesman should see, not something he finds out about from the
+              shopkeeper. */}
+          <TouchableOpacity
+            style={[
+              styles.gridCard,
+              { backgroundColor: issueCounts.open > 0 ? '#FFF5F5' : '#F7FAFC' },
+              issueCounts.total === 0 && styles.gridCardMuted,
+            ]}
+            onPress={() => setIssueListVisible(true)}
+            disabled={issueCounts.total === 0}
+          >
+            <Text style={[styles.gridValue, { color: issueCounts.open > 0 ? '#C53030' : '#4A5568' }]}>
+              {issueCounts.open > 0 ? issueCounts.open : issueCounts.total}
+            </Text>
+            <Text style={styles.gridLabel}>
+              {issueCounts.open > 0
+                ? `Open ${issueCounts.open === 1 ? 'issue' : 'issues'} \u203a`
+                : issueCounts.total > 0 ? 'Issues \u00b7 all dealt with \u203a' : 'No issues'}
+            </Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.gridCard, { backgroundColor: '#F7FAFC' }]}
+            onPress={() => setCreditRequestOpen(true)}
+            disabled={creditRequestPending}
+          >
+            <Text style={[styles.gridValue, { color: '#4A5568' }]}>{formatCurrency(party.creditLimit)}</Text>
+            <Text style={styles.gridLabel}>
+              {creditRequestPending ? 'Limit · awaiting admin' : 'Credit Limit · ask ›'}
+            </Text>
           </TouchableOpacity>
         </View>
 
-        <View style={styles.statsRow}>
-          <View style={[styles.statCard, { backgroundColor: '#EBF8FF' }]}>
-            <Text style={[styles.statValue, { color: '#3182CE' }]}>{stats.totalOrders}</Text>
-            <Text style={styles.statLabel}>Total Orders</Text>
+        {/* Only what is still waiting on an admin. A decided request has
+            already had its effect, so it is not left here to scroll past. */}
+        {creditRequestPending && (
+        <View style={styles.creditReqCard}>
+          <View style={styles.creditReqHead}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.creditReqTitle}>{t('Credit limit requests')}</Text>
+              <Text style={styles.creditReqSub}>
+                {formatCurrency(party.creditLimit)} allowed · {formatCurrency(netOutstanding)} owed
+              </Text>
+            </View>
           </View>
-          <View style={[styles.statCard, { backgroundColor: '#FEFCBF' }]}>
-            <Text style={[styles.statValue, { color: '#D69E2E' }]}>{stats.totalVisits}</Text>
-            <Text style={styles.statLabel}>Total Visits</Text>
+
+          {creditRequestPending && (
+            <View style={styles.creditReqList}>
+              {pendingCreditRequests.map((row) => (
+                <View key={row._id} style={styles.creditReqRow}>
+                  <View style={{ flex: 1, minWidth: 0 }}>
+                    <Text style={styles.creditReqAmount}>
+                      {formatCurrency(row.currentLimit)} → {formatCurrency(row.requestedLimit)}
+                      {row.status === 'approved' && Number(row.approvedLimit) !== Number(row.requestedLimit)
+                        ? ` · granted ${formatCurrency(row.approvedLimit)}`
+                        : ''}
+                    </Text>
+                    <Text style={styles.creditReqReason} numberOfLines={2}>{row.reason}</Text>
+                    <Text style={styles.creditReqMeta}>
+                      {row.requestedBy?.name || 'Someone'} · {formatDate(row.createdAt)}
+                      {row.reviewRemarks ? ` · ${row.reviewRemarks}` : ''}
+                    </Text>
+                  </View>
+                  <View style={styles.creditReqChip}>
+                    <Text style={styles.creditReqChipText}>WAITING</Text>
+                  </View>
+                </View>
+              ))}
+            </View>
+          )}
+        </View>
+        )}
+
+        <CreditLimitRequestModal
+          visible={creditRequestOpen}
+          onClose={() => setCreditRequestOpen(false)}
+          party={party}
+          creditLimit={party.creditLimit}
+          currentOutstanding={netOutstanding}
+          apiUrl={apiUrl}
+          token={token}
+          onSubmitted={loadProfile}
+        />
+
+        {/* Ledger statement — status tells the salesman a new one has arrived */}
+        <View style={styles.ledgerCard}>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.ledgerTitle}>{t('Ledger Statement')}</Text>
+            <Text style={[
+              styles.ledgerStatus,
+              party.ledgerRequestStatus === 'fulfilled' && { color: '#2F855A' },
+              party.ledgerRequestStatus === 'requested' && { color: '#B7791F' },
+            ]}>
+              {party.ledgerRequestStatus === 'fulfilled'
+                ? `✓ Ledger uploaded${party.ledgerUploadedAt ? ` · ${formatDate(party.ledgerUploadedAt)}` : ''}`
+                : party.ledgerRequestStatus === 'requested'
+                  ? `Requested${party.ledgerRequestedAt ? ` · ${formatDate(party.ledgerRequestedAt)}` : ''} — awaiting accounts`
+                  : 'No statement requested yet'}
+            </Text>
+          </View>
+          <View style={{ gap: 6 }}>
+            {party.ledgerDocument ? (
+              <>
+                <TouchableOpacity style={styles.ledgerViewBtn} disabled={ledgerBusy} onPress={() => openLedger(party.ledgerDocument)}>
+                  <Text style={styles.ledgerViewBtnText}>{ledgerBusy ? 'Opening…' : 'View Ledger'}</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.ledgerShareBtn, !canShareLedger && styles.ledgerShareBtnDisabled]}
+                  disabled={sharingLedger || !canShareLedger}
+                  onPress={shareLedger}
+                >
+                  <Text style={styles.ledgerShareBtnText}>
+                    {sharingLedger ? 'Sending…' : 'Share on WhatsApp'}
+                  </Text>
+                </TouchableOpacity>
+              </>
+            ) : null}
+            {party.ledgerRequestStatus !== 'requested' ? (
+              <TouchableOpacity
+                style={[styles.ledgerRequestBtn, !canRequestLedger && styles.ledgerRequestBtnDisabled]}
+                disabled={ledgerBusy || !canRequestLedger}
+                onPress={requestLedger}
+              >
+                <Text style={styles.ledgerRequestBtnText}>{party.ledgerDocument ? 'Request New' : 'Request Ledger'}</Text>
+              </TouchableOpacity>
+            ) : null}
           </View>
         </View>
 
-        {/* Wallet Balance Details Card */}
-        <View style={styles.walletDetailsCard}>
-          <Text style={styles.walletDetailsTitle}>💳 Party Wallet Details</Text>
-          <View style={styles.walletDetailsRow}>
-            <Text style={styles.walletDetailsLabel}>Confirmed Wallet (Advance)</Text>
-            <Text style={[styles.walletDetailsVal, { color: '#38A169' }]}>
-              {formatCurrency(party.advanceBalance || 0)}
-            </Text>
-          </View>
-          <View style={styles.walletDetailsDivider} />
-          <View style={styles.walletDetailsRow}>
-            <Text style={styles.walletDetailsLabel}>Pending Collection (Unallocated)</Text>
-            <Text style={[styles.walletDetailsVal, { color: '#D69E2E' }]}>
-              {formatCurrency(pendingUnallocated)}
-            </Text>
-          </View>
-          <View style={styles.walletDetailsDivider} />
-          <View style={styles.walletDetailsRow}>
-            <Text style={styles.walletDetailsLabel}>Pending Collection (Allocated)</Text>
-            <Text style={[styles.walletDetailsVal, { color: '#3182CE' }]}>
-              {formatCurrency(pendingAllocated)}
-            </Text>
-          </View>
-        </View>
+        {/* Accounts prepares each statement by hand, so the same one cannot be
+            asked for again straight away. */}
+        {!canRequestLedger && party.ledgerRequestStatus !== 'requested' ? (
+          <Text style={styles.ledgerCooldownNote}>
+            A new statement can be requested {ledgerCooldownText}.
+          </Text>
+        ) : null}
 
-        {/* Tabs */}
-        <View style={styles.tabRow}>
-          {['orders', 'visits', 'collections'].map((tab) => (
+        {/* Statement viewer — inside the app, never handed to a browser */}
+        <Modal
+          visible={!!ledgerDoc}
+          animationType="slide"
+          onRequestClose={() => setLedgerDoc(null)}
+        >
+          <SafeAreaView style={styles.ledgerViewerRoot}>
+            <View style={styles.ledgerViewerBar}>
+              <Text style={styles.ledgerViewerTitle} numberOfLines={1}>
+                {name(party.partyName)} · Statement
+              </Text>
+              <TouchableOpacity onPress={() => setLedgerDoc(null)}>
+                <Text style={styles.ledgerViewerClose}>✕ Close</Text>
+              </TouchableOpacity>
+            </View>
+
+            {ledgerDoc?.kind === 'image' ? (
+              <ScrollView
+                style={{ flex: 1 }}
+                contentContainerStyle={styles.ledgerImageWrap}
+                maximumZoomScale={4}
+                minimumZoomScale={1}
+              >
+                <Image source={{ uri: ledgerDoc.url }} style={styles.ledgerImage} resizeMode="contain" />
+              </ScrollView>
+            ) : ledgerDoc ? (
+              /**
+               * Drawn on the device itself.
+               *
+               * Android's web view cannot render a PDF, and the usual
+               * workaround — Google's document viewer — would hand a customer's
+               * financial statement to a third party. This renders it locally,
+               * so the file is never passed to another app and never leaves.
+               */
+              <Pdf
+                // No file cache: caching to disk is a common source of
+                // IllegalStateException here, and a signed URL is short-lived
+                // enough that a cached copy is worth little anyway.
+                // Already in hand, so nothing is fetched again here.
+                source={{ uri: ledgerDoc.data }}
+                style={styles.ledgerPdf}
+                trustAllCerts={false}
+                onError={(error) => {
+                  const detail = String(error?.message || error || 'unknown');
+                  // The host and file type matter for working out why, and are
+                  // safe to show — the signed token itself is not included.
+                  const host = (ledgerDoc.url.match(/^https?:\/\/([^/]+)/) || [])[1] || 'unknown host';
+                  console.log('[Ledger] PDF failed', { host, url: ledgerDoc.url.slice(0, 160), detail });
+                  setLedgerDoc(null);
+                  Alert.alert(
+                    'Statement could not be opened',
+                    `Tried to draw a PDF from ${host}.
+
+${detail}
+
+If this keeps happening, share it on WhatsApp instead.`
+                  );
+                }}
+                renderActivityIndicator={() => (
+                  <View style={styles.ledgerViewerLoading}>
+                    <ActivityIndicator color="#00796B" size="large" />
+                    <Text style={styles.ledgerViewerLoadingText}>Opening the statement…</Text>
+                  </View>
+                )}
+              />
+            ) : null}
+
             <TouchableOpacity
-              key={tab}
-              style={[styles.tab, activeTab === tab && styles.tabActive]}
-              onPress={() => setActiveTab(tab)}
+              style={[styles.ledgerViewerShare, !canShareLedger && styles.ledgerShareBtnDisabled]}
+              disabled={sharingLedger || !canShareLedger}
+              onPress={shareLedger}
             >
-              <Text style={[styles.tabText, activeTab === tab && styles.tabTextActive]}>
-                {tab === 'orders' ? `Orders (${recentOrders.length})` :
-                  tab === 'visits' ? `Visits (${recentVisits.length})` :
-                    `Collections (${recentCollections.length})`}
+              <Text style={styles.ledgerViewerShareText}>
+                {sharingLedger ? 'Sending…' : `Share with ${name(party.partyName)} on WhatsApp`}
               </Text>
             </TouchableOpacity>
-          ))}
-        </View>
+          </SafeAreaView>
+        </Modal>
+
+        {/* Whatever a card opened, with a way back to nothing. Nothing shows
+            until a card is tapped. */}
+        {activeTab ? (
+          <View style={styles.openListHead}>
+            <Text style={styles.openListTitle}>
+              {activeTab === 'orders' ? `Bills & orders (${recentOrders.length})`
+                : activeTab === 'visits' ? `Visits (${recentVisits.length})`
+                  : `Collections (${recentCollections.length})`}
+            </Text>
+            <TouchableOpacity onPress={() => setActiveTab(null)}>
+              <Text style={styles.openListClose}>Close ✕</Text>
+            </TouchableOpacity>
+          </View>
+        ) : (
+          <Text style={styles.tapHint}>Tap Total Sale, Visits, Bills or Outstanding above to see the detail.</Text>
+        )}
 
         {/* Tab Content: Orders */}
         {activeTab === 'orders' && (
@@ -580,12 +954,8 @@ export default function PartyProfileScreen({ token, apiUrl, partyId, onBack, onN
                     >
                       <View style={styles.listCardRow}>
                         <Text style={styles.listCardTitle}>#{order.orderNumber}</Text>
-                        <View style={[styles.statusBadge, { backgroundColor: getStatusColor(order.status) + '20' }]}>
-                          <Text style={[styles.statusText, { color: getStatusColor(order.status) }]}>
-                            {(order.status || 'pending').toUpperCase()}
-                          </Text>
-                        </View>
                       </View>
+                      <OrderStageTracker order={order} />
                       <Text style={styles.listCardSub}>
                         {formatDate(order.createdAt)} • {order.items?.length || 0} items
                       </Text>
@@ -611,13 +981,15 @@ export default function PartyProfileScreen({ token, apiUrl, partyId, onBack, onN
                         {(order.items || []).map((subItem, index) => (
                           <View key={index} style={styles.subItemRow}>
                             <View style={{ flex: 1.5 }}>
-                              <Text style={styles.subItemName}>{subItem.productName}</Text>
-                              <Text style={styles.subItemVariant}>{subItem.variantName} • {subItem.packSize}</Text>
+                              <Text style={styles.subItemName}>{name(subItem.productName)}</Text>
+                              <Text style={styles.subItemVariant}>{name(subItem.variantName)} • {subItem.packSize}</Text>
                             </View>
                             <Text style={styles.subItemQty}>Qty: {subItem.quantity}</Text>
                             <Text style={styles.subItemPrice}>₹{subItem.rate?.toFixed(2)}</Text>
                           </View>
                         ))}
+
+                        <OrderPaymentDetails order={order} apiUrl={apiUrl} token={token} />
 
                         {order.status !== 'cancelled' && (
                           <TouchableOpacity
@@ -783,7 +1155,7 @@ export default function PartyProfileScreen({ token, apiUrl, partyId, onBack, onN
             </ScrollView>
             <View style={styles.modalActionsFooter}>
               <TouchableOpacity style={styles.cancelBtn} onPress={() => setIssueModalVisible(false)}>
-                <Text style={styles.cancelBtnText}>Cancel</Text>
+                <Text style={styles.cancelBtnText}>{t('Cancel')}</Text>
               </TouchableOpacity>
               <TouchableOpacity
                 style={[styles.submitReplacementBtn, submittingIssue && styles.disabledSubmitBtn]}
@@ -843,8 +1215,8 @@ export default function PartyProfileScreen({ token, apiUrl, partyId, onBack, onN
                   return (
                     <View key={it.variantId} style={styles.modalItemRow}>
                       <View style={{ flex: 1.5 }}>
-                        <Text style={styles.modalItemName}>{it.productName}</Text>
-                        <Text style={styles.modalItemVariant}>{it.variantName} • {it.packSize}</Text>
+                        <Text style={styles.modalItemName}>{name(it.productName)}</Text>
+                        <Text style={styles.modalItemVariant}>{name(it.variantName)} • {it.packSize}</Text>
                         <Text style={styles.modalItemOriginal}>Original Qty: {it.quantity}</Text>
                       </View>
 
@@ -877,7 +1249,7 @@ export default function PartyProfileScreen({ token, apiUrl, partyId, onBack, onN
                   style={styles.cancelBtn}
                   onPress={() => setReplacementModalVisible(false)}
                 >
-                  <Text style={styles.cancelBtnText}>Cancel</Text>
+                  <Text style={styles.cancelBtnText}>{t('Cancel')}</Text>
                 </TouchableOpacity>
 
                 <TouchableOpacity
@@ -897,160 +1269,158 @@ export default function PartyProfileScreen({ token, apiUrl, partyId, onBack, onN
         </Modal>
       )}
 
-      {/* Bill Allocation Modal */}
-      {allocationModalVisible && (
-        <Modal
-          visible={allocationModalVisible}
-          transparent
-          animationType="slide"
-          onRequestClose={() => setAllocationModalVisible(false)}
-        >
-          <SafeAreaView style={styles.modalOverlay}>
-            <KeyboardAvoidingView
-              behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-              style={styles.allocModalWrapper}
-            >
-              <View style={styles.modalHeader}>
-                <Text style={styles.modalTitleText}>Settle Invoices</Text>
-                <TouchableOpacity
-                  style={styles.closeXBtn}
-                  onPress={() => setAllocationModalVisible(false)}
-                >
-                  <Text style={styles.closeXText}>✕</Text>
-                </TouchableOpacity>
-              </View>
+      {/* The wallet, and the way to place it. One slip, one bill, one amount
+          at a time - a 15,000 bill closes off two 10,000 cheques and carries
+          both as its reference. */}
+      <PartyIssuesSheet
+        visible={issueListVisible}
+        token={token}
+        apiUrl={apiUrl}
+        partyId={partyId}
+        partyName={party.partyName}
+        onClose={() => { setIssueListVisible(false); loadIssueCounts(); }}
+      />
 
-              {loadingFinance ? (
-                <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
-                  <ActivityIndicator size="large" color="#00796B" />
-                  <Text style={{ marginTop: 10, color: '#718096', fontSize: 13 }}>Loading billing records...</Text>
-                </View>
-              ) : (
-                <ScrollView contentContainerStyle={styles.allocFormContent}>
-                  <Text style={styles.modalDescText}>
-                    Select a payment collection with unallocated balance, then enter the amount to apply to each pending invoice.
-                  </Text>
-
-                  {/* Payment selection list */}
-                  <Text style={styles.fieldLabel}>1. Select Payment Receipt</Text>
-                  <View style={styles.allocPaymentSelectBox}>
-                    {financeData && financeData.payments && financeData.payments.filter(
-                      p => (p.unallocatedAmount || 0) > 0 && !['bounced', 'completed'].includes(p.status)
-                    ).length > 0 ? (
-                      financeData.payments
-                        .filter(p => (p.unallocatedAmount || 0) > 0 && !['bounced', 'completed'].includes(p.status))
-                        .map((payment) => (
-                          <TouchableOpacity
-                            key={payment._id}
-                            style={[
-                              styles.paymentOptionCard,
-                              selectedPaymentId === payment._id && styles.activePaymentOptionCard,
-                            ]}
-                            onPress={() => {
-                              setSelectedPaymentId(payment._id);
-                              setAllocationInputs({});
-                            }}
-                          >
-                            <View style={{ flex: 1 }}>
-                              <Text style={styles.paymentOptionText}>
-                                Receipt #{payment.collectionNumber} ({payment.paymentMode.toUpperCase()})
-                              </Text>
-                              <Text style={{ fontSize: 10, color: '#A0AEC0', marginTop: 2 }}>
-                                Date: {formatDate(payment.createdAt)}
-                              </Text>
-                            </View>
-                            <View style={{ alignItems: 'flex-end' }}>
-                              <Text style={styles.paymentOptionAmt}>
-                                Unallocated: {formatCurrency(payment.unallocatedAmount)}
-                              </Text>
-                              <Text style={{ fontSize: 10, color: '#718096' }}>
-                                Total: {formatCurrency(payment.amount)}
-                              </Text>
-                            </View>
-                          </TouchableOpacity>
-                        ))
-                    ) : (
-                      <Text style={{ fontSize: 13, color: '#E53E3E', textAlign: 'center', marginVertical: 10 }}>
-                        No unallocated payments found for this customer.
-                      </Text>
-                    )}
-                  </View>
-
-                  {selectedPaymentId && financeData && (
-                    <View style={{ marginTop: 10 }}>
-                      <Text style={styles.fieldLabel}>2. Allocate to Pending Invoices</Text>
-                      {financeData.invoices && financeData.invoices.filter(i => (i.balanceDue || 0) > 0 && i.status !== 'cancelled').length > 0 ? (
-                        financeData.invoices
-                          .filter(i => (i.balanceDue || 0) > 0 && i.status !== 'cancelled')
-                          .map((invoice) => (
-                            <View key={invoice._id} style={styles.allocInvoiceItem}>
-                              <View style={styles.allocInvoiceHeader}>
-                                <View style={{ flex: 1 }}>
-                                  <Text style={styles.allocInvoiceTitle}>Invoice #{invoice.invoiceNumber}</Text>
-                                  <Text style={styles.allocInvoiceDate}>Date: {formatDate(invoice.invoiceDate)}</Text>
-                                </View>
-                                <View style={{ alignItems: 'flex-end' }}>
-                                  <Text style={styles.allocInvoiceDue}>
-                                    Due: {formatCurrency(invoice.balanceDue)}
-                                  </Text>
-                                  <Text style={{ fontSize: 10, color: '#A0AEC0' }}>
-                                    Total: {formatCurrency(invoice.originalAmount)}
-                                  </Text>
-                                </View>
-                              </View>
-                              <TextInput
-                                style={styles.allocAmountInput}
-                                placeholder="Enter allocation amount (INR)..."
-                                placeholderTextColor="#A0AEC0"
-                                keyboardType="numeric"
-                                value={allocationInputs[invoice._id] || ''}
-                                onChangeText={(val) => setAllocationInputs(prev => ({ ...prev, [invoice._id]: val }))}
-                              />
-                            </View>
-                          ))
-                      ) : (
-                        <Text style={{ fontSize: 13, color: '#38A169', textAlign: 'center', marginVertical: 10 }}>
-                          No unpaid invoices found for this customer.
-                        </Text>
-                      )}
-                    </View>
-                  )}
-                </ScrollView>
-              )}
-
-              {/* Footer Actions */}
-              <View style={styles.modalActionsFooter}>
-                <TouchableOpacity
-                  style={styles.cancelBtn}
-                  onPress={() => setAllocationModalVisible(false)}
-                >
-                  <Text style={styles.cancelBtnText}>Cancel</Text>
-                </TouchableOpacity>
-
-                <TouchableOpacity
-                  style={[
-                    styles.submitReplacementBtn,
-                    (!selectedPaymentId || submittingAllocation) && styles.disabledSubmitBtn,
-                  ]}
-                  disabled={!selectedPaymentId || submittingAllocation}
-                  onPress={handleSubmitAllocation}
-                >
-                  {submittingAllocation ? (
-                    <ActivityIndicator color="#FFFFFF" size="small" />
-                  ) : (
-                    <Text style={styles.submitReplacementBtnText}>Submit Allocation</Text>
-                  )}
-                </TouchableOpacity>
-              </View>
-            </KeyboardAvoidingView>
-          </SafeAreaView>
-        </Modal>
-      )}
+      <WalletAllocationSheet
+        visible={allocationModalVisible}
+        token={token}
+        apiUrl={apiUrl}
+        partyId={partyId}
+        onClose={() => setAllocationModalVisible(false)}
+        onDone={(placed) => {
+          setAllocationModalVisible(false);
+          Alert.alert(
+            'Allocated',
+            `${formatCurrency(placed)} placed against bills. The money leaves the wallet now; each bill clears once an authorised person settles it.`,
+          );
+          loadProfile();
+        }}
+      />
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
+  profileHeadRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+  shopPhotoSmall: { width: 68, height: 68, borderRadius: 10, backgroundColor: '#EDF2F7' },
+  shopPhotoSmallPlaceholder: {
+    width: 68, height: 68, borderRadius: 10, backgroundColor: '#EDF2F7',
+    alignItems: 'center', justifyContent: 'center',
+  },
+  viewMoreBtn: { marginTop: 10, alignSelf: 'flex-start' },
+  viewMoreBtnText: { color: '#00796B', fontWeight: '700', fontSize: 12.5 },
+  profileDetailsBlock: {
+    marginTop: 10, paddingTop: 10,
+    borderTopWidth: 1, borderTopColor: '#EDF2F7', gap: 3,
+  },
+
+  // Two columns of three, so all six numbers are on screen together.
+  statGrid: {
+    flexDirection: 'row', flexWrap: 'wrap',
+    gap: 8, marginHorizontal: 16, marginTop: 12,
+  },
+  gridCard: {
+    flexGrow: 1, flexBasis: '31%', minWidth: 100,
+    paddingVertical: 14, paddingHorizontal: 10,
+    borderRadius: 12, alignItems: 'center',
+    borderWidth: 1, borderColor: 'transparent',
+  },
+  gridCardActive: { borderColor: '#00796B' },
+  // Nothing to allocate: still readable, but plainly not a button.
+  gridCardMuted: { opacity: 0.6 },
+  gridValue: { fontSize: 15, fontWeight: '800' },
+  gridLabel: { fontSize: 10, color: '#4A5568', marginTop: 4, fontWeight: '600', textAlign: 'center' },
+
+  ledgerRequestBtnDisabled: { opacity: 0.45 },
+  ledgerCooldownNote: {
+    marginHorizontal: 16, marginTop: 6,
+    fontSize: 11, color: '#B7791F',
+  },
+  creditReqCard: {
+    marginHorizontal: 16, marginTop: 12, padding: 14,
+    backgroundColor: '#FFFFFF', borderRadius: 12,
+    borderWidth: 1, borderColor: '#E2E8F0',
+  },
+  creditReqHead: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+  creditReqTitle: { fontSize: 14, fontWeight: '800', color: '#1A202C' },
+  creditReqSub: { fontSize: 11.5, color: '#718096', marginTop: 2 },
+  creditReqList: { marginTop: 12, borderTopWidth: 1, borderTopColor: '#EDF2F7' },
+  creditReqRow: {
+    flexDirection: 'row', alignItems: 'flex-start', gap: 10,
+    paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#F1F5F9',
+  },
+  creditReqAmount: { fontSize: 12.5, fontWeight: '700', color: '#1A202C' },
+  creditReqReason: { fontSize: 11.5, color: '#4A5568', marginTop: 2 },
+  creditReqMeta: { fontSize: 10.5, color: '#A0AEC0', marginTop: 3 },
+  creditReqChip: { paddingVertical: 4, paddingHorizontal: 9, borderRadius: 999, backgroundColor: '#EDF2F7' },
+  creditReqChipText: { fontSize: 9.5, fontWeight: '800', color: '#718096' },
+
+  ledgerShareBtnDisabled: { opacity: 0.5 },
+  ledgerShareBtn: {
+    paddingVertical: 8, paddingHorizontal: 12,
+    borderRadius: 8, backgroundColor: '#25D366', alignItems: 'center',
+  },
+  ledgerShareBtnText: { color: '#FFFFFF', fontWeight: '800', fontSize: 11.5 },
+
+  ledgerViewerRoot: { flex: 1, backgroundColor: '#1A202C' },
+  ledgerViewerBar: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    paddingHorizontal: 16, paddingVertical: 12, backgroundColor: '#2D3748',
+  },
+  ledgerViewerTitle: { flex: 1, color: '#FFFFFF', fontWeight: '700', fontSize: 14 },
+  ledgerViewerClose: { color: '#CBD5E0', fontWeight: '700', fontSize: 13, paddingLeft: 12 },
+  ledgerImageWrap: { flexGrow: 1, alignItems: 'center', justifyContent: 'center', padding: 8 },
+  ledgerImage: { width: '100%', height: 560 },
+  ledgerPdf: { flex: 1, backgroundColor: '#1A202C' },
+  ledgerViewerLoading: {
+    position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
+    alignItems: 'center', justifyContent: 'center', gap: 10, backgroundColor: '#FFFFFF',
+  },
+  ledgerViewerLoadingText: { color: '#4A5568', fontSize: 13 },
+  ledgerViewerShare: {
+    margin: 14, paddingVertical: 15, borderRadius: 10,
+    backgroundColor: '#25D366', alignItems: 'center',
+  },
+  ledgerViewerShareText: { color: '#FFFFFF', fontWeight: '800', fontSize: 14 },
+
+  ledgerToggle: {
+    marginHorizontal: 16, marginTop: 10,
+    paddingVertical: 12, borderRadius: 10,
+    backgroundColor: '#EDF6F5', alignItems: 'center',
+  },
+  ledgerToggleText: { color: '#00695C', fontWeight: '800', fontSize: 13 },
+  ledgerPanel: {
+    marginHorizontal: 16, marginTop: 8, padding: 12,
+    backgroundColor: '#FFFFFF', borderRadius: 12,
+    borderWidth: 1, borderColor: '#E2E8F0',
+  },
+  ledgerPanelCentre: { alignItems: 'center', gap: 8, paddingVertical: 12 },
+  ledgerPanelMuted: { color: '#718096', fontSize: 12, textAlign: 'center', paddingVertical: 8 },
+  ledgerPanelError: { color: '#C53030', fontSize: 12, paddingVertical: 8 },
+  ledgerHeadRow: {
+    flexDirection: 'row', paddingBottom: 8,
+    borderBottomWidth: 1, borderBottomColor: '#E2E8F0',
+  },
+  ledgerRow: {
+    flexDirection: 'row', paddingVertical: 9,
+    borderBottomWidth: 1, borderBottomColor: '#F1F5F9',
+  },
+  ledgerCell: { flex: 1, fontSize: 10.5, color: '#2D3748' },
+  ledgerHeadCell: { fontWeight: '800', color: '#4A5568', fontSize: 10 },
+  ledgerNum: { textAlign: 'right' },
+  ledgerBalance: { fontWeight: '800', color: '#1A202C' },
+
+  openListHead: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    marginHorizontal: 16, marginTop: 18, marginBottom: 4,
+  },
+  openListTitle: { fontSize: 14, fontWeight: '800', color: '#1A202C' },
+  openListClose: { fontSize: 12, color: '#718096', fontWeight: '700' },
+  tapHint: {
+    marginHorizontal: 16, marginTop: 18,
+    fontSize: 11.5, color: '#A0AEC0', textAlign: 'center',
+  },
+
   safeArea: {
     flex: 1,
     backgroundColor: '#F7F9FC',
@@ -1140,15 +1510,6 @@ const styles = StyleSheet.create({
     marginBottom: verticalScale(14),
     backgroundColor: '#EDF2F7',
   },
-  shopPhotoPlaceholder: {
-    width: '100%',
-    height: verticalScale(120),
-    borderRadius: 12,
-    backgroundColor: '#EDF2F7',
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginBottom: verticalScale(14),
-  },
   shopPhotoPlaceholderText: {
     color: '#A0AEC0',
     fontSize: responsiveFontSize(14),
@@ -1173,57 +1534,7 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
   // Stats
-  statsRow: {
-    flexDirection: 'row',
-    gap: verticalScale(12),
-    marginBottom: verticalScale(12),
-  },
-  statCard: {
-    flex: 1,
-    borderRadius: 12,
-    padding: scale(16),
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: '#E2E8F0',
-  },
-  statValue: {
-    fontSize: responsiveFontSize(18),
-    fontWeight: '800',
-  },
-  statLabel: {
-    fontSize: responsiveFontSize(11),
-    fontWeight: '700',
-    color: '#718096',
-    textTransform: 'uppercase',
-    marginTop: verticalScale(4),
-    letterSpacing: 0.5,
-  },
   // Tabs
-  tabRow: {
-    flexDirection: 'row',
-    backgroundColor: '#FFFFFF',
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: '#E2E8F0',
-    marginBottom: verticalScale(12),
-    overflow: 'hidden',
-  },
-  tab: {
-    flex: 1,
-    paddingVertical: verticalScale(12),
-    alignItems: 'center',
-  },
-  tabActive: {
-    backgroundColor: '#00796B',
-  },
-  tabText: {
-    fontSize: responsiveFontSize(12),
-    fontWeight: '700',
-    color: '#718096',
-  },
-  tabTextActive: {
-    color: '#FFFFFF',
-  },
   // List section
   listSection: {
     gap: verticalScale(10),
@@ -1573,6 +1884,9 @@ const styles = StyleSheet.create({
   modalActionsFooter: {
     flexDirection: 'row',
     padding: scale(16),
+    // Pinned to the bottom of a full-screen modal, so it clears the system
+    // navigation bar rather than sitting under it.
+    paddingBottom: scale(16) + bottomBarPadding(),
     borderTopWidth: 1,
     borderTopColor: '#E2E8F0',
     backgroundColor: '#FFFFFF',
@@ -1637,38 +1951,18 @@ const styles = StyleSheet.create({
   },
 
   // Allocation Styles
-  allocationCard: {
-    flexDirection: 'row',
-    backgroundColor: '#FFFFFF',
-    borderWidth: 1,
-    borderColor: '#E2E8F0',
-    borderRadius: 14,
-    padding: scale(16),
-    alignItems: 'center',
-    marginBottom: verticalScale(16),
+  ledgerCard: {
+    flexDirection: 'row', alignItems: 'center', gap: scale(12),
+    backgroundColor: '#fff', borderRadius: scale(12), padding: scale(14),
+    marginHorizontal: scale(16), marginBottom: verticalScale(12),
+    borderWidth: 1, borderColor: '#E2E8F0',
   },
-  allocationCardTitle: {
-    fontSize: responsiveFontSize(13.5),
-    fontWeight: '800',
-    color: '#2D3748',
-  },
-  allocationCardDesc: {
-    fontSize: responsiveFontSize(11),
-    color: '#718096',
-    marginTop: verticalScale(4),
-    paddingRight: scale(10),
-  },
-  allocationActionBtn: {
-    backgroundColor: '#00796B',
-    paddingHorizontal: scale(16),
-    paddingVertical: verticalScale(8),
-    borderRadius: 8,
-  },
-  allocationActionBtnText: {
-    color: '#FFFFFF',
-    fontWeight: '800',
-    fontSize: responsiveFontSize(12),
-  },
+  ledgerTitle: { fontSize: responsiveFontSize(13.5), fontWeight: '700', color: '#1A202C' },
+  ledgerStatus: { fontSize: responsiveFontSize(11.5), color: '#718096', marginTop: 3 },
+  ledgerViewBtn: { backgroundColor: '#3182CE', borderRadius: scale(8), paddingVertical: verticalScale(7), paddingHorizontal: scale(12) },
+  ledgerViewBtnText: { color: '#fff', fontSize: responsiveFontSize(11.5), fontWeight: '700', textAlign: 'center' },
+  ledgerRequestBtn: { borderWidth: 1, borderColor: '#CBD5E0', borderRadius: scale(8), paddingVertical: verticalScale(7), paddingHorizontal: scale(12) },
+  ledgerRequestBtnText: { color: '#2D3748', fontSize: responsiveFontSize(11.5), fontWeight: '700', textAlign: 'center' },
   allocModalWrapper: {
     backgroundColor: '#FFFFFF',
     borderTopLeftRadius: 20,
@@ -1748,6 +2042,9 @@ const styles = StyleSheet.create({
     color: '#E53E3E',
     fontWeight: '700',
   },
+  allocNotBilled: {
+    fontSize: 10.5, color: '#B7791F', marginTop: 6, lineHeight: 14,
+  },
   allocAmountInput: {
     height: verticalScale(38),
     backgroundColor: '#F7F9FC',
@@ -1760,40 +2057,4 @@ const styles = StyleSheet.create({
   },
 
   // Wallet details card styles
-  walletDetailsCard: {
-    backgroundColor: '#FFFFFF',
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: '#E2E8F0',
-    padding: scale(16),
-    marginBottom: verticalScale(16),
-  },
-  walletDetailsTitle: {
-    fontSize: responsiveFontSize(12),
-    fontWeight: '805',
-    color: '#2D3748',
-    textTransform: 'uppercase',
-    letterSpacing: 0.5,
-    marginBottom: verticalScale(12),
-  },
-  walletDetailsRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingVertical: verticalScale(4),
-  },
-  walletDetailsLabel: {
-    fontSize: responsiveFontSize(12),
-    color: '#718096',
-    fontWeight: '650',
-  },
-  walletDetailsVal: {
-    fontSize: responsiveFontSize(13.5),
-    fontWeight: '800',
-  },
-  walletDetailsDivider: {
-    height: 1,
-    backgroundColor: '#F7F9FC',
-    marginVertical: verticalScale(8),
-  },
 });

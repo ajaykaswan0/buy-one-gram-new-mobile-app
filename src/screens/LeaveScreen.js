@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback} from 'react';
 import {
   StyleSheet,
   Text,
@@ -9,6 +9,7 @@ import {
   SafeAreaView,
   ScrollView,
   Modal,
+  RefreshControl,
 } from 'react-native';
 import { scale, verticalScale, responsiveFontSize, maxContainerWidth } from '../utils/responsive';
 
@@ -59,6 +60,20 @@ export default function LeaveScreen({ token, apiUrl, onBack }) {
       }
     }
   }, [fromDate, toDate]);
+
+  // Pull down to reload, so the screen can be refreshed in place rather than
+  // by navigating away and back.
+  const [refreshing, setRefreshing] = useState(false);
+  const onPullRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await loadLeaves();
+    } catch (e) {
+      console.log('[Refresh] failed:', e.message);
+    } finally {
+      setRefreshing(false);
+    }
+  }, [loadLeaves]);
 
   const loadLeaves = async () => {
     setLoading(true);
@@ -243,7 +258,11 @@ export default function LeaveScreen({ token, apiUrl, onBack }) {
         <Text style={styles.headerTitle}>Leave Portal</Text>
       </View>
 
-      <ScrollView contentContainerStyle={styles.container}>
+      <ScrollView contentContainerStyle={styles.container}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onPullRefresh} colors={['#00796B']} tintColor="#00796B" />
+        }
+      >
         {/* Leave application form */}
         <View style={styles.formCard}>
           <Text style={styles.cardTitle}>Request Leave</Text>

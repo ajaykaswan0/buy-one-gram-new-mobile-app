@@ -35,7 +35,6 @@ export default function StoreManagerDashboardScreen({
   const [reconcileOrders, setReconcileOrders] = useState([]);
   const [packedOrders, setPackedOrders] = useState([]);
   const [dispatchedOrders, setDispatchedOrders] = useState([]);
-  const [partialReturnOrders, setPartialReturnOrders] = useState([]);
   const [drivers, setDrivers] = useState([]);
 
   // Packing Modal state
@@ -55,9 +54,6 @@ export default function StoreManagerDashboardScreen({
   const [dispatchOrder, setDispatchOrder] = useState(null);
   const [selectedDriverId, setSelectedDriverId] = useState('');
   const [submittingDispatch, setSubmittingDispatch] = useState(false);
-  const [partialReturnModalVisible, setPartialReturnModalVisible] = useState(false);
-  const [partialReturnOrder, setPartialReturnOrder] = useState(null);
-  const [partialDeliveredQty, setPartialDeliveredQty] = useState({});
 
   const fetchDashboardData = useCallback(async () => {
     try {
@@ -72,13 +68,11 @@ export default function StoreManagerDashboardScreen({
       const reconcile = allOrders.filter((o) => o.status === 'confirmed' && o.packingStatus === 'reconciliation_requested');
       const packed = allOrders.filter((o) => o.status === 'ready_for_delivery');
       const dispatched = allOrders.filter((o) => o.status === 'dispatched');
-      const partialReturns = allOrders.filter((o) => o.status === 'partial_delivery_return_pending');
 
       setConfirmedOrders(confirmed);
       setReconcileOrders(reconcile);
       setPackedOrders(packed);
       setDispatchedOrders(dispatched);
-      setPartialReturnOrders(partialReturns);
 
       // 2. Fetch Drivers list
       const driverRes = await fetch(`${apiUrl}/users?role=driver&limit=100`, {
@@ -113,30 +107,6 @@ export default function StoreManagerDashboardScreen({
   };
   const totalWeight = (order) => (order?.items || []).reduce((sum, item) => sum + unitWeight(item) * Number(item.quantity || 0), 0);
 
-  const openPartialReturn = (order) => {
-    setPartialReturnOrder(order);
-    setPartialDeliveredQty(Object.fromEntries((order.partialDeliveryItems || []).map((item) => [String(item.variantId?._id || item.variantId), String(item.deliveredQuantity || 0)])));
-    setPartialReturnModalVisible(true);
-  };
-
-  const confirmPartialReturn = async (order) => {
-    try {
-      const response = await fetch(`${apiUrl}/order/${order._id}/partial-delivery/confirm-return`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ items: (order.partialDeliveryItems || []).map((item) => ({ variantId: item.variantId?._id || item.variantId, deliveredQuantity: Number(partialDeliveredQty[String(item.variantId?._id || item.variantId)] || 0) })) }),
-      });
-      const data = await response.json();
-      if (!response.ok || !data.success) throw new Error(data.message || 'Could not confirm returned stock');
-      Alert.alert('Confirmed', 'Returned stock was added to inventory and the credit note was created.');
-      setPartialReturnModalVisible(false);
-      fetchDashboardData();
-    } catch (error) {
-      Alert.alert('Failed', error.message);
-    }
-  };
-
-  // Open Packing Checklist Modal
   const handleOpenPackingModal = (order) => {
     setSelectedOrder(order);
     const initialDetails = {};
@@ -412,10 +382,6 @@ export default function StoreManagerDashboardScreen({
             <Text style={[styles.metricVal, { color: '#3182CE' }]}>{dispatchedOrders.length}</Text>
             <Text style={styles.metricLabel}>✅ Dispatched Today</Text>
           </View>
-          <TouchableOpacity style={[styles.metricCard, activeTab === 'partial_returns' && styles.metricCardActive]} onPress={() => setActiveTab('partial_returns')}>
-            <Text style={[styles.metricVal, { color: '#D69E2E' }]}>{partialReturnOrders.length}</Text>
-            <Text style={styles.metricLabel}>Partial Returns</Text>
-          </TouchableOpacity>
         </View>
 
         {/* Tab Selection */}
@@ -446,21 +412,7 @@ export default function StoreManagerDashboardScreen({
               🚚 Load & Dispatch ({packedOrders.length})
             </Text>
           </TouchableOpacity>
-          <TouchableOpacity style={[styles.tabBtn, activeTab === 'partial_returns' && styles.tabBtnActive]} onPress={() => setActiveTab('partial_returns')}>
-            <Text style={[styles.tabText, activeTab === 'partial_returns' && styles.tabTextActive]}>Returns ({partialReturnOrders.length})</Text>
-          </TouchableOpacity>
         </View>
-
-        {activeTab === 'partial_returns' && <View>
-          <Text style={styles.sectionHeader}>Partial deliveries awaiting warehouse confirmation</Text>
-          {partialReturnOrders.length === 0 ? <View style={styles.emptyCard}><Text style={styles.emptyTitle}>No returned orders pending</Text></View> : partialReturnOrders.map((order) => <View key={order._id} style={styles.orderCard}>
-            <Text style={styles.orderNum}>Order #{order.orderNumber}</Text>
-            <Text style={styles.partyName}>{order.partyId?.partyName || 'Customer Party'}</Text>
-            <Text style={styles.orderMeta}>Total load weight: {totalWeight(order).toFixed(2)} kg</Text>
-            <View style={styles.itemsPreviewBox}>{(order.partialDeliveryItems || []).map((item, index) => <Text key={item._id || index} style={styles.itemPreviewRow}>{item.productName} {item.variantName}: sent {item.expectedQuantity}, delivered {item.deliveredQuantity}, returned {item.returnedQuantity} ({(Number(item.unitWeight || 0) * Number(item.returnedQuantity || 0)).toFixed(2)} kg)</Text>)}</View>
-            <TouchableOpacity style={styles.startPackBtn} onPress={() => openPartialReturn(order)}><Text style={styles.startPackBtnText}>Inspect Return & Create Credit Note</Text></TouchableOpacity>
-          </View>)}
-        </View>}
 
         {/* QUEUE 1: TO PACK */}
         {activeTab === 'to_pack' && (
@@ -613,19 +565,6 @@ export default function StoreManagerDashboardScreen({
           </View>
         )}
       </ScrollView>
-
-      <Modal visible={partialReturnModalVisible} transparent animationType="fade" onRequestClose={() => setPartialReturnModalVisible(false)}>
-        <View style={styles.modalOverlay}><View style={styles.modalContent}>
-          <Text style={styles.modalTitle}>Warehouse return inspection</Text>
-          <Text style={styles.modalSubTitle}>Use the driver bill photo and physical stock to enter actual delivered quantities.</Text>
-          <ScrollView style={{ maxHeight: 360 }}>{(partialReturnOrder?.partialDeliveryItems || []).map((item) => {
-            const key = String(item.variantId?._id || item.variantId);
-            const delivered = Number(partialDeliveredQty[key] || 0);
-            return <View key={key} style={{ marginTop: 12 }}><Text style={styles.inputLabel}>{item.productName} {item.variantName} — sent {item.expectedQuantity}</Text><TextInput style={styles.textInput} keyboardType="decimal-pad" value={partialDeliveredQty[key]} onChangeText={(value) => setPartialDeliveredQty((current) => ({ ...current, [key]: value }))} /><Text style={styles.orderMeta}>Returned: {Math.max(0, Number(item.expectedQuantity) - delivered)}</Text></View>;
-          })}</ScrollView>
-          <View style={styles.modalFooterActions}><TouchableOpacity style={styles.modalCancelBtn} onPress={() => setPartialReturnModalVisible(false)}><Text style={styles.modalCancelBtnText}>Close</Text></TouchableOpacity><TouchableOpacity style={styles.startPackBtn} onPress={() => confirmPartialReturn(partialReturnOrder)}><Text style={styles.startPackBtnText}>Confirm Stock & Credit Note</Text></TouchableOpacity></View>
-        </View></View>
-      </Modal>
 
       {/* ITEM PACKING CHECKLIST MODAL */}
       <Modal

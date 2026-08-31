@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { useLanguage } from '../i18n';
 import {
   StyleSheet,
   Text,
@@ -13,6 +14,7 @@ import {
 import { scale, verticalScale, responsiveFontSize, maxContainerWidth } from '../utils/responsive';
 
 export default function VisitHistoryScreen({ token, apiUrl, user }) {
+  const { t, term } = useLanguage();
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [visits, setVisits] = useState([]);
@@ -240,7 +242,7 @@ export default function VisitHistoryScreen({ token, apiUrl, user }) {
                         <Text style={styles.shopNameText}>{shopName}</Text>
                         <View style={[styles.statusBadge, { backgroundColor: getStatusColor(visit.status) + '15' }]}>
                           <Text style={[styles.statusText, { color: getStatusColor(visit.status) }]}>
-                            {visit.status?.toUpperCase() || 'UNKNOWN'}
+                            {term(visit.status) || 'UNKNOWN'}
                           </Text>
                         </View>
                       </View>

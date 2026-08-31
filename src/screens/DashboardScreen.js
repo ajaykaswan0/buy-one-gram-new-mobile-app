@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import { useLanguage } from '../i18n';
 import {
   StyleSheet,
   Text,
@@ -25,12 +26,13 @@ export default function DashboardScreen({
   onNavigateToProducts,
   onNavigateToOrderList,
   onNavigateToOutstandingList,
-  onNavigateToRoutePlanner,
+  onNavigateToDeliveryRoute,
   onNavigateToBeatPlan,
   user,
   isCso = false,
   onNavigateToTeam,
 }) {
+  const { t } = useLanguage();
   const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -88,6 +90,7 @@ export default function DashboardScreen({
   const [totalOutstanding, setTotalOutstanding] = useState(0);
   const [outstandingLimit, setOutstandingLimit] = useState(0);
   const [teamSummary, setTeamSummary] = useState({ members: 0, orders: 0, sales: 0, outstanding: 0 });
+  const [myPartyCount, setMyPartyCount] = useState(0);
 
   const fetchDashboardStats = async () => {
     if (!token) return;
@@ -123,7 +126,12 @@ export default function DashboardScreen({
       const start = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 0, 0, 0, 0).toISOString();
       const end = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 23, 59, 59, 999).toISOString();
 
-      const ordersPromise = fetch(`${apiUrl}/order/my?startDate=${start}&endDate=${end}&limit=100`, {
+      // scope=own keeps a manager's own numbers separate from their team's.
+      // Without it a CSO's "Today's Orders" was every order in the company,
+      // and the outstanding below it was the whole team's book.
+      const ownScope = isCso ? '&scope=own' : '';
+
+      const ordersPromise = fetch(`${apiUrl}/order/my?startDate=${start}&endDate=${end}&limit=100${ownScope}`, {
         headers: { Authorization: `Bearer ${token}` },
       }).then(async (res) => {
         const data = await res.json();
@@ -182,15 +190,17 @@ export default function DashboardScreen({
         setOutstandingLimit(Number(user?.outstandingLimit || 0));
       });
 
-      const partiesPromise = fetch(`${apiUrl}/parties/my`, {
+      const partiesPromise = fetch(`${apiUrl}/parties/my${isCso ? '?scope=own' : ''}`, {
         headers: { Authorization: `Bearer ${token}` },
       }).then(async (res) => {
         const data = await res.json();
         if (res.ok && data.success && Array.isArray(data.data)) {
           const totalOut = data.data.reduce((sum, p) => sum + (p.currentOutstanding || 0), 0);
           setTotalOutstanding(totalOut);
+          setMyPartyCount(data.data.length);
         } else {
           setTotalOutstanding(0);
+          setMyPartyCount(0);
         }
       }).catch((err) => {
         console.log('[Dashboard Stats] Parties outstanding fetch failed:', err.message);
@@ -355,7 +365,9 @@ export default function DashboardScreen({
               {/* Total Outstanding Section */}
               <View style={styles.outstandingSection}>
                 <View style={styles.outstandingHeaderRow}>
-                  <Text style={styles.outstandingTitle}>Total Outstanding (Assigned Parties)</Text>
+                  <Text style={styles.outstandingTitle}>
+                    {isCso ? 'My Outstanding (My Parties)' : 'Total Outstanding (Assigned Parties)'}
+                  </Text>
                   <TouchableOpacity
                     style={styles.eyeBtn}
                     onPress={onNavigateToOutstandingList}
@@ -367,6 +379,13 @@ export default function DashboardScreen({
                 <Text style={styles.outstandingValueText}>
                   ₹{totalOutstanding.toLocaleString('en-IN')}
                 </Text>
+                {isCso && (
+                  <Text style={styles.outstandingNote}>
+                    {myPartyCount > 0
+                      ? `Across ${myPartyCount} ${myPartyCount === 1 ? 'party' : 'parties'} assigned to you. Your team's book is in Team Performance below.`
+                      : "No parties are assigned to you directly — your team's book is in Team Performance below."}
+                  </Text>
+                )}
               </View>
 
               <View style={styles.cardDivider} />
@@ -374,14 +393,14 @@ export default function DashboardScreen({
               {/* Today's Daily Stats Grid */}
               <View style={styles.statsGrid}>
                 <View style={styles.gridCell}>
-                  <Text style={styles.cellLabel}>Today's Orders</Text>
+                  <Text style={styles.cellLabel}>{isCso ? "My Orders Today" : "Today's Orders"}</Text>
                   <Text style={styles.cellValue}>{todayOrderCount}</Text>
                 </View>
                 
                 <View style={styles.gridCellDivider} />
 
                 <View style={styles.gridCell}>
-                  <Text style={styles.cellLabel}>Today's Value</Text>
+                  <Text style={styles.cellLabel}>{isCso ? 'My Sale Today' : "Today's Value"}</Text>
                   <Text style={[styles.cellValue, { color: '#00796B' }]}>
                     ₹{todayOrderValue.toLocaleString('en-IN')}
                   </Text>
@@ -390,7 +409,7 @@ export default function DashboardScreen({
                 <View style={styles.gridCellDivider} />
 
                 <View style={styles.gridCell}>
-                  <Text style={styles.cellLabel}>Today's Visits</Text>
+                  <Text style={styles.cellLabel}>{isCso ? 'My Visits Today' : "Today's Visits"}</Text>
                   <Text style={styles.cellValue}>{todayVisitCount}</Text>
                 </View>
               </View>
@@ -411,7 +430,7 @@ export default function DashboardScreen({
 
         {/* Quick Actions Container Card */}
         <View style={styles.actionsCard}>
-          <Text style={styles.actionsCardTitle}>Quick Actions</Text>
+          <Text style={styles.actionsCardTitle}>{t('Quick Actions')}</Text>
           <View style={styles.actionsRow}>
             {/* Attendance Action Item */}
             <View style={styles.actionItem}>
@@ -421,7 +440,7 @@ export default function DashboardScreen({
               >
                 <Text style={styles.solidIconText}>☝</Text>
               </TouchableOpacity>
-              <Text style={styles.actionLabel}>Attendance</Text>
+              <Text style={styles.actionLabel}>{t('Attendance')}</Text>
             </View>
 
             {/* Apply Leave Action Item */}
@@ -432,7 +451,7 @@ export default function DashboardScreen({
               >
                 <Text style={styles.outlineIconText}>📄</Text>
               </TouchableOpacity>
-              <Text style={styles.actionLabel}>Apply Leave</Text>
+              <Text style={styles.actionLabel}>{t('Apply Leave')}</Text>
             </View>
 
             {/* Party Action Item */}
@@ -454,7 +473,7 @@ export default function DashboardScreen({
               >
                 <Text style={styles.outlineIconText}>📋</Text>
               </TouchableOpacity>
-              <Text style={styles.actionLabel}>Price List</Text>
+              <Text style={styles.actionLabel}>{t('Price List')}</Text>
             </View>
 
             {isCso ? <View style={styles.actionItem}>
@@ -463,10 +482,12 @@ export default function DashboardScreen({
               </TouchableOpacity>
               <Text style={styles.actionLabel}>My Beat Plan</Text>
             </View> : <View style={styles.actionItem}>
-              <TouchableOpacity style={[styles.circleBtn, styles.outlineBtn]} onPress={onNavigateToRoutePlanner}>
-                <Text style={styles.outlineIconText}>⌖</Text>
+              {/* The route the office drew, rather than one built on the
+                  phone — a salesman follows a plan, he does not make it. */}
+              <TouchableOpacity style={[styles.circleBtn, styles.outlineBtn]} onPress={onNavigateToDeliveryRoute}>
+                <Text style={styles.outlineIconText}>🗺️</Text>
               </TouchableOpacity>
-              <Text style={styles.actionLabel}>Plan Route</Text>
+              <Text style={styles.actionLabel}>{t('Delivery Route')}</Text>
             </View>}
 
             {/* Order Action Item */}
@@ -488,7 +509,7 @@ export default function DashboardScreen({
               >
                 <Text style={styles.outlineIconText}>📋</Text>
               </TouchableOpacity>
-              <Text style={styles.actionLabel}>My Orders</Text>
+              <Text style={styles.actionLabel}>{t('My Orders')}</Text>
             </View>
           </View>
         </View>
@@ -508,6 +529,12 @@ const styles = StyleSheet.create({
   },
 
   // Spotlight card
+  outstandingNote: {
+    marginTop: 6,
+    fontSize: 11,
+    color: '#718096',
+    lineHeight: 15,
+  },
   spotlightCard: {
     backgroundColor: '#FFFFFF',
     borderRadius: 16,

@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import { useLanguage } from '../i18n';
+import { readJson } from '../services/apiResponse';
 import {
   StyleSheet,
   Text,
@@ -16,8 +18,10 @@ import {
   Platform,
 } from 'react-native';
 import { scale, verticalScale, responsiveFontSize, maxContainerWidth } from '../utils/responsive';
+import { packLabel, perKgLabel } from '../utils/packLabel';
 
 export default function ProductScreen({ token, apiUrl, user, onBack }) {
+  const { t } = useLanguage();
   const [products, setProducts] = useState([]);
   const [priceList, setPriceList] = useState(null);
   const [inventoryRows, setInventoryRows] = useState([]);
@@ -26,7 +30,9 @@ export default function ProductScreen({ token, apiUrl, user, onBack }) {
   const [searchQuery, setSearchQuery] = useState('');
   
   // Filtering & GST states
-  const [withGst, setWithGst] = useState(false);
+  // On by default: the price a shopkeeper is quoted is the one he pays, so
+  // showing the pre-tax rate first invites an argument at the counter.
+  const [withGst, setWithGst] = useState(true);
   const [selectedPackSize, setSelectedPackSize] = useState('All');
 
   // Parties sharing states
@@ -35,6 +41,9 @@ export default function ProductScreen({ token, apiUrl, user, onBack }) {
   const [shareModalVisible, setShareModalVisible] = useState(false);
   const [selectedPartyId, setSelectedPartyId] = useState('other'); // partyId or 'other'
   const [customPhone, setCustomPhone] = useState('');
+  // Only used for a number that is not a party: the approved template has a
+  // name blank in it, and Meta rejects a send where a blank comes out empty.
+  const [customName, setCustomName] = useState('');
   const [partySearchQuery, setPartySearchQuery] = useState('');
   const [sendingShare, setSendingShare] = useState(false);
 
@@ -165,14 +174,21 @@ export default function ProductScreen({ token, apiUrl, user, onBack }) {
   const items = getRateListItems();
 
   // Extract dynamic pack size filter list
-  const packSizes = ['All', ...new Set(items.map((it) => it.packSize))];
+  /**
+   * The tabs carry their unit.
+   *
+   * They were built from `packSize` alone, so the row of filters read
+   * "All 500 1 5 10 30 800" — numbers with nothing to say whether they meant
+   * grams or kilos.
+   */
+  const packSizes = ['All', ...new Set(items.map((it) => packLabel(it.packSize, it.unit, it.variantName)))];
 
   // Filter displayed items
   const displayedItems = items.filter((item) => {
     const matchesSearch =
       item.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
       item.variantName.toLowerCase().includes(searchQuery.toLowerCase());
-    const matchesPack = selectedPackSize === 'All' || item.packSize === selectedPackSize;
+    const matchesPack = selectedPackSize === 'All' || packLabel(item.packSize, item.unit, item.variantName) === selectedPackSize;
     return matchesSearch && matchesPack;
   });
 
@@ -180,65 +196,65 @@ export default function ProductScreen({ token, apiUrl, user, onBack }) {
     setShareModalVisible(true);
     setSelectedPartyId('other');
     setCustomPhone('');
+    setCustomName('');
     setPartySearchQuery('');
   };
 
   const handleSendWhatsapp = async () => {
-    let targetPhone = customPhone.trim();
-    let selectedParty = null;
+    const toOther = !selectedPartyId || selectedPartyId === 'other';
+    const selectedParty = toOther ? null : parties.find(p => p._id === selectedPartyId);
 
-    if (selectedPartyId !== 'other') {
-      selectedParty = parties.find(p => p._id === selectedPartyId);
-      if (selectedParty) {
-        // Fallback to party whatsapp or mobile if target input was left empty
-        targetPhone = targetPhone || selectedParty.whatsapp || selectedParty.mobile || '';
-      }
+    // A party keeps its own saved number unless one was typed over it.
+    const targetPhone = (customPhone.trim()
+      || selectedParty?.whatsapp || selectedParty?.mobile || '').trim();
+
+    if (toOther && !targetPhone) {
+      Alert.alert('Number needed', 'Type the WhatsApp number to send the rate list to.');
+      return;
     }
-
     if (!targetPhone) {
-      Alert.alert('Required', 'Please enter a valid phone number.');
+      Alert.alert('No number', `${selectedParty?.partyName || 'This party'} has no WhatsApp or mobile number saved. Type one below.`);
       return;
     }
 
     setSendingShare(true);
     try {
-      const modeText = withGst ? 'WITH GST' : 'WITHOUT GST';
-      const text = displayedItems
-        .map(
-          (item, idx) =>
-            `${idx + 1}. ${item.name} (${item.packSize}) - Rate: ₹${item.rate.toFixed(
-              1
-            )} | MRP: ₹${item.mrp.toFixed(0)} | Diff: ${
-              item.diff > 0 ? '+' : ''
-            }${item.diff.toFixed(1)} | Margin: ${item.margin}%`
-        )
-        .join('\n');
+      /**
+       * Sends whatever Settings says the rate list is.
+       *
+       * The file and the approved template both come from Settings, which is
+       * why nothing about the message is decided here — only who it goes to.
+       *
+       * A shop that is not a party yet gets it on the typed number. Refusing
+       * until somebody creates the party just means the rate list never gets
+       * sent, which is the opposite of the point.
+       */
+      const url = toOther
+        ? `${apiUrl}/parties/share-to-number/rate_list`
+        : `${apiUrl}/parties/${selectedPartyId}/share/rate_list`;
 
-      const response = await fetch(`${apiUrl}/notification/whatsapp/price-list`, {
+      const body = toOther
+        ? JSON.stringify({ phone: targetPhone, name: customName.trim() })
+        : JSON.stringify({ phone: targetPhone });
+
+      const response = await fetch(url, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          partyId: selectedPartyId !== 'other' ? selectedPartyId : null,
-          phone: targetPhone,
-          templateName: 'price_list',
-          messageBody: `Rate List (${modeText}):\n\n${text}`,
-        }),
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body,
       });
 
-      const data = await response.json();
-      if (response.ok && data.success) {
-        Alert.alert('Success', 'WhatsApp price list shared successfully!');
-        setShareModalVisible(false);
-        fetchParties(); // reload updated whatsapp numbers
-      } else {
-        Alert.alert('Failed', data.message || 'Could not send WhatsApp message.');
-      }
+      // readJson throws on a refusal, carrying the server's own wording, so
+      // reaching here means it went out.
+      const data = await readJson(response, 'The server');
+      Alert.alert('Sent', data.message || 'Rate list sent.');
+      setShareModalVisible(false);
+      fetchParties();
     } catch (e) {
       console.warn('Send WhatsApp error:', e.message);
-      Alert.alert('Error', 'Connection error.');
+      // The server says why in terms a salesman can act on — no template
+      // chosen, number not on WhatsApp, no price set yet. Replacing all of
+      // that with "Connection error", as this used to, hides every one.
+      Alert.alert('Not sent', e.message || 'Could not reach the server.');
     } finally {
       setSendingShare(false);
     }
@@ -390,14 +406,22 @@ export default function ProductScreen({ token, apiUrl, user, onBack }) {
                 {/* Product Name */}
                 <View style={{ flex: 3.2 }}>
                   <Text style={styles.productNameText} numberOfLines={1}>{item.name}</Text>
-                  <Text style={styles.productPackSizeText}>{item.packSize} {item.unit}</Text>
+                  <Text style={styles.productPackSizeText}>
+                    {packLabel(item.packSize, item.unit, item.variantName)}
+                    {/* A 30kg rate of 3,150 cannot be compared with a 1kg rate of 114
+                        by eye. Only the big packs carry it; on a 1kg pack it would be
+                        the same number twice. */}
+                    {perKgLabel(item.rate, item.packSize, item.unit, item.variantName)
+                      ? '  ' + perKgLabel(item.rate, item.packSize, item.unit, item.variantName)
+                      : ''}
+                  </Text>
                   <Text style={{
                     color: item.availableStock > 0 ? '#38A169' : '#E53E3E',
                     fontSize: 10,
                     fontWeight: '700',
                     marginTop: 2,
                   }}>
-                    Available {item.availableStock} · Total {item.totalStock} · Reserved {item.reservedStock}
+                    {item.availableStock > 0 ? t('Available') : t('Out of stock')}
                   </Text>
                 </View>
 
@@ -481,6 +505,7 @@ export default function ProductScreen({ token, apiUrl, user, onBack }) {
                     onPress={() => {
                       setSelectedPartyId(party._id);
                       setCustomPhone(party.whatsapp || party.mobile || '');
+                      setCustomName('');
                     }}
                   >
                     <Text style={styles.partyOptionName}>{party.partyName}</Text>
@@ -501,6 +526,22 @@ export default function ProductScreen({ token, apiUrl, user, onBack }) {
                 value={customPhone}
                 onChangeText={setCustomPhone}
               />
+
+              {selectedPartyId === 'other' && (
+                <>
+                  <Text style={styles.phoneInputLabel}>3. Shop Name (optional)</Text>
+                  <TextInput
+                    style={styles.phoneInput}
+                    placeholder="Who is it for? e.g. Sharma Kirana"
+                    placeholderTextColor="#A0AEC0"
+                    value={customName}
+                    onChangeText={setCustomName}
+                  />
+                  <Text style={styles.customHint}>
+                    Goes to this number on the company WhatsApp. The shop does not have to be a party.
+                  </Text>
+                </>
+              )}
 
               {/* Actions Row */}
               <View style={styles.shareModalFooter}>
@@ -862,6 +903,12 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
     marginTop: verticalScale(10),
     marginBottom: verticalScale(6),
+  },
+  customHint: {
+    fontSize: 11,
+    color: '#718096',
+    marginTop: 6,
+    lineHeight: 15,
   },
   phoneInput: {
     height: verticalScale(42),

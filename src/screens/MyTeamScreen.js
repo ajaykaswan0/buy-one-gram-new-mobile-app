@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback} from 'react';
+import { useLanguage } from '../i18n';
 import {
   StyleSheet,
   Text,
@@ -11,8 +12,13 @@ import {
   Alert,
   FlatList,
   Linking,
+  RefreshControl,
 } from 'react-native';
 import { scale, verticalScale, responsiveFontSize, maxContainerWidth } from '../utils/responsive';
+
+/** Today in the phone's own timezone — toISOString() would give the UTC day. */
+const localDateKey = (d = new Date()) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 
 export default function MyTeamScreen({
   token,
@@ -22,9 +28,13 @@ export default function MyTeamScreen({
   onNavigateToOrder,
   onNavigateToParty,
 }) {
+  const { t, term, name } = useLanguage();
   const [loading, setLoading] = useState(true);
   const [teamMembers, setTeamMembers] = useState([]);
   const [error, setError] = useState('');
+  // The formal team behind this roster: its monthly number, what the team has
+  // sold against it, and how close its parties are to the credit ceiling.
+  const [myTeams, setMyTeams] = useState([]);
 
   // Selected subordinate modal details
   const [selectedMember, setSelectedMember] = useState(null);
@@ -35,11 +45,46 @@ export default function MyTeamScreen({
   const [memberParties, setMemberParties] = useState([]);
   const [memberOrders, setMemberOrders] = useState([]);
   const [memberVisits, setMemberVisits] = useState([]);
+  // Which day's visits are on screen. Today by default; the arrows walk back.
+  const [visitDate, setVisitDate] = useState(() => localDateKey());
+  const [visitsLoading, setVisitsLoading] = useState(false);
   const [memberDailyLog, setMemberDailyLog] = useState(null);
+  const [memberLive, setMemberLive] = useState(null);
 
   useEffect(() => {
     fetchMyTeam();
+    fetchTeamNumbers();
   }, [apiUrl, token, user]);
+
+  /**
+   * Reads the team's own figures. Kept separate from the roster fetch so a
+   * manager with no formal team still sees their reporting line exactly as
+   * before, rather than an error where the numbers would be.
+   */
+  // Pull down to reload, so the screen can be refreshed in place rather than
+  // by navigating away and back.
+  const [refreshing, setRefreshing] = useState(false);
+  const onPullRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await Promise.all([fetchMyTeam(), fetchTeamNumbers()]);
+    } catch (e) {
+      console.log('[Refresh] failed:', e.message);
+    } finally {
+      setRefreshing(false);
+    }
+  }, [Promise.all]);
+
+  const fetchTeamNumbers = async () => {
+    try {
+      const res = await fetch(`${apiUrl}/team/my`, { headers: { Authorization: `Bearer ${token}` } });
+      const data = await res.json();
+      setMyTeams(res.ok && Array.isArray(data?.data) ? data.data : []);
+    } catch (e) {
+      console.log('[MyTeamScreen] Could not load team numbers:', e.message);
+      setMyTeams([]);
+    }
+  };
 
   const fetchMyTeam = async () => {
     setLoading(true);
@@ -83,7 +128,7 @@ export default function MyTeamScreen({
 
               // 2. Fetch today visits using existing /visit
               const visitsRes = await fetch(
-                `${apiUrl}/visit/salesman/${sub._id}?date=${startOfToday.toISOString().slice(0,10)}`,
+                `${apiUrl}/visit/salesman/${sub._id}?date=${localDateKey()}`,
                 { headers: { Authorization: `Bearer ${token}` } }
               );
               const visitsData = await visitsRes.json();
@@ -92,12 +137,24 @@ export default function MyTeamScreen({
               const partiesData = await partiesRes.json();
               const ownedParties = (Array.isArray(partiesData.data) ? partiesData.data : []).filter(party => String(party.assignedSalesman?._id || party.assignedSalesman) === String(sub._id));
 
+              // Where they are right now. Fetched with the rest so the roster
+              // can mark who is inside a shop without opening each member.
+              let live = null;
+              try {
+                const liveRes = await fetch(`${apiUrl}/daily-log/live/${sub._id}`, { headers: { Authorization: `Bearer ${token}` } });
+                const liveData = await liveRes.json();
+                if (liveRes.ok && liveData.success) live = liveData.data;
+              } catch (liveErr) {
+                console.log('[MyTeamScreen] live status unavailable:', liveErr.message);
+              }
+
               return {
                 ...sub,
+                live,
                 stats: {
                   todayOrderCount,
                   todayOrderTotal,
-                  todayVisitsCount: visitsList.length,
+                  todayVisitsCount: live?.visitsToday ?? visitsList.length,
                   outstanding: ownedParties.reduce((sum,party)=>sum+Number(party.currentOutstanding||0),0),
                 },
               };
@@ -124,6 +181,40 @@ export default function MyTeamScreen({
     } finally {
       setLoading(false);
     }
+  };
+
+  /**
+   * Re-reads one day's visits without reloading the whole member.
+   *
+   * Only the visit list depends on the date; parties, orders and collections
+   * do not, and refetching all of them to change a day would be slow and would
+   * flicker the tabs the manager is not looking at.
+   */
+  const loadVisitsFor = async (dateKey) => {
+    if (!selectedMember) return;
+    setVisitsLoading(true);
+    setVisitDate(dateKey);
+    try {
+      const response = await fetch(`${apiUrl}/visit/salesman/${selectedMember._id}?date=${dateKey}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const body = await response.json();
+      setMemberVisits(response.ok && Array.isArray(body.data) ? body.data : []);
+    } catch (err) {
+      console.log('[MyTeamScreen] Could not load visits:', err.message);
+      setMemberVisits([]);
+    } finally {
+      setVisitsLoading(false);
+    }
+  };
+
+  /** Steps the visit day by whole days, never past today. */
+  const shiftVisitDate = (days) => {
+    const moved = new Date(`${visitDate}T12:00:00`);
+    moved.setDate(moved.getDate() + days);
+    const key = localDateKey(moved);
+    if (key > localDateKey()) return;      // tomorrow has not happened yet
+    loadVisitsFor(key);
   };
 
   const handleOpenMemberDetails = async (member, initialTab = 'summary') => {
@@ -165,16 +256,25 @@ export default function MyTeamScreen({
         setMemberParties([]);
       }
 
-      const today = new Date();
-      const date = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`;
-      const [orderRes, visitRes, logRes] = await Promise.all([
+      const date = localDateKey();
+      const [orderRes, visitRes, logRes, liveRes] = await Promise.all([
         fetch(`${apiUrl}/order?salesmanId=${member._id}&limit=100`, { headers: { Authorization: `Bearer ${token}` } }),
-        fetch(`${apiUrl}/visit/salesman/${member._id}`, { headers: { Authorization: `Bearer ${token}` } }),
+        // One day at a time. Without the date this returned every visit the
+        // salesman had ever made, under a heading that said "Today".
+        fetch(`${apiUrl}/visit/salesman/${member._id}?date=${date}`, { headers: { Authorization: `Bearer ${token}` } }),
         fetch(`${apiUrl}/daily-log/${member._id}/${date}`, { headers: { Authorization: `Bearer ${token}` } }),
+        fetch(`${apiUrl}/daily-log/live/${member._id}`, { headers: { Authorization: `Bearer ${token}` } }),
       ]);
-      const [orderData,visitData,logData] = await Promise.all([orderRes.json(),visitRes.json(),logRes.json()]);
+      const [orderData,visitData,logData,liveData] = await Promise.all([orderRes.json(),visitRes.json(),logRes.json(),liveRes.json()]);
       setMemberOrders((Array.isArray(orderData.data)?orderData.data:[]).filter(order=>String(order.salesmanId?._id||order.salesmanId)===String(member._id)));
-      setMemberVisits(Array.isArray(visitData.data)?visitData.data:[]);
+      const live = liveRes.ok && liveData.success ? liveData.data : null;
+      setMemberLive(live);
+      // The live call already returns today's visits with their party names, so
+      // it is preferred; /visit/salesman is the fallback for an older server.
+      // The live call carries today's visits with their party names already,
+      // so it is preferred for today; any other day comes from the dated call.
+      setMemberVisits(live?.recentVisits?.length ? live.recentVisits : (Array.isArray(visitData.data) ? visitData.data : []));
+      setVisitDate(date);
       setMemberDailyLog(logRes.ok&&logData.success?logData.data:null);
     } catch (err) {
       console.log('[MyTeamScreen] Error loading details:', err.message);
@@ -207,7 +307,11 @@ export default function MyTeamScreen({
         <View style={{ width: 60 }} />
       </View>
 
-      <ScrollView contentContainerStyle={styles.container}>
+      <ScrollView contentContainerStyle={styles.container}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onPullRefresh} colors={['#00796B']} tintColor="#00796B" />
+        }
+      >
         {loading ? (
           <View style={styles.loaderContainer}>
             <ActivityIndicator size="large" color="#00796B" />
@@ -230,6 +334,63 @@ export default function MyTeamScreen({
           </View>
         ) : (
           <>
+            {myTeams.filter((team) => team.summary).map((team) => {
+              const s = team.summary;
+              const money = (v) => `₹${Number(v || 0).toLocaleString('en-IN', { maximumFractionDigits: 0 })}`;
+              const done = s.targetAmount > 0 ? Math.round((s.achievedAmount / s.targetAmount) * 100) : 0;
+              return (
+                <View key={team._id} style={styles.teamNumbersCard}>
+                  <Text style={styles.teamNumbersName}>{team.name}</Text>
+                  <Text style={styles.teamNumbersSub}>
+                    {team.teamCode} · {team.role === 'manager' ? 'you manage this team' : 'you are a member'}
+                  </Text>
+
+                  <View style={styles.teamNumbersRow}>
+                    <View style={styles.teamNumbersCell}>
+                      <Text style={styles.teamNumbersLabel}>Target</Text>
+                      <Text style={styles.teamNumbersVal}>{money(s.targetAmount)}</Text>
+                    </View>
+                    <View style={styles.teamNumbersCell}>
+                      <Text style={styles.teamNumbersLabel}>Achieved</Text>
+                      <Text style={styles.teamNumbersVal}>{money(s.achievedAmount)}</Text>
+                    </View>
+                    <View style={styles.teamNumbersCell}>
+                      <Text style={styles.teamNumbersLabel}>Done</Text>
+                      <Text style={[styles.teamNumbersVal, done >= 100 && styles.teamNumbersGood]}>{done}%</Text>
+                    </View>
+                  </View>
+
+                  <View style={styles.teamNumbersRow}>
+                    <View style={styles.teamNumbersCell}>
+                      <Text style={styles.teamNumbersLabel}>Parties</Text>
+                      <Text style={styles.teamNumbersVal}>{s.parties}</Text>
+                    </View>
+                    <View style={styles.teamNumbersCell}>
+                      <Text style={styles.teamNumbersLabel}>Outstanding</Text>
+                      <Text style={[styles.teamNumbersVal, s.overLimit && styles.teamNumbersBad]}>{money(s.outstanding)}</Text>
+                    </View>
+                    <View style={styles.teamNumbersCell}>
+                      <Text style={styles.teamNumbersLabel}>Limit</Text>
+                      {/* Zero means no ceiling, so it must not read as ₹0. */}
+                      <Text style={styles.teamNumbersVal}>{s.outstandingLimit > 0 ? money(s.outstandingLimit) : 'None'}</Text>
+                    </View>
+                  </View>
+
+                  {s.overLimit && (
+                    <Text style={styles.teamNumbersWarn}>
+                      Past the team's outstanding limit by {money(s.outstanding - s.outstandingLimit)}. New credit
+                      orders for this team's parties will be refused until it is collected.
+                    </Text>
+                  )}
+                  {s.unallocatedAmount > 0 && team.role === 'manager' && (
+                    <Text style={styles.teamNumbersNote}>
+                      {money(s.unallocatedAmount)} of the team target is still unallocated.
+                    </Text>
+                  )}
+                </View>
+              );
+            })}
+
             {/* Team Overview Card */}
             <View style={styles.overviewCard}>
               <Text style={styles.overviewTitle}>Team Overview Today</Text>
@@ -313,6 +474,19 @@ export default function MyTeamScreen({
                   </View>
                 </View>
                 <Text style={{color:'#C05621',fontWeight:'800',marginTop:10}}>Assigned-party outstanding: ₹{Number(member.stats?.outstanding||0).toLocaleString('en-IN')}</Text>
+
+                {/* What they are doing this minute, without opening the member */}
+                {member.live?.ongoingVisit ? (
+                  <Text style={styles.rosterLiveOn}>
+                    🟢 Inside {member.live.ongoingVisit.partyName} · {member.live.ongoingVisit.minutesInside} min
+                  </Text>
+                ) : member.live?.lastSeenAt ? (
+                  <Text style={styles.rosterLiveIdle}>
+                    📍 Last seen {member.live.lastSeenMinutesAgo} min ago · {Number(member.live.totalDistanceKm || 0).toFixed(1)} km today
+                  </Text>
+                ) : (
+                  <Text style={styles.rosterLiveOff}>📍 No location received today</Text>
+                )}
 
                 {/* Subordinate Actions */}
                 <View style={styles.actionsRow}>
@@ -436,23 +610,68 @@ export default function MyTeamScreen({
                       </Text>
                       <Text style={styles.detailText}>Area: {memberBeatPlan.area || 'N/A'}</Text>
                       <Text style={styles.detailText}>
-                        Total Scheduled Parties: {memberBeatPlan.totalParties || 0}
+                        Day {memberBeatPlan.cycleDay || '?'} of the cycle
+                        {memberBeatPlan.executionStatus ? ` · ${memberBeatPlan.executionStatus}` : ''}
                       </Text>
+
+                      {/* Progress against the plan is the point of looking at
+                          someone else's beat, so it leads rather than hiding
+                          at the bottom of the list. */}
+                      <View style={styles.beatProgressRow}>
+                        <Text style={styles.beatProgressText}>
+                          {memberBeatPlan.visitedCount || 0} of {memberBeatPlan.totalParties || 0} visited
+                        </Text>
+                        <Text style={styles.beatProgressPct}>
+                          {memberBeatPlan.totalParties
+                            ? Math.round(((memberBeatPlan.visitedCount || 0) / memberBeatPlan.totalParties) * 100)
+                            : 0}%
+                        </Text>
+                      </View>
+                      <View style={styles.beatBarBg}>
+                        <View
+                          style={[
+                            styles.beatBarFill,
+                            {
+                              width: `${memberBeatPlan.totalParties
+                                ? Math.min(100, ((memberBeatPlan.visitedCount || 0) / memberBeatPlan.totalParties) * 100)
+                                : 0}%`,
+                            },
+                          ]}
+                        />
+                      </View>
 
                       <Text style={[styles.detailCardTitle, { marginTop: 16 }]}>
                         Targeted Parties Today:
                       </Text>
                       {Array.isArray(memberBeatPlan.parties) && memberBeatPlan.parties.length > 0 ? (
-                        memberBeatPlan.parties.map((pItem, idx) => (
-                          <View key={idx} style={styles.partyItemRow}>
-                            <Text style={styles.partyItemName}>
-                              {idx + 1}. {pItem.partyId?.partyName || 'Party'}
-                            </Text>
-                            <Text style={styles.partyItemSub}>
-                              {pItem.partyId?.mobile} • {pItem.partyId?.address}
-                            </Text>
-                          </View>
-                        ))
+                        memberBeatPlan.parties.map((pItem, idx) => {
+                          const done = pItem.visitedToday;
+                          const running = !!pItem.activeVisitId;
+                          return (
+                            <View
+                              key={idx}
+                              style={[
+                                styles.partyItemRow,
+                                done && styles.partyItemDone,
+                                running && styles.partyItemRunning,
+                              ]}
+                            >
+                              <Text style={styles.partyItemName}>
+                                {done ? '✅' : running ? '🟢' : '⬜'} {idx + 1}. {pItem.partyId?.partyName || 'Party'}
+                              </Text>
+                              <Text style={styles.partyItemSub}>
+                                {pItem.partyId?.mobile} • {pItem.partyId?.address}
+                              </Text>
+                              {(done || running) && (
+                                <Text style={styles.partyItemState}>
+                                  {running
+                                    ? 'Visit in progress'
+                                    : `Visited${pItem.visitDurationMinutes ? ` · ${pItem.visitDurationMinutes} min` : ''}${pItem.visitProductive ? ' · order/collection taken' : ''}`}
+                                </Text>
+                              )}
+                            </View>
+                          );
+                        })
                       ) : (
                         <Text style={styles.emptySubText}>No parties in today's beat schedule.</Text>
                       )}
@@ -468,7 +687,7 @@ export default function MyTeamScreen({
                   ) : (
                     memberParties.map((party) => (
                       <View key={party._id} style={styles.partyCard}>
-                        <Text style={styles.partyName}>{party.partyName}</Text>
+                        <Text style={name(styles.partyName)}>{name(party.partyName)}</Text>
                         <Text style={styles.partySub}>
                           📱 {party.mobile} • {party.area}, {party.city}
                         </Text>
@@ -492,9 +711,127 @@ export default function MyTeamScreen({
                 <View>{memberOrders.map(order=><View key={order._id} style={styles.colCard}><View style={styles.colHeaderRow}><Text style={styles.colParty}>{order.orderNumber}</Text><Text style={styles.colAmount}>₹{Number(order.netPayableAmount||order.grandTotal||0).toLocaleString('en-IN')}</Text></View><Text style={styles.colSub}>{order.partyId?.partyName||'Party'} · {order.status}</Text></View>)}{!memberOrders.length&&<Text style={styles.emptySubText}>No orders found for this member.</Text>}</View>
               ) : activeTab === 'activity' ? (
                 <View>
-                  <View style={styles.detailCard}><Text style={styles.detailCardTitle}>Live Location</Text>{memberDailyLog?.points?.length?<><Text style={styles.detailText}>Last update: {new Date(memberDailyLog.points.at(-1).timestamp).toLocaleString()}</Text><Text style={styles.detailText}>Distance today: {Number(memberDailyLog.totalDistanceKm||0).toFixed(2)} km</Text><TouchableOpacity style={styles.createOrderBtn} onPress={()=>{const p=memberDailyLog.points.at(-1);Linking.openURL(`https://www.google.com/maps/search/?api=1&query=${p.latitude},${p.longitude}`)}}><Text style={styles.createOrderBtnText}>Open Live Location</Text></TouchableOpacity></>:<Text style={styles.emptySubText}>No live GPS point available today.</Text>}</View>
-                  <Text style={styles.detailCardTitle}>Recent Visits ({memberVisits.length})</Text>
-                  {memberVisits.map(visit=><View key={visit._id} style={styles.partyCard}><Text style={styles.partyName}>{visit.partyId?.partyName||'Party visit'}</Text><Text style={styles.partySub}>{visit.status||'visited'} · {new Date(visit.arrivedAt||visit.createdAt).toLocaleString()}</Text></View>)}
+                  {/* Where they are right now */}
+                  <View style={styles.detailCard}>
+                    <View style={styles.liveHeaderRow}>
+                      <Text style={styles.detailCardTitle}>Right Now</Text>
+                      <View style={[styles.liveChip, memberLive?.onDuty ? styles.liveChipOn : styles.liveChipOff]}>
+                        <Text style={[styles.liveChipText, memberLive?.onDuty ? styles.liveChipTextOn : styles.liveChipTextOff]}>
+                          {memberLive?.onDuty ? 'ON DUTY' : 'OFF DUTY'}
+                        </Text>
+                      </View>
+                    </View>
+
+                    {memberLive?.ongoingVisit ? (
+                      <View style={styles.ongoingBox}>
+                        <Text style={styles.ongoingTitle}>
+                          🟢 Inside {memberLive.ongoingVisit.partyName}
+                        </Text>
+                        {!!memberLive.ongoingVisit.area && (
+                          <Text style={styles.ongoingSub}>{memberLive.ongoingVisit.area}</Text>
+                        )}
+                        <Text style={styles.ongoingSub}>
+                          {memberLive.ongoingVisit.minutesInside} min so far · arrived{' '}
+                          {new Date(memberLive.ongoingVisit.arrivedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        </Text>
+                      </View>
+                    ) : (
+                      <Text style={styles.detailText}>Not inside any party at the moment.</Text>
+                    )}
+
+                    <Text style={styles.detailText}>
+                      🚶 Distance today: {Number(memberLive?.totalDistanceKm ?? memberDailyLog?.totalDistanceKm ?? 0).toFixed(2)} km
+                    </Text>
+                    <Text style={styles.detailText}>
+                      ✅ Visits today: {memberLive?.completedVisitsToday ?? 0} done
+                      {memberLive?.ongoingVisit ? ', 1 running' : ''}
+                    </Text>
+                    <Text style={styles.detailText}>
+                      📍 Last GPS fix:{' '}
+                      {memberLive?.lastSeenAt
+                        ? `${new Date(memberLive.lastSeenAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} (${memberLive.lastSeenMinutesAgo} min ago)`
+                        : 'none received today'}
+                    </Text>
+                    {/* A fix older than half an hour is stale enough that it should
+                        not be read as "where he is", so say so plainly. */}
+                    {memberLive?.lastSeenMinutesAgo > 30 && (
+                      <Text style={styles.staleWarn}>
+                        This position is {memberLive.lastSeenMinutesAgo} minutes old — the phone may be offline or
+                        tracking may be switched off.
+                      </Text>
+                    )}
+
+                    {memberLive?.lastPoint ? (
+                      <TouchableOpacity
+                        style={styles.createOrderBtn}
+                        onPress={() =>
+                          Linking.openURL(
+                            `https://www.google.com/maps/search/?api=1&query=${memberLive.lastPoint.latitude},${memberLive.lastPoint.longitude}`
+                          )
+                        }
+                      >
+                        <Text style={styles.createOrderBtnText}>📍 Open Last Location on Map</Text>
+                      </TouchableOpacity>
+                    ) : (
+                      <Text style={styles.emptySubText}>No GPS point received today.</Text>
+                    )}
+                  </View>
+
+                  <View style={styles.visitDateRow}>
+                    <TouchableOpacity style={styles.visitDateArrow} onPress={() => shiftVisitDate(-1)}>
+                      <Text style={styles.visitDateArrowText}>‹</Text>
+                    </TouchableOpacity>
+
+                    <View style={styles.visitDateMiddle}>
+                      <Text style={styles.detailCardTitle}>
+                        {visitDate === localDateKey()
+                          ? `Today's Visits (${memberVisits.length})`
+                          : `Visits (${memberVisits.length})`}
+                      </Text>
+                      <Text style={styles.visitDateLabel}>
+                        {new Date(`${visitDate}T12:00:00`).toDateString()}
+                      </Text>
+                    </View>
+
+                    <TouchableOpacity
+                      style={[styles.visitDateArrow, visitDate >= localDateKey() && styles.visitDateArrowOff]}
+                      disabled={visitDate >= localDateKey()}
+                      onPress={() => shiftVisitDate(1)}
+                    >
+                      <Text style={styles.visitDateArrowText}>›</Text>
+                    </TouchableOpacity>
+                  </View>
+
+                  {visitDate !== localDateKey() && (
+                    <TouchableOpacity style={styles.backToTodayBtn} onPress={() => loadVisitsFor(localDateKey())}>
+                      <Text style={styles.backToTodayText}>Back to today</Text>
+                    </TouchableOpacity>
+                  )}
+
+                  {visitsLoading ? (
+                    <ActivityIndicator color="#00796B" style={{ marginVertical: 20 }} />
+                  ) : memberVisits.length === 0 ? (
+                    <Text style={styles.emptySubText}>
+                      {visitDate === localDateKey()
+                        ? 'No visits recorded today.'
+                        : 'No visits recorded on this day.'}
+                    </Text>
+                  ) : (
+                    memberVisits.map((visit) => (
+                      <View key={visit._id} style={styles.partyCard}>
+                        <Text style={name(styles.partyName)}>
+                          {name(visit.partyName || visit.partyId?.partyName || 'Party visit')}
+                        </Text>
+                        <Text style={styles.partySub}>
+                          {visit.status === 'ongoing' ? '🟢 ongoing' : (visit.status || 'visited')}
+                          {visit.durationMinutes ? ` · ${visit.durationMinutes} min` : ''}
+                          {' · '}
+                          {new Date(visit.arrivedAt || visit.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        </Text>
+                        {visit.productive && <Text style={styles.productiveTag}>Order or collection taken</Text>}
+                      </View>
+                    ))
+                  )}
                 </View>
               ) : (
                 <View>
@@ -512,7 +849,7 @@ export default function MyTeamScreen({
                           </Text>
                         </View>
                         <Text style={styles.colSub}>
-                          Mode: {col.paymentMode?.toUpperCase()} • Status: {col.status?.toUpperCase()}
+                          Mode: {term(col.paymentMode)} • Status: {term(col.status)}
                         </Text>
                         <Text style={styles.colDate}>
                           Date: {new Date(col.collectionDate || col.createdAt).toLocaleDateString()}
@@ -605,6 +942,23 @@ const styles = StyleSheet.create({
     color: '#718096',
     textAlign: 'center',
   },
+  teamNumbersCard: {
+    backgroundColor: '#fff', borderRadius: 14, padding: 16, marginBottom: 14,
+    borderWidth: 1, borderColor: '#e2e8f0',
+  },
+  teamNumbersName: { fontSize: 16, fontWeight: '700', color: '#0f172a' },
+  teamNumbersSub: { fontSize: 11, color: '#64748b', marginTop: 2, marginBottom: 12 },
+  teamNumbersRow: { flexDirection: 'row', marginBottom: 10 },
+  teamNumbersCell: { flex: 1 },
+  teamNumbersLabel: { fontSize: 10, color: '#64748b', textTransform: 'uppercase', letterSpacing: 0.4 },
+  teamNumbersVal: { fontSize: 15, fontWeight: '700', color: '#0f172a', marginTop: 2 },
+  teamNumbersGood: { color: '#16a34a' },
+  teamNumbersBad: { color: '#dc2626' },
+  teamNumbersWarn: {
+    fontSize: 11, color: '#dc2626', backgroundColor: '#fef2f2',
+    padding: 8, borderRadius: 8, marginTop: 4,
+  },
+  teamNumbersNote: { fontSize: 11, color: '#64748b', marginTop: 4 },
   overviewCard: {
     backgroundColor: '#FFF',
     borderRadius: 12,
@@ -794,12 +1148,62 @@ const styles = StyleSheet.create({
     color: '#00796B',
     fontWeight: '700',
   },
+  beatProgressRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginTop: 12,
+    marginBottom: 6,
+  },
+  beatProgressText: { fontSize: 13, fontWeight: '700', color: '#2D3748' },
+  beatProgressPct: { fontSize: 13, fontWeight: '800', color: '#00796B' },
+  beatBarBg: { height: 8, borderRadius: 999, backgroundColor: '#EDF2F7', overflow: 'hidden' },
+  beatBarFill: { height: 8, borderRadius: 999, backgroundColor: '#00796B' },
+  partyItemDone: { backgroundColor: '#E6F6EF' },
+  partyItemRunning: { backgroundColor: '#FFF7E6' },
+  partyItemState: { fontSize: 11, color: '#00695C', fontWeight: '700', marginTop: 3 },
+  liveHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+  },
+  liveChip: { paddingHorizontal: 10, paddingVertical: 3, borderRadius: 999 },
+  liveChipOn: { backgroundColor: '#E6F6EF' },
+  liveChipOff: { backgroundColor: '#EDF2F7' },
+  liveChipText: { fontSize: 10, fontWeight: '800', letterSpacing: 0.5 },
+  liveChipTextOn: { color: '#00796B' },
+  liveChipTextOff: { color: '#718096' },
+  ongoingBox: {
+    backgroundColor: '#E6F6EF',
+    borderRadius: 10,
+    padding: 12,
+    marginBottom: 10,
+  },
+  ongoingTitle: { fontSize: 14, fontWeight: '800', color: '#00695C' },
+  ongoingSub: { fontSize: 12, color: '#2F6F63', marginTop: 3 },
+  staleWarn: { fontSize: 11, color: '#C05621', marginTop: 6, lineHeight: 15 },
+  productiveTag: { fontSize: 11, color: '#00796B', fontWeight: '700', marginTop: 4 },
+  rosterLiveOn: { fontSize: 12, color: '#00695C', fontWeight: '700', marginTop: 6 },
+  rosterLiveIdle: { fontSize: 12, color: '#4A5568', marginTop: 6 },
+  rosterLiveOff: { fontSize: 12, color: '#A0AEC0', marginTop: 6 },
   detailCard: {
     backgroundColor: '#F7F9FC',
     borderRadius: 8,
     padding: scale(14),
     marginBottom: verticalScale(16),
   },
+  visitDateRow: { flexDirection: 'row', alignItems: 'center', marginTop: 8 },
+  visitDateMiddle: { flex: 1, alignItems: 'center' },
+  visitDateLabel: { fontSize: responsiveFontSize(10), color: '#718096', marginTop: 1 },
+  visitDateArrow: {
+    width: 34, height: 34, borderRadius: 17, alignItems: 'center', justifyContent: 'center',
+    borderWidth: 1, borderColor: '#CBD5E0',
+  },
+  visitDateArrowOff: { opacity: 0.3 },
+  visitDateArrowText: { fontSize: responsiveFontSize(18), color: '#2D3748', lineHeight: responsiveFontSize(20) },
+  backToTodayBtn: { alignSelf: 'center', marginTop: 6, marginBottom: 2 },
+  backToTodayText: { fontSize: responsiveFontSize(10), color: '#00796B', fontWeight: '700' },
   detailCardTitle: {
     fontSize: responsiveFontSize(15),
     fontWeight: '700',

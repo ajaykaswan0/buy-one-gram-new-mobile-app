@@ -17,10 +17,13 @@ import {
   Alert,
 } from 'react-native';
 import { scale, verticalScale, responsiveFontSize } from './src/utils/responsive';
+import { bottomBarPadding } from './src/utils/systemBars';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import messaging from '@react-native-firebase/messaging';
-import Geolocation from '@react-native-community/geolocation';
+import { getMessaging } from '@react-native-firebase/messaging';
+import { startTracking, stopTracking } from './src/services/locationTracker';
+import { hasNativeTracking, startNativeTracking, stopNativeTracking } from './src/services/nativeTracker';
 import LoginScreen from './src/screens/LoginScreen';
+import { LanguageProvider } from './src/i18n';
 import DashboardScreen from './src/screens/DashboardScreen';
 import AttendanceScreen from './src/screens/AttendanceScreen';
 import ProfileScreen from './src/screens/ProfileScreen';
@@ -41,12 +44,14 @@ import CrmDashboardScreen from './src/screens/CrmDashboardScreen';
 import CrmHomeScreen from './src/screens/CrmHomeScreen';
 import AssignedIssuesScreen from './src/screens/AssignedIssuesScreen';
 import PartyRoutePlannerScreen from './src/screens/PartyRoutePlannerScreen';
+import DeliveryRouteScreen from './src/screens/DeliveryRouteScreen';
 import MyTeamScreen from './src/screens/MyTeamScreen';
 import RecoveryScreen from './src/screens/RecoveryScreen';
 import SalesPartnerDashboardScreen from './src/screens/SalesPartnerDashboardScreen';
 import StoreManagerDashboardScreen from './src/screens/StoreManagerDashboardScreen';
+import PackerDashboardScreen from './src/screens/PackerDashboardScreen';
+import { API_URL } from './src/config/api';
 
-const LOCATION_TRACKING_TASK = 'LOCATION_TRACKING_TASK';
 const REQUIRED_PERMISSION_KEYS = ['camera', 'contacts', 'location', 'backgroundLocation'];
 const TRACKING_PROFILE_KEY = 'tracking_profile';
 const DEVICE_ID_KEY = 'tracking_device_id';
@@ -146,10 +151,18 @@ const getOrCreateDeviceId = async () => {
   return deviceId;
 };
 
+/**
+ * The Firebase messaging instance.
+ *
+ * @react-native-firebase v26 dropped the default export, so the old
+ * `messaging()` call resolved to undefined. Every caller here guarded against
+ * that and quietly returned null — which is why no device ever registered a
+ * push token and no notification could be delivered. The modular getMessaging()
+ * returns the same object, with the same instance methods.
+ */
 const getMessagingInstance = () => {
   try {
-    if (typeof messaging !== 'function') return null;
-    return messaging();
+    return getMessaging();
   } catch (e) {
     console.log('[FCM] Messaging instance not available:', e.message);
     return null;
@@ -219,58 +232,75 @@ const registerFcmTokenWithBackend = async ({ authToken, apiUrl }) => {
   }
 };
 
-// Define the global background location updates task safely
-try {
-  if (TaskManager && typeof TaskManager.defineTask === 'function') {
-    TaskManager.defineTask(LOCATION_TRACKING_TASK, async ({ data, error }) => {
-      if (error) return;
-      if (data && data.locations && data.locations.length > 0) {
-        const location = data.locations[0];
-        const { latitude, longitude, accuracy } = location.coords;
-        try {
-          const token = await AsyncStorage.getItem('token');
-          const apiUrl = await AsyncStorage.getItem('api_url') || 'http://200.141.9.159:5000/api';
-          const trackingProfileRaw = await AsyncStorage.getItem(TRACKING_PROFILE_KEY);
-          const trackingProfile = trackingProfileRaw ? JSON.parse(trackingProfileRaw) : null;
-          if (trackingProfile?.userId && trackingProfile?.deviceId && token) {
-            const permissionState = await getPermissionState();
-            await fetch(`${apiUrl}/device-tracking/ping`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                userId: trackingProfile.userId,
-                userName: trackingProfile.userName,
-                userMobile: trackingProfile.userMobile,
-                deviceId: trackingProfile.deviceId,
-                deviceLabel: trackingProfile.deviceLabel,
-                latitude,
-                longitude,
-                accuracy,
-                source: 'background',
-                permissionStatus: normalizePermissionStatus(permissionState),
-                isLoggedIn: Boolean(token),
-              }),
-            });
-          }
-        } catch (e) {}
-      }
-    });
-  }
-} catch (e) {}
+// Background location used to be registered here through Expo's TaskManager.
+// This project has no Expo packages installed, so `TaskManager` was always an
+// undefined identifier: the reference threw ReferenceError, the empty catch
+// swallowed it, and the task was never registered. Removed rather than left
+// looking functional. Location reporting runs through
+// startBackgroundLocationReporting below, using @react-native-community/geolocation.
 
-export default function App() {
+/**
+ * The app proper. Wrapped below rather than here because it has several early
+ * returns — a splash, a permission gate — and every one of them needs the
+ * language provider above it.
+ */
+function AppShell() {
   const [appReady, setAppReady] = useState(false);
   const [token, setToken] = useState(null);
   const [user, setUser] = useState(null);
-  const [apiUrl, setApiUrl] = useState('http://200.141.9.159:5000/api');
+  const [apiUrl, setApiUrl] = useState(API_URL);
   
   // Navigation states
   const [activeTab, setActiveTab] = useState('home');
   const [subScreen, setSubScreen] = useState(null);
+
+  /**
+   * Where he has been, so back goes back.
+   *
+   * There used to be one `previousSubScreen` slot, honoured only when leaving
+   * the order screen — from anywhere else the back button dropped him on the
+   * home tab, however deep he was. Party list → party profile → back landed on
+   * home instead of the list he was reading a second ago.
+   *
+   * A stack costs almost nothing and unwinds any depth correctly.
+   */
+  /**
+   * Bumped whenever something changes whether the day is open.
+   *
+   * The duty check otherwise runs on a one-minute timer, so marking attendance
+   * left the app showing OFFLINE — and hiding the beat plan — until the timer
+   * came round or the app was killed and reopened. Marking attendance is
+   * exactly the moment to ask again rather than wait.
+   */
+  const [dutyNonce, setDutyNonce] = useState(0);
+
+  const [screenStack, setScreenStack] = useState([]);
+
+  // Changing tab abandons wherever he was, so the history goes with it —
+  // otherwise back from a fresh tab would walk into the last tab's screens.
+  useEffect(() => { setScreenStack([]); }, [activeTab]);
+
+  /** Opens a screen, remembering the one being left. */
+  const navigateTo = (next) => {
+    setScreenStack((stack) => [...stack, subScreen]);
+    setSubScreen(next);
+  };
+
+  /**
+   * Returns to the previous screen, or the tab underneath if there is none.
+   *
+   * The two setters are called side by side rather than one inside the other's
+   * updater — React does not support setting state from within another
+   * update, and doing so can drop one of the two silently.
+   */
+  const goBack = () => {
+    const previous = screenStack.length ? screenStack[screenStack.length - 1] : null;
+    setSubScreen(previous ?? null);
+    setScreenStack((stack) => stack.slice(0, -1));
+  };
   const [orderParty, setOrderParty] = useState(null);
   const [profilePartyId, setProfilePartyId] = useState(null);
   const [collectionParty, setCollectionParty] = useState(null);
-  const [previousSubScreen, setPreviousSubScreen] = useState(null);
 
   // Tracking states
   const [activeLogId, setActiveLogId] = useState(null);
@@ -342,31 +372,23 @@ export default function App() {
   // Hardware Back Button Handler
   useEffect(() => {
     const backAction = () => {
+      // Deepest first: a screen goes back to whatever opened it.
       if (subScreen) {
-        if (subScreen === 'order' && previousSubScreen) {
-          setSubScreen(previousSubScreen);
-          setPreviousSubScreen(null);
-          setOrderParty(null);
-        } else {
-          setSubScreen(null);
-        }
-        return true; // prevent default behavior (exiting the app)
+        goBack();
+        return true;
       }
-      // If we are not on the home tab, hardware back button goes back to home tab
+      // Then the tabs: anything but home returns to home.
       if (activeTab !== 'home') {
         setActiveTab('home');
         return true;
       }
-      return false; // let standard exit behavior happen
+      return false; // home, with nothing behind it — let Android close the app
     };
 
-    const backHandler = BackHandler.addEventListener(
-      'hardwareBackPress',
-      backAction
-    );
-
+    const backHandler = BackHandler.addEventListener('hardwareBackPress', backAction);
     return () => backHandler.remove();
-  }, [subScreen, previousSubScreen, activeTab]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [subScreen, screenStack, activeTab]);
 
   // 1. Initialize auth state on mount
   useEffect(() => {
@@ -374,11 +396,9 @@ export default function App() {
       try {
         const storedToken = await AsyncStorage.getItem('token');
         const storedUser = await AsyncStorage.getItem('user');
-        const storedApiUrl = await AsyncStorage.getItem('api_url');
-
-        if (storedApiUrl) {
-          setApiUrl(storedApiUrl);
-        }
+        // The server address is compiled in. It used to be read from storage,
+        // which meant a phone once pointed at a laptop kept going there after
+        // the production build was installed.
 
         const storedTrackingProfile = await AsyncStorage.getItem(TRACKING_PROFILE_KEY);
         if (storedTrackingProfile) {
@@ -386,71 +406,33 @@ export default function App() {
         }
 
         if (storedToken && storedUser) {
-          setToken(storedToken);
-          setUser(JSON.parse(storedUser));
-          setActiveTab('home');
-          registerFcmTokenWithBackend({
-            authToken: storedToken,
-            apiUrl: storedApiUrl || apiUrl,
-          }).catch(() => {});
-        }
-        const permissionStatus = await requestAllRequiredPermissions();
-        setPermissionState({
-          loading: false,
-          missing: permissionStatus.missing,
-          map: permissionStatus.map,
-        });
-        syncTrackingPermissionStatus(trackingProfile, permissionStatus);
-      } catch (e) {
-        console.error('Failed to restore auth states', e);
-      } finally {
-        setAppReady(true);
-      }
-    };
-
-    initializeApp();
-  }, []);
-
-  useEffect(() => {
-    const subscription = AppState.addEventListener('change', (nextState) => {
-      if (nextState === 'active') {
-        refreshPermissionState();
-        if (trackingProfile?.userId) {
-          startBackgroundLocationReporting(activeLogId || null);
-        }
-      }
-    });
-    return () => subscription.remove();
-  }, [trackingProfile, activeLogId]);
-
-  // 2. Keep daily-log summary synced from live tracking stream
-  useEffect(() => {
-    if (!token) {
-      stopBackgroundLocationReporting();
-      stopStatusChecking();
-      return;
-    }
-
-    if (trackingProfile?.userId) {
-      startBackgroundLocationReporting(activeLogId || null);
-    }
-
-    const checkDailyLogStatus = async () => {
-      try {
-        const res = await fetch(`${apiUrl}/daily-log/my/today`, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
-        const data = await res.json();
-        
-        if (res.ok && data.success && data.data) {
-          const log = data.data;
-          if (log?._id && activeLogId !== log._id) {
-            setActiveLogId(log._id);
-            await AsyncStorage.setItem('active_log_id', log._id);
+          // Tokens last 7 days and there is no refresh, so a stored one is often
+          // dead. Restoring it blindly left the app looking signed in while every
+          // screen quietly failed to load. Check it once, here, and send the user
+          // back to login if it has expired.
+          let tokenIsValid = true;
+          try {
+            const check = await fetch(`${API_URL}/auth/me`, {
+              headers: { Authorization: `Bearer ${storedToken}` },
+            });
+            if (check.status === 401 || check.status === 403) tokenIsValid = false;
+          } catch (networkError) {
+            // Offline is not the same as signed out - keep the session and let the
+            // screens retry, or a salesman with no signal would be locked out.
+            console.warn('Session check skipped, network unavailable:', networkError.message);
           }
-        } else {
-          await AsyncStorage.removeItem('active_log_id');
-          setActiveLogId(null);
+
+          if (tokenIsValid) {
+            setToken(storedToken);
+            setUser(JSON.parse(storedUser));
+            setActiveTab('home');
+            registerFcmTokenWithBackend({
+              authToken: storedToken,
+              apiUrl: API_URL,
+            }).catch(() => {});
+          } else {
+            await AsyncStorage.multiRemove(['token', 'user']);
+          }
         }
         const permissionStatus = await requestAllRequiredPermissions();
         setPermissionState({
@@ -493,6 +475,38 @@ export default function App() {
       startBackgroundLocationReporting(activeLogId || null);
     }
 
+    // A duplicate of the app-init routine used to sit here: the function was
+    // renamed to checkDailyLogStatus but the call was left as initializeApp(),
+    // which is not in scope. That threw ReferenceError on every run of this
+    // effect and meant the copied body never ran either. The real initialisation
+    // runs in its own effect above, and the working daily-log poller is below, so
+    // this effect now does only what its comment says: start and stop tracking.
+  }, []);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (nextState) => {
+      if (nextState === 'active') {
+        refreshPermissionState();
+        if (trackingProfile?.userId) {
+          startBackgroundLocationReporting(activeLogId || null);
+        }
+      }
+    });
+    return () => subscription.remove();
+  }, [trackingProfile, activeLogId]);
+
+  // 2. Keep daily-log summary synced from live tracking stream
+  useEffect(() => {
+    if (!token) {
+      stopBackgroundLocationReporting();
+      stopStatusChecking();
+      return;
+    }
+
+    if (trackingProfile?.userId) {
+      startBackgroundLocationReporting(activeLogId || null);
+    }
+
     const checkDailyLogStatus = async () => {
       try {
         const res = await fetch(`${apiUrl}/daily-log/my/today`, {
@@ -500,9 +514,16 @@ export default function App() {
         });
         const data = await res.json();
         
-        if (res.ok && data.success && data.data) {
-          const log = data.data;
-          if (log?._id && activeLogId !== log._id) {
+        /**
+         * On duty means attendance was marked, not merely that a log exists.
+         *
+         * The endpoint returns an empty log shape for any day, so its presence
+         * proved nothing — the app showed ONLINE to someone who had not checked
+         * in at all, and let him start visiting.
+         */
+        const log = res.ok && data.success ? data.data : null;
+        if (log?._id && log.onDuty) {
+          if (activeLogId !== log._id) {
             setActiveLogId(log._id);
             await AsyncStorage.setItem('active_log_id', log._id);
           }
@@ -521,48 +542,64 @@ export default function App() {
     return () => {
       stopStatusChecking();
     };
-  }, [token, apiUrl, activeLogId, trackingProfile]);
+  }, [token, apiUrl, activeLogId, trackingProfile, dutyNonce]);
 
+  /**
+   * Starts the continuous location watch for this shift.
+   *
+   * What used to be here fired a single getCurrentPosition and stopped, so a
+   * day produced a handful of scattered dots instead of a trail. The watch now
+   * lives in src/services/locationTracker.js, buffers points locally and
+   * uploads them in batches, so a lost signal delays the trail rather than
+   * putting a hole in it.
+   */
   const startBackgroundLocationReporting = async (logId = null) => {
     try {
       if (logId) await AsyncStorage.setItem('active_log_id', logId);
 
       const permissionCheck = await getPermissionState();
       if (!permissionCheck.map?.location) {
-        setPermissionState((current) => ({ ...current, loading: false, missing: permissionCheck.missing, map: permissionCheck.map }));
+        setPermissionState((current) => ({
+          ...current, loading: false,
+          missing: permissionCheck.missing, map: permissionCheck.map,
+        }));
         return;
       }
 
-      Geolocation.getCurrentPosition(
-        async (position) => {
-          const { latitude, longitude, accuracy } = position.coords;
-          const storedToken = await AsyncStorage.getItem('token');
-          const storedApiUrl = await AsyncStorage.getItem('api_url') || 'http://200.141.9.159:5000/api';
-          const trackingProfileRaw = await AsyncStorage.getItem(TRACKING_PROFILE_KEY);
-          const trackingProfile = trackingProfileRaw ? JSON.parse(trackingProfileRaw) : null;
-          if (trackingProfile?.userId && trackingProfile?.deviceId && storedToken) {
-            fetch(`${storedApiUrl}/device-tracking/ping`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                userId: trackingProfile.userId,
-                userName: trackingProfile.userName,
-                userMobile: trackingProfile.userMobile,
-                deviceId: trackingProfile.deviceId,
-                deviceLabel: trackingProfile.deviceLabel,
-                latitude,
-                longitude,
-                accuracy,
-                source: 'foreground',
-                permissionStatus: normalizePermissionStatus(permissionCheck),
-                isLoggedIn: Boolean(storedToken),
-              }),
-            }).catch(() => {});
-          }
-        },
-        () => {},
-        { enableHighAccuracy: false, timeout: 15000, maximumAge: 10000 }
-      );
+      /**
+       * Android records in a foreground service, everything else in JS.
+       *
+       * Attendance no longer gates any of this: somebody who is logged in is
+       * tracked, so the trail no longer has a hole in it wherever the person
+       * forgot to punch in.
+       */
+      const [rawProfile] = await Promise.all([
+        AsyncStorage.getItem(TRACKING_PROFILE_KEY),
+      ]);
+      const profile = rawProfile ? JSON.parse(rawProfile) : null;
+      if (hasNativeTracking) {
+        const started = await startNativeTracking(profile, API_URL);
+        if (started) return;
+      }
+
+      // Read fresh for every point, so clocking in or out is picked up without
+      // tearing the watch down and starting it again.
+      await startTracking(async () => {
+        const [storedToken, profileRaw, openLogId] = await Promise.all([
+          AsyncStorage.getItem('token'),
+          AsyncStorage.getItem(TRACKING_PROFILE_KEY),
+          AsyncStorage.getItem('active_log_id'),
+        ]);
+        const state = await getPermissionState();
+        return {
+          token: storedToken,
+          apiUrl: API_URL,
+          profile: profileRaw ? JSON.parse(profileRaw) : null,
+          // Tracking follows the login, not attendance, so every point counts.
+          onDuty: true,
+          permissionStatus: normalizePermissionStatus(state),
+        };
+      });
     } catch (e) {
       console.log('[Location Tracker] Error starting location updates:', e.message);
     }
@@ -570,6 +607,10 @@ export default function App() {
 
   const stopBackgroundLocationReporting = async () => {
     try {
+      // Stops the watch and pushes whatever is still buffered, so the end of a
+      // shift is not silently truncated.
+      await stopNativeTracking();
+      await stopTracking();
       await AsyncStorage.removeItem('active_log_id');
     } catch (e) {
       console.log('[Location Tracker] Error stopping location updates:', e.message);
@@ -588,7 +629,7 @@ export default function App() {
     setUser(newUser);
     setApiUrl(currentUrl);
     setActiveTab('home');
-    setSubScreen(null);
+    goBack();
     registerFcmTokenWithBackend({
       authToken: newToken,
       apiUrl: currentUrl,
@@ -616,7 +657,7 @@ export default function App() {
   useEffect(() => {
     if (!token || !apiUrl) return undefined;
 
-    const messagingInstance = typeof messaging === 'function' ? messaging() : null;
+    const messagingInstance = getMessagingInstance();
     if (!messagingInstance) return undefined;
 
     const unsubscribeTokenRefresh =
@@ -651,9 +692,34 @@ export default function App() {
           })
         : () => {};
 
+    // Tapping a notification should land on the notifications screen. Without
+    // these two the tap merely reopened whatever screen was last showing.
+    const unsubscribeOpened =
+      typeof messagingInstance.onNotificationOpenedApp === 'function'
+        ? messagingInstance.onNotificationOpenedApp(() => {
+            setActiveTab('notifications');
+            goBack();
+            fetchUnreadCount();
+          })
+        : () => {};
+
+    // The same tap, but from a cold start: the app was not running at all, so
+    // there was no listener to fire and the message is collected here instead.
+    if (typeof messagingInstance.getInitialNotification === 'function') {
+      messagingInstance.getInitialNotification()
+        .then((opened) => {
+          if (!opened) return;
+          setActiveTab('notifications');
+          goBack();
+          fetchUnreadCount();
+        })
+        .catch(() => {});
+    }
+
     return () => {
       unsubscribeTokenRefresh();
       unsubscribeForeground();
+      unsubscribeOpened();
     };
   }, [token, apiUrl]);
 
@@ -755,6 +821,21 @@ export default function App() {
   const isCso = normalizedRole === 'cso';
   const isSalesPartner = normalizedRole === 'salespartner';
   const isStoreManager = ['storemanager', 'store_manager', 'warehousemanager', 'warehouse_manager', 'storekeeper'].includes(normalizedRole);
+  const isPacker = normalizedRole === 'packer';
+
+  // A packer gets one screen and nothing else: no tabs, no header, no profile.
+  if (isPacker) {
+    return (
+      <SafeAreaView style={styles.container}>
+        <StatusBar barStyle="dark-content" backgroundColor="#FFFFFF" />
+        <PackerDashboardScreen
+          token={token}
+          apiUrl={apiUrl}
+          user={user}
+        />
+      </SafeAreaView>
+    );
+  }
 
   return (
     <SafeAreaView style={styles.container}>
@@ -763,7 +844,7 @@ export default function App() {
       {/* Global Top Header Bar */}
       <View style={styles.header}>
         <View style={styles.headerLeft}>
-          <TouchableOpacity onPress={() => { setActiveTab('home'); setSubScreen(null); }}>
+          <TouchableOpacity onPress={() => { setActiveTab('home'); goBack(); }}>
             <Image 
               source={require('./assets/logo.png')} 
               style={styles.logoImage} 
@@ -775,7 +856,7 @@ export default function App() {
         <View style={styles.headerRightContainer}>
           <TouchableOpacity 
             style={styles.notificationIndicator} 
-            onPress={() => setSubScreen('notifications')}
+            onPress={() => navigateTo('notifications')}
           >
             <Text style={styles.bellIcon}>🔔</Text>
             {unreadCount > 0 && (
@@ -787,7 +868,7 @@ export default function App() {
 
           <TouchableOpacity 
             style={styles.profileIndicator} 
-            onPress={() => { setActiveTab('profile'); setSubScreen(null); }}
+            onPress={() => { setActiveTab('profile'); goBack(); }}
           >
             <View style={styles.avatarCircle}>
               <Text style={styles.avatarCircleText}>{initials}</Text>
@@ -802,7 +883,8 @@ export default function App() {
           <AttendanceScreen
             token={token}
             apiUrl={apiUrl}
-            onBack={() => setSubScreen(null)}
+            onAttendanceMarked={() => setDutyNonce((count) => count + 1)}
+            onBack={() => goBack()}
           />
         ) : subScreen === 'crmParties' ? (
           <CrmDashboardScreen
@@ -810,19 +892,16 @@ export default function App() {
             apiUrl={apiUrl}
             user={user}
             onNavigateToPartyProfile={(partyId) => {
-              setPreviousSubScreen('crmParties');
               setProfilePartyId(partyId);
-              setSubScreen('partyProfile');
+              navigateTo('partyProfile');
             }}
             onNavigateToCollection={(party) => {
-              setPreviousSubScreen('crmParties');
               setCollectionParty(party);
-              setSubScreen('collection');
+              navigateTo('collection');
             }}
             onNavigateToOrder={(party) => {
-              setPreviousSubScreen('crmParties');
               setOrderParty(party);
-              setSubScreen('order');
+              navigateTo('order');
             }}
           />
         ) : subScreen === 'team' ? (
@@ -830,40 +909,39 @@ export default function App() {
             token={token}
             apiUrl={apiUrl}
             user={user}
-            onBack={() => setSubScreen(null)}
+            onBack={() => goBack()}
             onNavigateToOrder={(party) => {
-              setPreviousSubScreen('team');
               setOrderParty(party);
-              setSubScreen('order');
+              navigateTo('order');
             }}
           />
         ) : subScreen === 'issues' ? (
-          <AssignedIssuesScreen token={token} apiUrl={apiUrl} onBack={() => setSubScreen(null)} />
+          <AssignedIssuesScreen token={token} apiUrl={apiUrl} onBack={() => goBack()} />
         ) : subScreen === 'recovery' ? (
-          <RecoveryScreen token={token} apiUrl={apiUrl} onBack={() => setSubScreen(null)} />
+          <RecoveryScreen token={token} apiUrl={apiUrl} onBack={() => goBack()} />
+        ) : subScreen === 'deliveryRoute' ? (
+          <DeliveryRouteScreen apiUrl={apiUrl} onBack={() => goBack()} />
         ) : subScreen === 'routePlanner' ? (
-          <PartyRoutePlannerScreen token={token} apiUrl={apiUrl} onBack={() => setSubScreen(null)} />
+          <PartyRoutePlannerScreen token={token} apiUrl={apiUrl} onBack={() => goBack()} />
         ) : subScreen === 'leave' ? (
           <LeaveScreen
             token={token}
             apiUrl={apiUrl}
-            onBack={() => setSubScreen(null)}
+            onBack={() => goBack()}
           />
         ) : subScreen === 'party' ? (
           <VisitScreen
             token={token}
             user={user}
             apiUrl={apiUrl}
-            onBack={() => setSubScreen(null)}
+            onBack={() => goBack()}
             onNavigateToOrder={(party) => {
-              setPreviousSubScreen('party');
               setOrderParty(party);
-              setSubScreen('order');
+              navigateTo('order');
             }}
             onNavigateToCollection={(party) => {
-              setPreviousSubScreen('party');
               setCollectionParty(party);
-              setSubScreen('collection');
+              navigateTo('collection');
             }}
           />
         ) : subScreen === 'collection' ? (
@@ -872,8 +950,7 @@ export default function App() {
             apiUrl={apiUrl}
             party={collectionParty}
             onBack={() => {
-              setSubScreen(previousSubScreen || null);
-              setPreviousSubScreen(null);
+              goBack();
               setCollectionParty(null);
             }}
           />
@@ -883,19 +960,16 @@ export default function App() {
             apiUrl={apiUrl}
             partyId={profilePartyId}
             onBack={() => {
-              setSubScreen(previousSubScreen || null);
-              setPreviousSubScreen(null);
+              goBack();
               setProfilePartyId(null);
             }}
             onNavigateToOrder={(party) => {
-              setPreviousSubScreen('partyProfile');
               setOrderParty(party);
-              setSubScreen('order');
+              navigateTo('order');
             }}
             onNavigateToCollection={(party) => {
-              setPreviousSubScreen('partyProfile');
               setCollectionParty(party);
-              setSubScreen('collection');
+              navigateTo('collection');
             }}
           />
         ) : subScreen === 'order' ? (
@@ -905,8 +979,7 @@ export default function App() {
             user={user}
             preSelectedParty={orderParty}
             onBack={() => {
-              setSubScreen(previousSubScreen || null);
-              setPreviousSubScreen(null);
+              goBack();
               setOrderParty(null);
             }}
           />
@@ -915,30 +988,34 @@ export default function App() {
             token={token}
             apiUrl={apiUrl}
             user={user}
-            onBack={() => setSubScreen(null)}
+            onBack={() => goBack()}
           />
         ) : subScreen === 'orderList' ? (
           <OrderListScreen
             token={token}
             apiUrl={apiUrl}
-            onBack={() => setSubScreen(null)}
+            user={user}
+            onBack={() => goBack()}
           />
         ) : subScreen === 'notifications' ? (
           <NotificationScreen
             token={token}
             apiUrl={apiUrl}
-            onBack={() => setSubScreen(null)}
+            onBack={() => goBack()}
             onClearBadge={() => setUnreadCount(0)}
           />
         ) : subScreen === 'outstandingList' ? (
           <OutstandingListScreen
             token={token}
             apiUrl={apiUrl}
-            onBack={() => setSubScreen(null)}
+            onBack={() => goBack()}
             onNavigateToOrder={(party) => {
-              setPreviousSubScreen('outstandingList');
               setOrderParty(party);
-              setSubScreen('order');
+              navigateTo('order');
+            }}
+            onNavigateToCollection={(party) => {
+              setCollectionParty(party);
+              navigateTo('collection');
             }}
           />
         ) : activeTab === 'home' ? (
@@ -947,20 +1024,20 @@ export default function App() {
               token={token}
               apiUrl={apiUrl}
               activeLogId={activeLogId}
-              onNavigateToAttendance={() => setSubScreen('attendance')}
-              onNavigateToLeave={() => setSubScreen('leave')}
-              onNavigateToProducts={() => setSubScreen('products')}
+              onNavigateToAttendance={() => navigateTo('attendance')}
+              onNavigateToLeave={() => navigateTo('leave')}
+              onNavigateToProducts={() => navigateTo('products')}
             />
           ) : isStoreManager ? (
             <StoreManagerDashboardScreen
               token={token}
               apiUrl={apiUrl}
               user={user}
-              onNavigateToAttendance={() => setSubScreen('attendance')}
-              onNavigateToLeave={() => setSubScreen('leave')}
-              onNavigateToProfile={() => { setActiveTab('profile'); setSubScreen(null); }}
-              onNavigateToProducts={() => setSubScreen('products')}
-              onNavigateToOrders={() => setSubScreen('orderList')}
+              onNavigateToAttendance={() => navigateTo('attendance')}
+              onNavigateToLeave={() => navigateTo('leave')}
+              onNavigateToProfile={() => { setActiveTab('profile'); goBack(); }}
+              onNavigateToProducts={() => navigateTo('products')}
+              onNavigateToOrders={() => navigateTo('orderList')}
             />
           ) : isCrm ? (
             <CrmHomeScreen
@@ -968,55 +1045,52 @@ export default function App() {
               apiUrl={apiUrl}
               user={user}
               activeLogId={activeLogId}
-              onNavigateToAttendance={() => setSubScreen('attendance')}
-              onNavigateToLeave={() => setSubScreen('leave')}
-              onNavigateToProducts={() => setSubScreen('products')}
+              onNavigateToAttendance={() => navigateTo('attendance')}
+              onNavigateToLeave={() => navigateTo('leave')}
+              onNavigateToProducts={() => navigateTo('products')}
               onNavigateToOrder={() => {
-                setPreviousSubScreen(null);
                 setOrderParty(null);
-                setSubScreen('order');
+                navigateTo('order');
               }}
-              onNavigateToIssues={() => setSubScreen('issues')}
-              onNavigateToRecovery={() => setSubScreen('recovery')}
-              onNavigateToRoutePlanner={() => setSubScreen('routePlanner')}
-              onNavigateToParties={() => setSubScreen('crmParties')}
+              onNavigateToIssues={() => navigateTo('issues')}
+              onNavigateToRecovery={() => navigateTo('recovery')}
+              onNavigateToRoutePlanner={() => navigateTo('routePlanner')}
+              onNavigateToParties={() => navigateTo('crmParties')}
             />
           ) : isSalesPartner ? (
             <SalesPartnerDashboardScreen
               token={token}
               apiUrl={apiUrl}
               user={user}
-              onNavigateToParty={() => setSubScreen('party')}
+              onNavigateToParty={() => navigateTo('party')}
               onNavigateToOrder={() => {
-                setPreviousSubScreen(null);
                 setOrderParty(null);
-                setSubScreen('order');
+                navigateTo('order');
               }}
-              onNavigateToOrderList={() => setSubScreen('orderList')}
-              onNavigateToProducts={() => setSubScreen('products')}
-              onNavigateToRoutePlanner={() => setSubScreen('routePlanner')}
+              onNavigateToOrderList={() => navigateTo('orderList')}
+              onNavigateToProducts={() => navigateTo('products')}
+              onNavigateToRoutePlanner={() => navigateTo('routePlanner')}
             />
           ) : (
             <DashboardScreen
               token={token}
               apiUrl={apiUrl}
               activeLogId={activeLogId}
-              onNavigateToAttendance={() => setSubScreen('attendance')}
-              onNavigateToLeave={() => setSubScreen('leave')}
-              onNavigateToParty={() => setSubScreen('party')}
+              onNavigateToAttendance={() => navigateTo('attendance')}
+              onNavigateToLeave={() => navigateTo('leave')}
+              onNavigateToParty={() => navigateTo('party')}
               onNavigateToOrder={() => {
-                setPreviousSubScreen(null);
                 setOrderParty(null);
-                setSubScreen('order');
+                navigateTo('order');
               }}
-              onNavigateToProducts={() => setSubScreen('products')}
-              onNavigateToOrderList={() => setSubScreen('orderList')}
-              onNavigateToOutstandingList={() => setSubScreen('outstandingList')}
-              onNavigateToRoutePlanner={() => setSubScreen('routePlanner')}
-              onNavigateToBeatPlan={() => { setActiveTab('beatPlan'); setSubScreen(null); }}
+              onNavigateToProducts={() => navigateTo('products')}
+              onNavigateToOrderList={() => navigateTo('orderList')}
+              onNavigateToOutstandingList={() => navigateTo('outstandingList')}
+              onNavigateToDeliveryRoute={() => navigateTo('deliveryRoute')}
+              onNavigateToBeatPlan={() => { setActiveTab('beatPlan'); goBack(); }}
               user={user}
               isCso={isCso}
-              onNavigateToTeam={() => setSubScreen('team')}
+              onNavigateToTeam={() => navigateTo('team')}
             />
           )
         ) : activeTab === 'profile' ? (
@@ -1030,13 +1104,13 @@ export default function App() {
             <OrderListScreen
               token={token}
               apiUrl={apiUrl}
-              onBack={() => { setActiveTab('home'); setSubScreen(null); }}
+              onBack={() => { setActiveTab('home'); goBack(); }}
             />
           ) : isSalesPartner ? (
             <OrderListScreen
               token={token}
               apiUrl={apiUrl}
-              onBack={() => { setActiveTab('home'); setSubScreen(null); }}
+              onBack={() => { setActiveTab('home'); goBack(); }}
             />
           ) : (
           <VisitHistoryScreen
@@ -1051,13 +1125,13 @@ export default function App() {
               token={token}
               apiUrl={apiUrl}
               user={user}
-              onBack={() => { setActiveTab('home'); setSubScreen(null); }}
+              onBack={() => { setActiveTab('home'); goBack(); }}
             />
           ) : isSalesPartner ? (
             <PartyRoutePlannerScreen
               token={token}
               apiUrl={apiUrl}
-              onBack={() => { setActiveTab('home'); setSubScreen(null); }}
+              onBack={() => { setActiveTab('home'); goBack(); }}
             />
           ) : (
           <ReportScreen
@@ -1070,7 +1144,7 @@ export default function App() {
             <AttendanceScreen
               token={token}
               apiUrl={apiUrl}
-              onBack={() => { setActiveTab('home'); setSubScreen(null); }}
+              onBack={() => { setActiveTab('home'); goBack(); }}
             />
           ) : (
             <BeatPlanScreen
@@ -1079,9 +1153,12 @@ export default function App() {
               activeLogId={activeLogId}
               user={user}
               onNavigateToPartyProfile={(partyId) => {
-                setPreviousSubScreen('beatPlan');
                 setProfilePartyId(partyId);
-                setSubScreen('partyProfile');
+                navigateTo('partyProfile');
+              }}
+              onNavigateToOrder={(party) => {
+                setOrderParty(party);
+                navigateTo('order');
               }}
             />
           )
@@ -1099,7 +1176,7 @@ export default function App() {
         {/* Left Side Tab Buttons */}
         <TouchableOpacity
           style={styles.tabItem}
-          onPress={() => { setActiveTab('report'); setSubScreen(null); }}
+          onPress={() => { setActiveTab('report'); goBack(); }}
         >
             <Text style={[styles.tabIcon, activeTab === 'report' && styles.activeTabColor]}>{isSalesPartner ? '🗺️' : '📊'}</Text>
           <Text style={[styles.tabLabel, activeTab === 'report' && styles.activeTabColor]}>{isSalesPartner ? 'Route' : 'Report'}</Text>
@@ -1107,7 +1184,7 @@ export default function App() {
 
         <TouchableOpacity
           style={styles.tabItem}
-          onPress={() => { setActiveTab('history'); setSubScreen(null); }}
+          onPress={() => { setActiveTab('history'); goBack(); }}
         >
           <Text style={[styles.tabIcon, activeTab === 'history' && styles.activeTabColor]}>{isSalesPartner ? '📋' : '🕒'}</Text>
           <Text style={[styles.tabLabel, activeTab === 'history' && styles.activeTabColor]}>{isSalesPartner ? 'Orders' : 'History'}</Text>
@@ -1117,7 +1194,7 @@ export default function App() {
         <View style={styles.homeBtnContainer}>
           <TouchableOpacity
             style={styles.floatingHomeBtn}
-            onPress={() => { setActiveTab('home'); setSubScreen(null); }}
+            onPress={() => { setActiveTab('home'); goBack(); }}
           >
             <Text style={styles.homeBtnText}>🏠</Text>
           </TouchableOpacity>
@@ -1126,7 +1203,7 @@ export default function App() {
         {/* Right Side Tab Buttons */}
         <TouchableOpacity
           style={styles.tabItem}
-          onPress={() => { setActiveTab('beatPlan'); setSubScreen(null); }}
+          onPress={() => { setActiveTab('beatPlan'); goBack(); }}
         >
           <Text style={[styles.tabIcon, activeTab === 'beatPlan' && styles.activeTabColor]}>🗺️</Text>
           <Text style={[styles.tabLabel, activeTab === 'beatPlan' && styles.activeTabColor]}>Beat Plan</Text>
@@ -1134,13 +1211,21 @@ export default function App() {
 
         <TouchableOpacity
           style={styles.tabItem}
-          onPress={() => { setActiveTab('profile'); setSubScreen(null); }}
+          onPress={() => { setActiveTab('profile'); goBack(); }}
         >
           <Text style={[styles.tabIcon, activeTab === 'profile' && styles.activeTabColor]}>👤</Text>
           <Text style={[styles.tabLabel, activeTab === 'profile' && styles.activeTabColor]}>Profile</Text>
         </TouchableOpacity>
       </View>
     </SafeAreaView>
+  );
+}
+
+export default function App() {
+  return (
+    <LanguageProvider>
+      <AppShell />
+    </LanguageProvider>
   );
 }
 
@@ -1322,7 +1407,10 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
   tabBar: {
-    height: Platform.OS === 'ios' ? 76 : 78,
+    // Height and padding both follow the real system bar rather than a fixed
+    // guess, so the three-button navigation bar no longer sits on top of the
+    // Report and Profile tabs.
+    height: (Platform.OS === 'ios' ? 56 : 58) + bottomBarPadding(),
     backgroundColor: '#FFFFFF',
     borderTopWidth: 1,
     borderTopColor: '#E2E8F0',
@@ -1330,7 +1418,7 @@ const styles = StyleSheet.create({
     justifyContent: 'space-around',
     alignItems: 'center',
     position: 'relative',
-    paddingBottom: Platform.OS === 'ios' ? 20 : 22,
+    paddingBottom: bottomBarPadding(),
   },
   tabItem: {
     alignItems: 'center',

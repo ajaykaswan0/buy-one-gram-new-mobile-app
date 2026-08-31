@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import { useLanguage } from '../i18n';
+import CreditLimitRequestModal from '../components/CreditLimitRequestModal';
 import {
   StyleSheet,
   Text,
@@ -11,11 +13,17 @@ import {
   Alert,
   Image,
   Modal,
+  RefreshControl,
 } from 'react-native';
 import { scale, verticalScale, responsiveFontSize, maxContainerWidth } from '../utils/responsive';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { packLabel, perKgLabel } from '../utils/packLabel';
+
+// Not a category name anyone can type, so it cannot collide with a real one.
+const ALL_CATEGORIES = '__all__';
 
 export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onBack }) {
+  const { t, term, name } = useLanguage();
   const [selectedParty, setSelectedParty] = useState(preSelectedParty || null);
   const [parties, setParties] = useState([]);
   const [partySearchQuery, setPartySearchQuery] = useState('');
@@ -24,6 +32,7 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
   // Products & Order creation states
   const [products, setProducts] = useState([]);
   const [productSearchQuery, setProductSearchQuery] = useState('');
+  const [selectedCategory, setSelectedCategory] = useState(ALL_CATEGORIES);
   const [loadingProducts, setLoadingProducts] = useState(false);
   const [expandedProduct, setExpandedProduct] = useState(null);
   const [selectedWarehouseId, setSelectedWarehouseId] = useState(null);
@@ -42,8 +51,27 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
   const [paymentTerms, setPaymentTerms] = useState('Immediate');
   const [pickerVisible, setPickerVisible] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  // Offers this salesman may apply, priced by the server against the basket.
+  const [offers, setOffers] = useState([]);
+  const [selectedOfferId, setSelectedOfferId] = useState('');
+  const [offerPickerVisible, setOfferPickerVisible] = useState(false);
+  const [loadingOffers, setLoadingOffers] = useState(false);
+  // The party's ceiling and what it already owes, refreshed on open so the
+  // check is against today's figure and not whatever the list was cached with.
+  const [creditInfo, setCreditInfo] = useState({ limit: 0, outstanding: 0 });
+  const [creditBlock, setCreditBlock] = useState(null);
+  const [creditRequestOpen, setCreditRequestOpen] = useState(false);
 
-  const PAYMENT_OPTIONS = [
+  /**
+   * What the office offers, and the smallest order it will take.
+   *
+   * Both were written into this screen, so adding "Net 90 Days" or raising the
+   * floor meant a release and a reinstall on every phone. They come from
+   * Settings now. The list below is only what is shown until the fetch answers,
+   * and what is fallen back to if it fails - a salesman standing in a shop with
+   * no signal still needs to be able to place an order.
+   */
+  const [paymentOptions, setPaymentOptions] = useState([
     'Immediate',
     'Advance',
     'Cash on Delivery (COD)',
@@ -52,7 +80,27 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
     'Net 30 Days',
     'Net 45 Days',
     'Net 60 Days',
-  ];
+  ]);
+  const [minimumOrderAmount, setMinimumOrderAmount] = useState(0);
+  const [reviewVisible, setReviewVisible] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    fetch(`${apiUrl}/app-settings/company-info`, { headers: { Authorization: `Bearer ${token}` } })
+      .then((r) => r.json())
+      .then((data) => {
+        if (!alive) return;
+        const rules = data?.data?.ordering;
+        if (Array.isArray(rules?.paymentTerms) && rules.paymentTerms.length) {
+          setPaymentOptions(rules.paymentTerms);
+        }
+        setMinimumOrderAmount(Number(rules?.minimumOrderAmount || 0));
+      })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [apiUrl, token]);
+
+  const PAYMENT_OPTIONS = paymentOptions;
 
   // Search parties if not pre-selected
   useEffect(() => {
@@ -78,8 +126,39 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
     if (selectedParty) {
       fetchProducts();
       loadDraftOrder(selectedParty._id);
+      // Seed from the party we were handed, then confirm against the server —
+      // a cached list can be hours old and the limit has to be current.
+      setCreditInfo({
+        limit: Number(selectedParty.creditLimit || 0),
+        outstanding: Number(selectedParty.currentOutstanding || 0),
+      });
+      fetch(`${apiUrl}/parties/${selectedParty._id}`, { headers: { Authorization: `Bearer ${token}` } })
+        .then((res) => res.json())
+        .then((body) => {
+          const fresh = body?.data;
+          if (!fresh) return;
+          setCreditInfo({
+            limit: Number(fresh.creditLimit || 0),
+            outstanding: Number(fresh.currentOutstanding || 0),
+          });
+        })
+        .catch(() => { /* the seeded figures will do */ });
     }
   }, [selectedParty]);
+
+  // Pull down to reload, so the screen can be refreshed in place rather than
+  // by navigating away and back.
+  const [refreshing, setRefreshing] = useState(false);
+  const onPullRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await fetchProducts();
+    } catch (e) {
+      console.log('[Refresh] failed:', e.message);
+    } finally {
+      setRefreshing(false);
+    }
+  }, [fetchProducts]);
 
   const loadInitialParties = async () => {
     setLoadingParties(true);
@@ -278,6 +357,27 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
       newQty = availableStock;
     }
 
+    /**
+     * Stop at the ceiling, not at submit.
+     *
+     * Only an increase is checked — reducing a quantity or removing a line has
+     * to stay possible, otherwise a salesman who tips over the limit would be
+     * unable to bring the order back down again.
+     */
+    const currentQty = Number(orderItems[variantId]?.quantity || 0);
+    if (newQty > currentQty) {
+      const custom = customRates[variantId] !== undefined ? parseFloat(customRates[variantId]) : variant.salesPrice;
+      const rate = isNaN(custom) || custom < variant.salesPrice ? variant.salesPrice : custom;
+      const extra = (newQty - currentQty) * Number(rate || 0);
+      if (wouldExceedCredit(extra)) {
+        setCreditBlock({
+          productName: `${name(product.productName)} ${variant.variantName || ''}`.trim(),
+          extra,
+        });
+        return;
+      }
+    }
+
     setOrderItems(prev => {
       const updated = { ...prev };
       if (newQty <= 0) {
@@ -332,7 +432,7 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
       } else {
         const avail = getResolvedStock(variant._id, variant.sku);
         if (avail === undefined || avail <= 0) {
-          Alert.alert('Out of Stock', `${variant.variantName} is out of stock.`);
+          Alert.alert('Out of Stock', `${name(variant.variantName)} is out of stock.`);
           return updated;
         }
         // Auto-add to order if price is adjusted and stock exists
@@ -446,8 +546,37 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
     });
   };
 
-  // Filter products by search query
+  /**
+   * The categories actually on the shelf, with how many products each holds.
+   *
+   * Built from the catalogue rather than a fixed list, so a category added in
+   * admin turns up here without a release. Counts are shown because "Spices 2"
+   * tells a salesman whether it is worth tapping.
+   */
+  const categories = (() => {
+    const counts = new Map();
+    for (const product of products) {
+      const name = (product.category || '').trim() || 'Uncategorised';
+      counts.set(name, (counts.get(name) || 0) + 1);
+    }
+    return [
+      { name: ALL_CATEGORIES, count: products.length },
+      ...[...counts.entries()]
+        .sort((a, b) => a[0].localeCompare(b[0]))
+        .map(([name, count]) => ({ name, count })),
+    ];
+  })();
+
+  const inSelectedCategory = (product) => {
+    if (selectedCategory === ALL_CATEGORIES) return true;
+    const name = (product.category || '').trim() || 'Uncategorised';
+    return name === selectedCategory;
+  };
+
+  // Both filters apply together: a search inside a category searches that
+  // category, which is what picking one is for.
   const filteredProducts = products.filter((p) => {
+    if (!inSelectedCategory(p)) return false;
     if (!productSearchQuery.trim()) return true;
     const q = productSearchQuery.toLowerCase();
     return (
@@ -462,10 +591,126 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
   const itemsArray = Object.values(orderItems);
   const totalQty = itemsArray.reduce((sum, item) => sum + item.quantity, 0);
   const subTotal = itemsArray.reduce((sum, item) => sum + (item.quantity * item.rate), 0);
-  const taxTotal = itemsArray.reduce((sum, item) => sum + (item.quantity * item.rate * (item.variant.gstPercentage || 0) / 100), 0);
-  const grandTotal = subTotal + taxTotal;
 
-  const handleSubmitOrder = async () => {
+  // The chosen offer's discount, per line, exactly as the server priced it —
+  // the app never works a discount out for itself.
+  const chosenOffer = offers.find(o => String(o.offerId) === String(selectedOfferId) && o.eligible) || null;
+  // Only what can actually be applied is offered for selection; the rest are
+  // shown inside the popup with the reason, never as a pickable row.
+  const eligibleOffers = offers.filter(o => o.eligible);
+  const blockedOffers = offers.filter(o => !o.eligible);
+  const bestOffer = eligibleOffers.reduce(
+    (best, o) => (!best || Number(o.discountAmount) > Number(best.discountAmount) ? o : best),
+    null,
+  );
+  const discountByLine = {};
+  if (chosenOffer) {
+    (chosenOffer.lineDiscounts || []).forEach(entry => { discountByLine[entry.index] = Number(entry.discount || 0); });
+  }
+  const discountTotal = chosenOffer ? Number(chosenOffer.discountAmount || 0) : 0;
+
+  // GST follows the discount down, matching how the order is totalled on save.
+  const taxTotal = itemsArray.reduce((sum, item, index) => {
+    const taxable = (item.quantity * item.rate) - (discountByLine[index] || 0);
+    return sum + (taxable * (item.variant.gstPercentage || 0) / 100);
+  }, 0);
+  const grandTotal = subTotal - discountTotal + taxTotal;
+
+  const paymentTypeCode = paymentTerms === 'Cash on Delivery (COD)' ? 'cod'
+    : paymentTerms === 'Advance' ? 'prepaid' : 'credit';
+
+  const formatMoney = (value) => Number.isFinite(Number(value))
+    ? `₹${Number(value).toLocaleString('en-IN', { maximumFractionDigits: 2 })}`
+    : '₹0';
+
+  /**
+   * What is left on the party's credit, and whether this order fits.
+   *
+   * Only credit terms consume it — cash on delivery and advance are settled at
+   * or before delivery and never become a receivable, which is why the popup
+   * offers COD as the way through rather than simply refusing the order.
+   */
+  const creditLimit = Number(creditInfo.limit || 0);
+  const usesCredit = paymentTypeCode === 'credit';
+  const availableCredit = creditLimit > 0
+    ? Math.max(0, creditLimit - Number(creditInfo.outstanding || 0))
+    : Infinity;
+  const overCreditLimit = usesCredit && creditLimit > 0 && grandTotal > availableCredit;
+
+  /**
+   * Whether one more line would break the ceiling.
+   *
+   * Checked before the item goes in, so the salesman is stopped at the moment
+   * he adds it rather than after he has built the whole order and pressed
+   * submit — which is what the server-side check alone would have done.
+   */
+  const wouldExceedCredit = (addedAmount) => {
+    if (!usesCredit || creditLimit <= 0) return false;
+    return grandTotal + Number(addedAmount || 0) > availableCredit + 0.01;
+  };
+
+  /**
+   * Asks the server which offers apply to the basket and what each is worth.
+   *
+   * Quoted server-side because only it knows the real price-list rates, and
+   * because a discount the app worked out for itself could never be trusted.
+   * Debounced so changing a quantity does not fire a request per tap.
+   */
+  useEffect(() => {
+    const lines = Object.values(orderItems);
+    if (!selectedParty || lines.length === 0) {
+      setOffers([]);
+      return undefined;
+    }
+    let active = true;
+    setLoadingOffers(true);
+    const timer = setTimeout(() => {
+      fetch(`${apiUrl}/order/applicable-offers`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          partyId: selectedParty._id,
+          paymentType: paymentTypeCode,
+          items: lines.map(item => ({
+            productId: item.product._id,
+            variantId: item.variant._id,
+            quantity: item.quantity,
+            rate: item.rate,
+          })),
+        }),
+      })
+        .then(res => res.json())
+        .then(data => { if (active) setOffers(Array.isArray(data?.data) ? data.data : []); })
+        .catch(() => { if (active) setOffers([]); })
+        .finally(() => { if (active) setLoadingOffers(false); });
+    }, 500);
+    return () => { active = false; clearTimeout(timer); };
+  }, [orderItems, selectedParty, paymentTypeCode, apiUrl, token]);
+
+  // Editing the basket can make the chosen offer stop qualifying; clearing it
+  // keeps the total on screen equal to what the server will charge.
+  useEffect(() => {
+    if (!selectedOfferId) return;
+    const still = offers.find(o => String(o.offerId) === String(selectedOfferId));
+    if (offers.length && (!still || !still.eligible)) setSelectedOfferId('');
+  }, [offers, selectedOfferId]);
+
+  // The office's floor, against this order's total. Zero means no floor.
+  const belowMinimum = minimumOrderAmount > 0 && grandTotal < minimumOrderAmount;
+
+  /**
+   * Nothing goes out until it has been read back.
+   *
+   * An order was placed the moment Submit was tapped, so a wrong quantity or the
+   * wrong payment term was only found once the order existed and had to be
+   * cancelled and re-entered. The same tap now shows the whole order — shop,
+   * every line, the discount, the tax, the total and the terms — and the
+   * salesman either confirms it or goes back and changes it.
+   *
+   * The checks run before the review rather than after: there is no sense
+   * reading back an order that is already too small to place.
+   */
+  const openReview = () => {
     if (!selectedParty) {
       Alert.alert('Error', 'Please select a party first.');
       return;
@@ -476,6 +721,22 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
       return;
     }
 
+    // The office sets a floor in Settings. The server refuses below it
+    // too; saying so here means the salesman finds out with the shopkeeper
+    // still in front of him, in time to add something.
+    if (belowMinimum) {
+      Alert.alert(
+        'Order is too small',
+        `The smallest order we take is ₹${minimumOrderAmount.toLocaleString('en-IN')}. This one is ₹${grandTotal.toLocaleString('en-IN')} — add ₹${(minimumOrderAmount - grandTotal).toLocaleString('en-IN')} more.`,
+      );
+      return;
+    }
+
+    setReviewVisible(true);
+  };
+
+  const handleSubmitOrder = async () => {
+    setReviewVisible(false);
     setIsSubmitting(true);
     try {
       const payloadItems = itemsArray.map(item => ({
@@ -489,8 +750,9 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
         partyId: selectedParty._id,
         warehouseId: selectedWarehouseId,
         source: 'phone',
-        paymentType: paymentTerms === 'Cash on Delivery (COD)' ? 'cod' : paymentTerms === 'Advance' ? 'prepaid' : 'credit',
+        paymentType: paymentTypeCode,
         items: payloadItems,
+        offerId: selectedOfferId || null,
         remarks: `Payment Terms: ${paymentTerms}. Notes: ${orderNotes}`,
       };
 
@@ -543,7 +805,12 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
         <Text style={styles.headerTitle}>Create New Order</Text>
       </View>
 
-      <ScrollView contentContainerStyle={styles.container}>
+      <ScrollView
+        contentContainerStyle={styles.container}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onPullRefresh} colors={['#00796B']} tintColor="#00796B" />
+        }
+      >
         {/* Step 1: Party Selection */}
         {!selectedParty ? (
           <View style={styles.stepContainer}>
@@ -570,7 +837,7 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
                       onPress={() => handleSelectParty(party)}
                     >
                       <View style={{ flex: 1 }}>
-                        <Text style={styles.partyName}>{party.partyName}</Text>
+                        <Text style={name(styles.partyName)}>{name(party.partyName)}</Text>
                         <Text style={styles.partyCode}>Code: {party.partyCode} • 📞 {party.mobile}</Text>
                         <Text style={styles.partyAddr}>{party.address}</Text>
                       </View>
@@ -590,7 +857,7 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
                 <Text style={styles.changePartyBtn}>Change Party</Text>
               </TouchableOpacity>
             </View>
-            <Text style={styles.selectedPartyName}>{selectedParty.partyName}</Text>
+            <Text style={styles.selectedPartyName}>{name(selectedParty.partyName)}</Text>
             <Text style={styles.selectedPartyCode}>Code: {selectedParty.partyCode} | Mobile: {selectedParty.mobile}</Text>
             <Text style={styles.selectedPartyAddr}>📍 {selectedParty.address}</Text>
             
@@ -623,12 +890,49 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
               onChangeText={setProductSearchQuery}
             />
 
+            {/*
+              * The shelf, split by category.
+              *
+              * A salesman knows what he wants by aisle before he knows its
+              * name, and scrolling one long catalogue in a shop doorway is
+              * slow. "All" stays first, so the old behaviour is one tap away.
+              */}
+            {categories.length > 2 && (
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.categoryStrip}
+              >
+                {categories.map((category) => {
+                  const active = selectedCategory === category.name;
+                  return (
+                    <TouchableOpacity
+                      key={category.name}
+                      style={[styles.categoryChip, active && styles.categoryChipActive]}
+                      onPress={() => setSelectedCategory(category.name)}
+                    >
+                      <Text style={[styles.categoryChipText, active && styles.categoryChipTextActive]}>
+                        {category.name === ALL_CATEGORIES ? 'All' : category.name}
+                      </Text>
+                      <Text style={[styles.categoryChipCount, active && styles.categoryChipCountActive]}>
+                        {category.count}
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </ScrollView>
+            )}
+
             {loadingProducts ? (
               <ActivityIndicator color="#00796B" style={{ marginVertical: 30 }} />
             ) : (
               <View style={styles.productCatalog}>
                 {filteredProducts.length === 0 ? (
-                  <Text style={styles.emptyText}>No products found in catalog.</Text>
+                  <Text style={styles.emptyText}>
+                    {selectedCategory === ALL_CATEGORIES
+                      ? 'No products found in catalog.'
+                      : `Nothing in ${selectedCategory} matches. Tap All to search everything.`}
+                  </Text>
                 ) : (
                   filteredProducts.map((product) => {
                     const activeVariants = (product.variants || []).filter(
@@ -659,7 +963,7 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
                           )}
                           <View style={{ flex: 1, marginLeft: 10 }}>
                             <Text style={styles.catalogProductName} numberOfLines={1}>
-                              {product.productName}
+                              {name(product.productName)}
                             </Text>
                             <Text style={styles.catalogProductMeta}>
                               {product.brand} • {product.category}
@@ -687,9 +991,17 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
                                 <View key={v._id} style={styles.variantItemRow}>
                                   {/* Variant details */}
                                   <View style={styles.variantMetaBlock}>
-                                    <Text style={styles.catalogVariantName}>{v.variantName}</Text>
+                                    <Text style={styles.catalogVariantName}>
+                                      {name(v.variantName)}
+                                      {/* What a kilo costs, on the packs where the pack
+                                          price alone cannot be compared: a 30kg at 3,150
+                                          against a 1kg at 114. */}
+                                      {perKgLabel(v.salesPrice, v.packSize, v.unit, v.variantName)
+                                        ? '  ' + perKgLabel(v.salesPrice, v.packSize, v.unit, v.variantName)
+                                        : ''}
+                                    </Text>
                                     <Text style={styles.catalogVariantSku}>
-                                      SKU: {v.sku} • {v.packSize} {v.unit}
+                                      SKU: {v.sku} • {packLabel(v.packSize, v.unit, v.variantName)}
                                     </Text>
                                     <Text style={[
                                       styles.stockLabel,
@@ -780,7 +1092,7 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
             <View style={styles.additionalInfoBlock}>
               <Text style={styles.blockTitle}>📝 Payment & Notes</Text>
 
-              <Text style={styles.fieldLabel}>Payment Terms</Text>
+              <Text style={styles.fieldLabel}>{t('Payment Terms')}</Text>
               <TouchableOpacity
                 style={styles.dropdownSelector}
                 onPress={() => setPickerVisible(true)}
@@ -788,6 +1100,157 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
                 <Text style={styles.dropdownSelectorText}>{paymentTerms}</Text>
                 <Text style={styles.dropdownArrow}>▼</Text>
               </TouchableOpacity>
+
+              {/* Offer Picker Modal */}
+              <Modal
+                visible={offerPickerVisible}
+                transparent
+                animationType="fade"
+                onRequestClose={() => setOfferPickerVisible(false)}
+              >
+                <TouchableOpacity
+                  style={styles.modalOverlay}
+                  activeOpacity={1}
+                  onPress={() => setOfferPickerVisible(false)}
+                >
+                  <View style={styles.pickerModalContent}>
+                    <Text style={styles.pickerModalTitle}>Apply an offer</Text>
+                    <Text style={styles.offerModalNote}>
+                      Priced against this order by the server, so what you see is what comes off.
+                    </Text>
+
+                    <ScrollView style={styles.offerModalList}>
+                      {/* Selecting nothing is a real choice, so it gets a row. */}
+                      <TouchableOpacity
+                        style={[styles.offerRow, !selectedOfferId && styles.offerRowActive]}
+                        onPress={() => { setSelectedOfferId(''); setOfferPickerVisible(false); }}
+                      >
+                        <Text style={styles.offerRadio}>{!selectedOfferId ? '\u25cf' : '\u25cb'}</Text>
+                        <View style={styles.offerBody}>
+                          <Text style={styles.offerName}>No offer</Text>
+                          <Text style={styles.offerMeta}>Charge the full price</Text>
+                        </View>
+                      </TouchableOpacity>
+
+                      {eligibleOffers.map((offer) => {
+                        const selected = String(selectedOfferId) === String(offer.offerId);
+                        return (
+                          <TouchableOpacity
+                            key={offer.offerId}
+                            style={[styles.offerRow, selected && styles.offerRowActive]}
+                            onPress={() => {
+                              setSelectedOfferId(selected ? '' : String(offer.offerId));
+                              setOfferPickerVisible(false);
+                            }}
+                          >
+                            <Text style={styles.offerRadio}>{selected ? '\u25cf' : '\u25cb'}</Text>
+                            <View style={styles.offerBody}>
+                              <Text style={styles.offerName}>{offer.name}</Text>
+                              <Text style={styles.offerMeta}>
+                                {offer.discountPercentage}% off
+                                {offer.minAmount > 0 ? ` \u00b7 min \u20b9${offer.minAmount}` : ''}
+                              </Text>
+                            </View>
+                            <Text style={styles.offerSaving}>
+                              {`− ₹${Number(offer.discountAmount).toFixed(2)}`}
+                            </Text>
+                          </TouchableOpacity>
+                        );
+                      })}
+
+                      {eligibleOffers.length === 0 && (
+                        <Text style={styles.offerModalEmpty}>
+                          No offer applies to this order yet.
+                        </Text>
+                      )}
+
+                      {/* Near misses are worth showing: "add ₹500 more" is
+                          something the salesman can act on at the counter. */}
+                      {blockedOffers.length > 0 && (
+                        <>
+                          <Text style={styles.offerModalSection}>Not available yet</Text>
+                          {blockedOffers.map((offer) => (
+                            <View key={offer.offerId} style={[styles.offerRow, styles.offerRowDisabled]}>
+                              <Text style={styles.offerRadio}>{'\u25cb'}</Text>
+                              <View style={styles.offerBody}>
+                                <Text style={styles.offerName}>{offer.name}</Text>
+                                <Text style={styles.offerMeta}>{offer.reason}</Text>
+                              </View>
+                            </View>
+                          ))}
+                        </>
+                      )}
+                    </ScrollView>
+
+                    <TouchableOpacity
+                      style={styles.offerModalClose}
+                      onPress={() => setOfferPickerVisible(false)}
+                    >
+                      <Text style={styles.offerModalCloseText}>{t('Close')}</Text>
+                    </TouchableOpacity>
+                  </View>
+                </TouchableOpacity>
+              </Modal>
+
+              {/* Credit ceiling reached */}
+              <Modal
+                visible={!!creditBlock}
+                transparent
+                animationType="fade"
+                onRequestClose={() => setCreditBlock(null)}
+              >
+                <View style={styles.creditScrim}>
+                  <View style={styles.creditCard}>
+                    <Text style={styles.creditTitle}>{t('Credit limit reached')}</Text>
+                    <Text style={styles.creditBody}>
+                      {name(selectedParty?.partyName)} has a credit limit of {formatMoney(creditLimit)} and already owes{' '}
+                      {formatMoney(creditInfo.outstanding)}, leaving {formatMoney(availableCredit)}.
+                    </Text>
+                    <Text style={styles.creditBody}>
+                      This order is already {formatMoney(grandTotal)}
+                      {creditBlock?.productName ? `, and ${name(creditBlock.productName)} would add ${formatMoney(creditBlock.extra)}` : ''}.
+                    </Text>
+                    <Text style={styles.creditHint}>
+                      To keep going, take this order on Cash on Delivery — it is paid at delivery, so it does not use credit.
+                    </Text>
+
+                    <TouchableOpacity
+                      style={styles.creditPrimaryBtn}
+                      onPress={() => {
+                        setPaymentTerms('Cash on Delivery (COD)');
+                        setCreditBlock(null);
+                      }}
+                    >
+                      <Text style={styles.creditPrimaryBtnText}>{t('Switch to Cash on Delivery')}</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={styles.creditSecondaryBtn}
+                      onPress={() => {
+                        setCreditBlock(null);
+                        setCreditRequestOpen(true);
+                      }}
+                    >
+                      <Text style={styles.creditSecondaryBtnText}>{t('Ask admin to raise the limit')}</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={styles.creditGhostBtn} onPress={() => setCreditBlock(null)}>
+                      <Text style={styles.creditGhostBtnText}>{t('Keep the order as it is')}</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              </Modal>
+
+              <CreditLimitRequestModal
+                visible={creditRequestOpen}
+                onClose={() => setCreditRequestOpen(false)}
+                party={selectedParty}
+                creditLimit={creditLimit}
+                currentOutstanding={creditInfo.outstanding}
+                // Pre-filled with enough to cover what is already owed plus
+                // this order, rounded up — the figure he actually needs.
+                suggested={Math.ceil((Number(creditInfo.outstanding || 0) + grandTotal) / 1000) * 1000}
+                apiUrl={apiUrl}
+                token={token}
+              />
 
               {/* Payment Terms Picker Modal */}
               <Modal
@@ -802,43 +1265,60 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
                   onPress={() => setPickerVisible(false)}
                 >
                   <View style={styles.pickerModalContent}>
-                    <Text style={styles.pickerModalTitle}>Select Payment Terms</Text>
+                    <Text style={styles.pickerModalTitle}>{t('Select Payment Terms')}</Text>
                     <ScrollView style={styles.pickerOptionsList}>
-                      {PAYMENT_OPTIONS.map((opt) => (
-                        <TouchableOpacity
-                          key={opt}
-                          style={[
-                            styles.pickerOptionItem,
-                            paymentTerms === opt && styles.pickerOptionItemActive,
-                          ]}
-                          onPress={() => {
-                            setPaymentTerms(opt);
-                            setPickerVisible(false);
-                          }}
-                        >
-                          <Text
+                      {PAYMENT_OPTIONS.map((opt) => {
+                        // A credit term the party cannot afford is not offered.
+                        // It stays visible with the reason, rather than being
+                        // hidden, so it is clear why the choice is missing.
+                        const termIsCredit = opt !== 'Cash on Delivery (COD)' && opt !== 'Advance';
+                        const blocked = termIsCredit && creditLimit > 0 && grandTotal > availableCredit + 0.01;
+                        return (
+                          <TouchableOpacity
+                            key={opt}
+                            disabled={blocked}
                             style={[
-                              styles.pickerOptionText,
-                              paymentTerms === opt && styles.pickerOptionTextActive,
+                              styles.pickerOptionItem,
+                              paymentTerms === opt && styles.pickerOptionItemActive,
+                              blocked && styles.pickerOptionItemBlocked,
                             ]}
+                            onPress={() => {
+                              setPaymentTerms(opt);
+                              setPickerVisible(false);
+                            }}
                           >
-                            {opt}
-                          </Text>
-                          {paymentTerms === opt && <Text style={styles.pickerCheckmark}>✓</Text>}
-                        </TouchableOpacity>
-                      ))}
+                            <View style={{ flex: 1 }}>
+                              <Text
+                                style={[
+                                  styles.pickerOptionText,
+                                  paymentTerms === opt && styles.pickerOptionTextActive,
+                                  blocked && styles.pickerOptionTextBlocked,
+                                ]}
+                              >
+                                {opt}
+                              </Text>
+                              {blocked && (
+                                <Text style={styles.pickerOptionBlockedNote}>
+                                  Over the credit limit — only {formatMoney(availableCredit)} available
+                                </Text>
+                              )}
+                            </View>
+                            {paymentTerms === opt && <Text style={styles.pickerCheckmark}>✓</Text>}
+                          </TouchableOpacity>
+                        );
+                      })}
                     </ScrollView>
                     <TouchableOpacity
                       style={styles.pickerCloseBtn}
                       onPress={() => setPickerVisible(false)}
                     >
-                      <Text style={styles.pickerCloseBtnText}>Cancel</Text>
+                      <Text style={styles.pickerCloseBtnText}>{t('Cancel')}</Text>
                     </TouchableOpacity>
                   </View>
                 </TouchableOpacity>
               </Modal>
 
-              <Text style={styles.fieldLabel}>Order Notes / Remarks</Text>
+              <Text style={styles.fieldLabel}>{t('Order Notes / Remarks')}</Text>
               <TextInput
                 style={[styles.input, styles.textarea]}
                 placeholder="Enter dispatch instructions or remarks..."
@@ -868,39 +1348,236 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
                   </View>
                 ))}
                 <View style={styles.summaryDivider} />
+
+                {/* One line that opens the picker, rather than a list that
+                    pushes the totals off the screen on a phone. */}
+                <TouchableOpacity
+                  style={styles.offerTrigger}
+                  disabled={loadingOffers || eligibleOffers.length === 0}
+                  onPress={() => setOfferPickerVisible(true)}
+                >
+                  <Text style={styles.offerTriggerIcon}>%</Text>
+                  <View style={styles.offerTriggerBody}>
+                    {chosenOffer ? (
+                      <>
+                        <Text style={styles.offerTriggerTitle}>{chosenOffer.name}</Text>
+                        <Text style={styles.offerTriggerSub}>
+                          {chosenOffer.discountPercentage}% off · saving ₹{Number(chosenOffer.discountAmount).toFixed(2)}
+                        </Text>
+                      </>
+                    ) : (
+                      <>
+                        <Text style={styles.offerTriggerTitle}>
+                          {loadingOffers
+                            ? 'Checking offers…'
+                            : eligibleOffers.length
+                              ? `${eligibleOffers.length} offer${eligibleOffers.length === 1 ? '' : 's'} available`
+                              : 'No offer applies to this order'}
+                        </Text>
+                        {!loadingOffers && bestOffer && (
+                          <Text style={styles.offerTriggerSub}>
+                            Best saves ₹{Number(bestOffer.discountAmount).toFixed(2)}
+                          </Text>
+                        )}
+                      </>
+                    )}
+                  </View>
+                  {chosenOffer ? (
+                    <TouchableOpacity onPress={() => setSelectedOfferId('')}>
+                      <Text style={styles.offerTriggerClear}>{t('Remove')}</Text>
+                    </TouchableOpacity>
+                  ) : (
+                    eligibleOffers.length > 0 && <Text style={styles.offerTriggerChevron}>›</Text>
+                  )}
+                </TouchableOpacity>
+
                 <View style={styles.summaryRow}>
-                  <Text style={styles.summaryLabel}>Sub Total</Text>
+                  <Text style={styles.summaryLabel}>{t('Sub Total')}</Text>
                   <Text style={styles.summaryVal}>₹{subTotal.toFixed(2)}</Text>
                 </View>
+                {discountTotal > 0 && (
+                  <View style={styles.summaryRow}>
+                    <Text style={styles.summaryLabel}>Offer Discount</Text>
+                    <Text style={[styles.summaryVal, styles.offerSaving]}>− ₹{discountTotal.toFixed(2)}</Text>
+                  </View>
+                )}
                 <View style={styles.summaryRow}>
-                  <Text style={styles.summaryLabel}>GST Tax</Text>
+                  <Text style={styles.summaryLabel}>{t('GST Tax')}</Text>
                   <Text style={styles.summaryVal}>₹{taxTotal.toFixed(2)}</Text>
                 </View>
                 <View style={[styles.summaryRow, styles.grandTotalRow]}>
-                  <Text style={styles.grandTotalLabel}>Grand Total</Text>
+                  <Text style={styles.grandTotalLabel}>{t('Grand Total')}</Text>
                   <Text style={styles.grandTotalVal}>₹{grandTotal.toFixed(2)}</Text>
                 </View>
+
+                {/* Where this order stands against the party's credit.
+                    Shown even when there is no limit, because "nothing is
+                    blocking me" and "no limit is set" look identical
+                    otherwise — which is exactly how a missing check hides. */}
+                {!usesCredit ? (
+                  <Text style={styles.creditNote}>
+                    {paymentTerms} — this does not use the party's credit.
+                  </Text>
+                ) : creditLimit > 0 ? (
+                  <Text style={[styles.creditNote, overCreditLimit && styles.creditNoteBad]}>
+                    {overCreditLimit
+                      ? `Over the credit limit. ${formatMoney(availableCredit)} was available; switch to Cash on Delivery to place this.`
+                      : `Credit: ${formatMoney(creditInfo.outstanding)} owed of ${formatMoney(creditLimit)} · ${formatMoney(availableCredit - grandTotal)} left after this order.`}
+                  </Text>
+                ) : (
+                  <Text style={styles.creditNoteMuted}>
+                    No credit limit is set for {name(selectedParty?.partyName)} — nothing is being checked.
+                  </Text>
+                )}
               </View>
+            )}
+
+            {belowMinimum && (
+              <Text style={styles.minimumWarning}>
+                {`Add ₹${(minimumOrderAmount - grandTotal).toLocaleString('en-IN')} more — the smallest order we take is ₹${minimumOrderAmount.toLocaleString('en-IN')}.`}
+              </Text>
             )}
 
             {/* Submit Button */}
             <TouchableOpacity 
               style={[
                 styles.submitBtn,
-                (itemsArray.length === 0 || isSubmitting) && styles.disabledSubmitBtn
+                (itemsArray.length === 0 || isSubmitting || belowMinimum) && styles.disabledSubmitBtn
               ]} 
-              onPress={handleSubmitOrder}
-              disabled={itemsArray.length === 0 || isSubmitting}
+              onPress={openReview}
+              disabled={itemsArray.length === 0 || isSubmitting || belowMinimum}
             >
               {isSubmitting ? (
                 <ActivityIndicator color="#FFFFFF" />
               ) : (
-                <Text style={styles.submitBtnText}>Submit & Place Order</Text>
+                <Text style={styles.submitBtnText}>Review & Place Order</Text>
               )}
             </TouchableOpacity>
           </View>
         )}
-      </ScrollView>
+      </ScrollView>
+
+      {/* The whole order, read back before it is placed. Everything shown here
+          is the same value that goes into the payload. */}
+      <Modal
+        visible={reviewVisible}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setReviewVisible(false)}
+      >
+        <View style={styles.reviewOverlay}>
+          <View style={styles.reviewBox}>
+            <View style={styles.reviewHead}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.reviewTitle}>{t('Check this order')}</Text>
+                <Text style={styles.reviewSubtitle}>{t('Nothing is placed until you confirm')}</Text>
+              </View>
+              <TouchableOpacity
+                onPress={() => setReviewVisible(false)}
+                hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+              >
+                <Text style={styles.reviewClose}>\u2715</Text>
+              </TouchableOpacity>
+            </View>
+
+            <ScrollView style={styles.reviewBody} showsVerticalScrollIndicator>
+              <View style={styles.reviewCard}>
+                <Text style={styles.reviewParty}>{selectedParty?.partyName}</Text>
+                <Text style={styles.reviewPartyMeta}>
+                  {[selectedParty?.partyCode, selectedParty?.area, selectedParty?.city].filter(Boolean).join(' \u00b7 ')}
+                </Text>
+                <View style={styles.reviewTermRow}>
+                  <Text style={styles.reviewTermLabel}>{t('Payment Terms')}</Text>
+                  <Text style={styles.reviewTermValue}>{paymentTerms}</Text>
+                </View>
+              </View>
+
+              <Text style={styles.reviewSection}>
+                {itemsArray.length} {itemsArray.length === 1 ? t('item') : t('items')}
+              </Text>
+
+              {itemsArray.map((item, index) => {
+                const lineDiscount = discountByLine[index] || 0;
+                return (
+                  <View key={`${item.product._id}-${item.variant._id}`} style={styles.reviewLine}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.reviewLineName}>{item.product.productName}</Text>
+                      <Text style={styles.reviewLineVariant}>
+                        {packLabel(item.variant.packSize, item.variant.unit, item.variant.variantName)}
+                        {'  \u00b7  '}
+                        {item.quantity} \u00d7 {formatMoney(item.rate)}
+                      </Text>
+                      {lineDiscount > 0 && (
+                        <Text style={styles.reviewLineOff}>{t('Offer')} \u2212{formatMoney(lineDiscount)}</Text>
+                      )}
+                    </View>
+                    <Text style={styles.reviewLineAmount}>{formatMoney(item.quantity * item.rate)}</Text>
+                  </View>
+                );
+              })}
+
+              <View style={styles.reviewTotals}>
+                <View style={styles.reviewTotalRow}>
+                  <Text style={styles.reviewTotalLabel}>{t('Subtotal')}</Text>
+                  <Text style={styles.reviewTotalValue}>{formatMoney(subTotal)}</Text>
+                </View>
+                {discountTotal > 0 && (
+                  <View style={styles.reviewTotalRow}>
+                    <Text style={[styles.reviewTotalLabel, { color: '#047857' }]}>
+                      {chosenOffer?.name || t('Discount')}
+                    </Text>
+                    <Text style={[styles.reviewTotalValue, { color: '#047857' }]}>
+                      \u2212{formatMoney(discountTotal)}
+                    </Text>
+                  </View>
+                )}
+                <View style={styles.reviewTotalRow}>
+                  <Text style={styles.reviewTotalLabel}>{t('GST')}</Text>
+                  <Text style={styles.reviewTotalValue}>{formatMoney(taxTotal)}</Text>
+                </View>
+                <View style={[styles.reviewTotalRow, styles.reviewGrandRow]}>
+                  <Text style={styles.reviewGrandLabel}>{t('Total')}</Text>
+                  <Text style={styles.reviewGrandValue}>{formatMoney(grandTotal)}</Text>
+                </View>
+              </View>
+
+              {/* Only for a credit sale: cash and advance never touch the limit. */}
+              {paymentTypeCode === 'credit' && creditInfo.limit > 0 && (
+                <Text style={styles.reviewCredit}>
+                  {`${t('On credit')} \u00b7 ${formatMoney(Math.max(0, creditInfo.limit - creditInfo.outstanding - grandTotal))} ${t('of the limit left after this order')}`}
+                </Text>
+              )}
+
+              {orderNotes.trim() ? (
+                <View style={styles.reviewNotes}>
+                  <Text style={styles.reviewNotesLabel}>{t('Notes')}</Text>
+                  <Text style={styles.reviewNotesText}>{orderNotes.trim()}</Text>
+                </View>
+              ) : null}
+            </ScrollView>
+
+            <View style={styles.reviewActions}>
+              <TouchableOpacity
+                style={styles.reviewChangeBtn}
+                onPress={() => setReviewVisible(false)}
+                disabled={isSubmitting}
+              >
+                <Text style={styles.reviewChangeText}>{t('Change something')}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.reviewConfirmBtn, isSubmitting && { opacity: 0.6 }]}
+                onPress={handleSubmitOrder}
+                disabled={isSubmitting}
+              >
+                {isSubmitting
+                  ? <ActivityIndicator color="#FFFFFF" />
+                  : <Text style={styles.reviewConfirmText}>{t('Place this order')}</Text>}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
     </SafeAreaView>
   );
 }
@@ -952,6 +1629,36 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
     letterSpacing: 0.5,
   },
+  categoryStrip: {
+    gap: scale(8),
+    paddingBottom: verticalScale(12),
+    paddingRight: scale(4),
+  },
+  categoryChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: scale(6),
+    paddingHorizontal: scale(14),
+    paddingVertical: verticalScale(8),
+    borderRadius: 999,
+    backgroundColor: '#F1F5F9',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+  },
+  categoryChipActive: { backgroundColor: '#00796B', borderColor: '#00796B' },
+  categoryChipText: { fontSize: responsiveFontSize(12), fontWeight: '700', color: '#475569' },
+  categoryChipTextActive: { color: '#FFFFFF' },
+  categoryChipCount: {
+    fontSize: responsiveFontSize(10),
+    fontWeight: '800',
+    color: '#94A3B8',
+    backgroundColor: '#FFFFFF',
+    borderRadius: 999,
+    paddingHorizontal: scale(6),
+    paddingVertical: 1,
+    overflow: 'hidden',
+  },
+  categoryChipCountActive: { color: '#00796B', backgroundColor: '#E0F2F1' },
   searchInput: {
     height: verticalScale(44),
     backgroundColor: '#F7F9FC',
@@ -1355,6 +2062,81 @@ const styles = StyleSheet.create({
     color: '#2D3748',
     fontWeight: '600',
   },
+  offerBlock: { marginBottom: 12 },
+  offerTrigger: {
+    flexDirection: 'row', alignItems: 'center', gap: 10,
+    paddingVertical: 12, paddingHorizontal: 12, marginBottom: 12,
+    borderWidth: 1, borderColor: '#e2e8f0', borderRadius: 10, backgroundColor: '#fff',
+  },
+  offerTriggerIcon: {
+    width: 26, height: 26, borderRadius: 13, backgroundColor: '#e6f7f5',
+    color: '#00796B', textAlign: 'center', lineHeight: 26, fontWeight: '700',
+  },
+  offerTriggerBody: { flex: 1 },
+  offerTriggerTitle: { fontSize: 13, fontWeight: '600', color: '#0f172a' },
+  offerTriggerSub: { fontSize: 11, color: '#16a34a', marginTop: 2, fontWeight: '600' },
+  offerTriggerChevron: { fontSize: 22, color: '#94a3b8' },
+  offerTriggerClear: { fontSize: 12, color: '#dc2626', fontWeight: '600' },
+  offerModalNote: { fontSize: 11, color: '#64748b', marginBottom: 10, textAlign: 'center' },
+  offerModalList: { maxHeight: 340 },
+  offerModalEmpty: { fontSize: 12, color: '#64748b', textAlign: 'center', paddingVertical: 18 },
+  offerModalSection: {
+    fontSize: 10, fontWeight: '700', color: '#94a3b8',
+    textTransform: 'uppercase', letterSpacing: 0.5, marginTop: 12, marginBottom: 6,
+  },
+  offerModalClose: {
+    marginTop: 12, paddingVertical: 12, borderRadius: 10,
+    backgroundColor: '#f1f5f9', alignItems: 'center',
+  },
+  offerModalCloseText: { fontSize: 14, fontWeight: '600', color: '#0f172a' },
+  offerHeading: { fontSize: 12, fontWeight: '700', color: '#64748b', marginBottom: 6, textTransform: 'uppercase' },
+  offerRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 10,
+    paddingVertical: 10, paddingHorizontal: 12, marginBottom: 6,
+    borderWidth: 1, borderColor: '#e2e8f0', borderRadius: 10, backgroundColor: '#fff',
+  },
+  offerRowActive: { borderColor: '#00bfa5', backgroundColor: '#e6f7f5' },
+  offerRowDisabled: { opacity: 0.55 },
+  offerRadio: { fontSize: 14, color: '#00bfa5' },
+  offerBody: { flex: 1 },
+  offerName: { fontSize: 13, fontWeight: '600', color: '#0f172a' },
+  offerMeta: { fontSize: 11, color: '#64748b', marginTop: 2 },
+  offerSaving: { fontSize: 13, fontWeight: '700', color: '#16a34a' },
+  offerSavingMuted: { fontSize: 13, color: '#94a3b8' },
+  pickerOptionItemBlocked: { opacity: 0.55 },
+  pickerOptionTextBlocked: { color: '#A0AEC0' },
+  pickerOptionBlockedNote: { fontSize: 10.5, color: '#C05621', marginTop: 3 },
+
+  creditScrim: {
+    flex: 1, backgroundColor: 'rgba(0,0,0,0.55)',
+    alignItems: 'center', justifyContent: 'center', padding: 22,
+  },
+  creditCard: {
+    width: '100%', backgroundColor: '#FFFFFF',
+    borderRadius: 16, padding: 22, gap: 10,
+  },
+  creditTitle: { fontSize: 17, fontWeight: '800', color: '#C53030' },
+  creditBody: { fontSize: 13, color: '#2D3748', lineHeight: 19 },
+  creditHint: { fontSize: 12.5, color: '#00695C', lineHeight: 18, marginTop: 2 },
+  creditPrimaryBtn: {
+    marginTop: 12, backgroundColor: '#00796B',
+    paddingVertical: 14, borderRadius: 10, alignItems: 'center',
+  },
+  creditPrimaryBtnText: { color: '#FFFFFF', fontWeight: '800', fontSize: 14 },
+  creditSecondaryBtn: {
+    marginTop: 10, paddingVertical: 13, borderRadius: 10,
+    borderWidth: 1, borderColor: '#00796B', alignItems: 'center',
+  },
+  creditSecondaryBtnText: { color: '#00796B', fontWeight: '800', fontSize: 13.5 },
+  creditGhostBtn: { paddingVertical: 10, alignItems: 'center' },
+  creditGhostBtnText: { color: '#718096', fontWeight: '600', fontSize: 13 },
+
+  creditNote: {
+    marginTop: 10, fontSize: 11.5, color: '#2F855A', lineHeight: 16,
+  },
+  creditNoteBad: { color: '#C53030', fontWeight: '700' },
+  creditNoteMuted: { marginTop: 10, fontSize: 11.5, color: '#A0AEC0', lineHeight: 16 },
+
   grandTotalRow: {
     borderTopWidth: 1,
     borderTopColor: '#E2E8F0',
@@ -1370,6 +2152,48 @@ const styles = StyleSheet.create({
     fontSize: responsiveFontSize(16),
     fontWeight: '800',
     color: '#00796B',
+  },
+  reviewOverlay: { flex: 1, backgroundColor: 'rgba(15,23,42,0.55)', justifyContent: 'flex-end' },
+  reviewBox: { backgroundColor: '#F7F9FC', borderTopLeftRadius: 20, borderTopRightRadius: 20, padding: scale(16), maxHeight: '92%' },
+  reviewHead: { flexDirection: 'row', alignItems: 'flex-start' },
+  reviewTitle: { fontSize: responsiveFontSize(18), fontWeight: '900', color: '#0F172A' },
+  reviewSubtitle: { fontSize: responsiveFontSize(10), color: '#64748B', fontWeight: '700', marginTop: verticalScale(2) },
+  reviewClose: { fontSize: responsiveFontSize(18), color: '#64748B', fontWeight: '900' },
+  reviewBody: { marginTop: verticalScale(12), maxHeight: verticalScale(430) },
+  reviewCard: { backgroundColor: '#FFFFFF', borderRadius: 12, padding: scale(12), borderWidth: 1, borderColor: '#E2E8F0' },
+  reviewParty: { fontSize: responsiveFontSize(14), fontWeight: '900', color: '#0F172A' },
+  reviewPartyMeta: { fontSize: responsiveFontSize(10), color: '#64748B', fontWeight: '700', marginTop: verticalScale(2) },
+  reviewTermRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: verticalScale(10), paddingTop: verticalScale(8), borderTopWidth: 1, borderTopColor: '#E2E8F0' },
+  reviewTermLabel: { fontSize: responsiveFontSize(10), color: '#64748B', fontWeight: '800' },
+  reviewTermValue: { fontSize: responsiveFontSize(11), color: '#0F172A', fontWeight: '900' },
+  reviewSection: { fontSize: responsiveFontSize(11), fontWeight: '900', color: '#0F766E', marginTop: verticalScale(14), marginBottom: verticalScale(8) },
+  reviewLine: { flexDirection: 'row', alignItems: 'flex-start', backgroundColor: '#FFFFFF', borderRadius: 10, padding: scale(10), marginBottom: verticalScale(6), borderWidth: 1, borderColor: '#E2E8F0' },
+  reviewLineName: { fontSize: responsiveFontSize(12), fontWeight: '800', color: '#0F172A' },
+  reviewLineVariant: { fontSize: responsiveFontSize(10), color: '#64748B', fontWeight: '700', marginTop: verticalScale(2) },
+  reviewLineOff: { fontSize: responsiveFontSize(9), color: '#047857', fontWeight: '800', marginTop: verticalScale(2) },
+  reviewLineAmount: { fontSize: responsiveFontSize(12), fontWeight: '900', color: '#0F172A' },
+  reviewTotals: { backgroundColor: '#FFFFFF', borderRadius: 12, padding: scale(12), marginTop: verticalScale(8), borderWidth: 1, borderColor: '#E2E8F0' },
+  reviewTotalRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: verticalScale(6) },
+  reviewTotalLabel: { fontSize: responsiveFontSize(11), color: '#64748B', fontWeight: '700' },
+  reviewTotalValue: { fontSize: responsiveFontSize(11), color: '#0F172A', fontWeight: '800' },
+  reviewGrandRow: { borderTopWidth: 1, borderTopColor: '#E2E8F0', paddingTop: verticalScale(8), marginTop: verticalScale(4), marginBottom: 0 },
+  reviewGrandLabel: { fontSize: responsiveFontSize(13), color: '#0F172A', fontWeight: '900' },
+  reviewGrandValue: { fontSize: responsiveFontSize(16), color: '#0F766E', fontWeight: '900' },
+  reviewCredit: { fontSize: responsiveFontSize(10), color: '#B45309', fontWeight: '800', marginTop: verticalScale(10) },
+  reviewNotes: { backgroundColor: '#FFFFFF', borderRadius: 10, padding: scale(10), marginTop: verticalScale(10), borderWidth: 1, borderColor: '#E2E8F0' },
+  reviewNotesLabel: { fontSize: responsiveFontSize(9), color: '#64748B', fontWeight: '900' },
+  reviewNotesText: { fontSize: responsiveFontSize(11), color: '#334155', marginTop: verticalScale(3) },
+  reviewActions: { flexDirection: 'row', gap: scale(10), marginTop: verticalScale(14) },
+  reviewChangeBtn: { flex: 1, padding: scale(14), borderRadius: 12, backgroundColor: '#E2E8F0', alignItems: 'center' },
+  reviewChangeText: { fontWeight: '900', color: '#475569' },
+  reviewConfirmBtn: { flex: 2, padding: scale(14), borderRadius: 12, backgroundColor: '#0F766E', alignItems: 'center' },
+  reviewConfirmText: { fontWeight: '900', color: '#FFFFFF' },
+  minimumWarning: {
+    color: '#B45309',
+    fontWeight: '700',
+    fontSize: 12,
+    textAlign: 'center',
+    marginBottom: 8,
   },
   submitBtn: {
     height: verticalScale(48),

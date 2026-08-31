@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback} from 'react';
 import {
   StyleSheet,
   Text,
@@ -8,7 +8,12 @@ import {
   SafeAreaView,
   ScrollView,
   Alert,
+  RefreshControl,
+  Modal,
+  Pressable,
+  Platform,
 } from 'react-native';
+import ReactNativeBlobUtil from 'react-native-blob-util';
 import { scale, verticalScale, responsiveFontSize, maxContainerWidth } from '../utils/responsive';
 
 export default function ReportScreen({ token, apiUrl }) {
@@ -21,8 +26,15 @@ export default function ReportScreen({ token, apiUrl }) {
   const [selectedYear, setSelectedYear] = useState(prevMonthDate.getFullYear());
 
   // Dropdown visibility states
-  const [showMonthDropdown, setShowMonthDropdown] = useState(false);
-  const [showYearDropdown, setShowYearDropdown] = useState(false);
+  // '' | 'month' | 'year' — only one list is ever open.
+  const [picker, setPicker] = useState('');
+
+  // Incentive and per-category performance for the chosen month.
+  const [categoryData, setCategoryData] = useState(null);
+  const [categoryError, setCategoryError] = useState('');
+  const [loadingCategories, setLoadingCategories] = useState(true);
+  const [openCategory, setOpenCategory] = useState('');
+  const [downloading, setDownloading] = useState(false);
 
   // Target details state
   const [targetAmount, setTargetAmount] = useState(0);
@@ -57,6 +69,20 @@ export default function ReportScreen({ token, apiUrl }) {
     { label: `${today.getFullYear()}`, value: today.getFullYear() },
     { label: `${today.getFullYear() - 1}`, value: today.getFullYear() - 1 },
   ];
+
+  // Pull down to reload, so the screen can be refreshed in place rather than
+  // by navigating away and back.
+  const [refreshing, setRefreshing] = useState(false);
+  const onPullRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await fetchReportData();
+    } catch (e) {
+      console.log('[Refresh] failed:', e.message);
+    } finally {
+      setRefreshing(false);
+    }
+  }, [fetchReportData]);
 
   const fetchReportData = async () => {
     setLoading(true);
@@ -135,6 +161,127 @@ export default function ReportScreen({ token, apiUrl }) {
     fetchReportData();
   }, [selectedMonth, selectedYear]);
 
+  /**
+   * Incentive and category figures, fetched separately.
+   *
+   * Kept out of the main load so a month with no incentive plan still shows
+   * targets and attendance rather than failing the whole screen.
+   */
+  const loadCategories = useCallback(async () => {
+    setLoadingCategories(true);
+    setCategoryError('');
+    setOpenCategory('');
+    const month = `${selectedYear}-${String(selectedMonth).padStart(2, '0')}`;
+    try {
+      const response = await fetch(`${apiUrl}/incentive/my/categories?month=${month}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+
+      // Read as text first: a server that does not have this endpoint answers
+      // with an HTML error page, and calling .json() on that throws a parser
+      // error that says nothing about what actually went wrong.
+      const raw = await response.text();
+      let body = null;
+      try { body = raw ? JSON.parse(raw) : null; } catch { body = null; }
+
+      if (!body) {
+        throw new Error(response.status === 404
+          ? 'This report is not on the server yet.'
+          : `The server replied ${response.status} without any detail.`);
+      }
+      if (!response.ok || !body.success) {
+        throw new Error(body.message || `The server refused the request (${response.status}).`);
+      }
+
+      setCategoryData(body.data);
+    } catch (e) {
+      // console.log, not warn: warn does not reach logcat in a release build,
+      // which is how this failure stayed invisible the first time.
+      console.log('[Report] category performance failed', month, String(e?.message || e));
+      setCategoryData(null);
+      setCategoryError(String(e?.message || e));
+    } finally {
+      setLoadingCategories(false);
+    }
+  }, [selectedMonth, selectedYear, apiUrl, token]);
+
+  useEffect(() => { loadCategories(); }, [loadCategories]);
+
+  const money = (value) => `₹${Number(value || 0).toLocaleString('en-IN', { maximumFractionDigits: 0 })}`;
+
+  /**
+   * Saves the Monday-to-Saturday sheet into the phone's Downloads folder.
+   *
+   * The file is fetched with plain fetch and written from base64 rather than
+   * handed to react-native-blob-util's downloader, which miscounts bytes
+   * against Content-Length on Android and reports "Download interrupted." for
+   * a file that arrived perfectly well.
+   */
+  const downloadWeeklyReport = async (weekOf) => {
+    if (downloading) return;
+    setDownloading(true);
+    try {
+      const day = weekOf.toISOString().slice(0, 10);
+      const response = await fetch(`${apiUrl}/incentive/my/weekly-report?weekOf=${day}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+
+      if (!response.ok) {
+        // An error comes back as JSON even though a PDF was asked for.
+        const detail = await response.text().catch(() => '');
+        let message = `The server replied ${response.status}.`;
+        try { message = JSON.parse(detail).message || message; } catch { /* not JSON; keep the status */ }
+        throw new Error(message);
+      }
+
+      const blob = await response.blob();
+      if (!blob.size) throw new Error('The report came back empty.');
+
+      const dataUri = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ''));
+        reader.onerror = () => reject(new Error('The report could not be read.'));
+        reader.readAsDataURL(blob);
+      });
+      const base64 = dataUri.slice(dataUri.indexOf(',') + 1);
+
+      const fileName = `incentive-week-${day}.pdf`;
+      const path = `${ReactNativeBlobUtil.fs.dirs.DownloadDir}/${fileName}`;
+      await ReactNativeBlobUtil.fs.writeFile(path, base64, 'base64');
+
+      // Registers it with Android's download manager so it shows up in the
+      // Downloads app rather than only existing as a file on disk.
+      if (Platform.OS === 'android') {
+        await ReactNativeBlobUtil.android.addCompleteDownload({
+          title: fileName,
+          description: 'Weekly incentive report',
+          mime: 'application/pdf',
+          path,
+          showNotification: true,
+        }).catch(() => null);
+      }
+
+      Alert.alert(
+        'Saved',
+        `${fileName} is in your Downloads.`,
+        [
+          { text: 'Open', onPress: () => ReactNativeBlobUtil.android.actionViewIntent(path, 'application/pdf').catch(() => null) },
+          { text: 'Done', style: 'cancel' },
+        ],
+      );
+    } catch (e) {
+      console.log('[Report] weekly report failed', String(e?.message || e));
+      Alert.alert('Not saved', String(e?.message || e));
+    } finally {
+      setDownloading(false);
+    }
+  };
+
+  /** Any day inside this week, and inside the one before it. */
+  const thisWeekDay = new Date();
+  const lastWeekDay = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  const openCategoryRow = (categoryData?.categories || []).find((row) => row.category === openCategory) || null;
+
   // Performance Rating Logic
   const getPerformanceRating = () => {
     if (targetPercentage >= 95 && attendancePercentage >= 90) {
@@ -158,76 +305,55 @@ export default function ReportScreen({ token, apiUrl }) {
         <Text style={styles.topHeaderTitle}>Performance Report</Text>
       </View>
 
-      {/* Selectors Bar */}
+      {/*
+        * Selectors Bar
+        *
+        * The month list opens in a modal rather than as an absolutely
+        * positioned panel below the button. Hanging out of the bar it drew
+        * fine, but Android delivers no touch events to the part of a child
+        * that falls outside its parent's bounds — so all twelve months were
+        * visible while the list could neither be scrolled nor, below the first
+        * row or two, tapped at all.
+        */}
       <View style={styles.selectorsBar}>
-        {/* Month Selector dropdown toggle */}
-        <View style={styles.dropdownContainer}>
-          <TouchableOpacity
-            style={styles.selectorBtn}
-            onPress={() => {
-              setShowMonthDropdown(!showMonthDropdown);
-              setShowYearDropdown(false);
-            }}
-          >
-            <Text style={styles.selectorBtnText}>
-              {selectedMonthObj ? selectedMonthObj.label : 'Select Month'} ▼
-            </Text>
-          </TouchableOpacity>
+        <TouchableOpacity style={[styles.selectorBtn, styles.selectorGrow]} onPress={() => setPicker('month')}>
+          <Text style={styles.selectorBtnText}>
+            {selectedMonthObj ? selectedMonthObj.label : 'Select Month'} ▼
+          </Text>
+        </TouchableOpacity>
 
-          {showMonthDropdown && (
-            <View style={styles.dropdownOptionsList}>
-              <ScrollView nestedScrollEnabled style={{ maxHeight: 200 }}>
-                {months.map((m) => (
+        <TouchableOpacity style={[styles.selectorBtn, styles.selectorGrow]} onPress={() => setPicker('year')}>
+          <Text style={styles.selectorBtnText}>{selectedYear} ▼</Text>
+        </TouchableOpacity>
+      </View>
+
+      <Modal visible={!!picker} transparent animationType="fade" onRequestClose={() => setPicker('')}>
+        <Pressable style={styles.pickerBackdrop} onPress={() => setPicker('')}>
+          {/* Swallows taps inside the sheet, which would otherwise close it. */}
+          <Pressable style={styles.pickerSheet} onPress={() => {}}>
+            <Text style={styles.pickerTitle}>{picker === 'year' ? 'Choose a year' : 'Choose a month'}</Text>
+            <ScrollView style={styles.pickerScroll} showsVerticalScrollIndicator>
+              {(picker === 'year' ? years : months).map((option) => {
+                const active = picker === 'year' ? selectedYear === option.value : selectedMonth === option.value;
+                return (
                   <TouchableOpacity
-                    key={m.value}
-                    style={styles.dropdownOptionItem}
+                    key={option.value}
+                    style={[styles.pickerRow, active && styles.pickerRowActive]}
                     onPress={() => {
-                      setSelectedMonth(m.value);
-                      setShowMonthDropdown(false);
+                      if (picker === 'year') setSelectedYear(option.value);
+                      else setSelectedMonth(option.value);
+                      setPicker('');
                     }}
                   >
-                    <Text style={[styles.optionText, selectedMonth === m.value && styles.activeOptionText]}>
-                      {m.label}
-                    </Text>
+                    <Text style={[styles.optionText, active && styles.activeOptionText]}>{option.label}</Text>
+                    {active && <Text style={styles.pickerTick}>✓</Text>}
                   </TouchableOpacity>
-                ))}
-              </ScrollView>
-            </View>
-          )}
-        </View>
-
-        {/* Year Selector dropdown toggle */}
-        <View style={styles.dropdownContainer}>
-          <TouchableOpacity
-            style={styles.selectorBtn}
-            onPress={() => {
-              setShowYearDropdown(!showYearDropdown);
-              setShowMonthDropdown(false);
-            }}
-          >
-            <Text style={styles.selectorBtnText}>{selectedYear} ▼</Text>
-          </TouchableOpacity>
-
-          {showYearDropdown && (
-            <View style={styles.dropdownOptionsList}>
-              {years.map((y) => (
-                <TouchableOpacity
-                  key={y.value}
-                  style={styles.dropdownOptionItem}
-                  onPress={() => {
-                    setSelectedYear(y.value);
-                    setShowYearDropdown(false);
-                  }}
-                >
-                  <Text style={[styles.optionText, selectedYear === y.value && styles.activeOptionText]}>
-                    {y.label}
-                  </Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-          )}
-        </View>
-      </View>
+                );
+              })}
+            </ScrollView>
+          </Pressable>
+        </Pressable>
+      </Modal>
 
       {loading ? (
         <View style={styles.loadingWrapper}>
@@ -235,7 +361,11 @@ export default function ReportScreen({ token, apiUrl }) {
           <Text style={styles.loadingText}>Analyzing performance metrics...</Text>
         </View>
       ) : (
-        <ScrollView contentContainerStyle={styles.scrollContainer}>
+        <ScrollView contentContainerStyle={styles.scrollContainer}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onPullRefresh} colors={['#00796B']} tintColor="#00796B" />
+        }
+      >
           {/* Performance Grading Card */}
           <View style={[styles.reportCard, styles.gradeCard, { borderColor: performance.color }]}>
             <Text style={styles.cardHeaderTitle}>Performance Overview</Text>
@@ -335,6 +465,141 @@ export default function ReportScreen({ token, apiUrl }) {
               Note: Attendance percentages are computed out of monthly days excluding Sundays.
             </Text>
           </View>
+
+          {/* Incentive Summary */}
+          <View style={styles.reportCard}>
+            <Text style={styles.cardHeaderTitle}>Incentive Summary</Text>
+
+            <View style={styles.incentiveTotalRow}>
+              <View>
+                <Text style={styles.valueLabel}>Total incentive this month</Text>
+                <Text style={styles.incentiveTotal}>{money(categoryData?.totalIncentive)}</Text>
+              </View>
+              {categoryData?.planName ? (
+                <View style={styles.planPill}>
+                  <Text style={styles.planPillText} numberOfLines={1}>{categoryData.planName}</Text>
+                </View>
+              ) : null}
+            </View>
+
+            {loadingCategories ? (
+              <ActivityIndicator color="#00796B" style={{ marginVertical: verticalScale(16) }} />
+            ) : !categoryData ? (
+              <View>
+                <Text style={styles.attendanceNoteText}>
+                  {categoryError || 'Could not load your incentive for this month.'}
+                </Text>
+                <TouchableOpacity style={styles.retryBtn} onPress={loadCategories}>
+                  <Text style={styles.retryBtnText}>Try again</Text>
+                </TouchableOpacity>
+              </View>
+            ) : (
+              <>
+                <Text style={styles.sectionLabel}>Your Performance</Text>
+                <Text style={styles.sectionHint}>Tap a category to see how it is doing.</Text>
+
+                {/*
+                  * One category open at a time.
+                  *
+                  * Six shelves each showing five figures at once is a table
+                  * nobody reads standing in a shop; opened one at a time it is
+                  * a question and an answer.
+                  */}
+                {(categoryData.categories || []).length === 0 ? (
+                  <Text style={styles.attendanceNoteText}>No product categories are set up yet.</Text>
+                ) : (
+                  <View style={styles.categoryChipWrap}>
+                    {categoryData.categories.map((row) => {
+                      const active = openCategory === row.category;
+                      return (
+                        <TouchableOpacity
+                          key={row.category}
+                          style={[styles.catChip, active && styles.catChipActive]}
+                          onPress={() => setOpenCategory(active ? '' : row.category)}
+                        >
+                          <Text style={[styles.catChipText, active && styles.catChipTextActive]}>
+                            {row.category}
+                          </Text>
+                        </TouchableOpacity>
+                      );
+                    })}
+                  </View>
+                )}
+
+                {openCategoryRow && (
+                  <View style={styles.catDetail}>
+                    <Text style={styles.catDetailTitle}>{openCategoryRow.category}</Text>
+
+                    <View style={styles.catRow}>
+                      <Text style={styles.catRowLabel}>Last month sale</Text>
+                      <Text style={styles.catRowValue}>{money(openCategoryRow.lastMonthSale)}</Text>
+                    </View>
+                    <View style={styles.catRow}>
+                      <Text style={styles.catRowLabel}>This month sale</Text>
+                      <Text style={[styles.catRowValue, styles.catRowStrong]}>{money(openCategoryRow.thisMonthSale)}</Text>
+                    </View>
+                    <View style={styles.catRow}>
+                      <Text style={styles.catRowLabel}>Target</Text>
+                      <Text style={styles.catRowValue}>
+                        {openCategoryRow.target > 0 ? money(openCategoryRow.target) : 'Not set'}
+                      </Text>
+                    </View>
+                    <View style={styles.catRow}>
+                      <Text style={styles.catRowLabel}>Shortfall</Text>
+                      <Text style={[
+                        styles.catRowValue,
+                        openCategoryRow.shortfall === 0 && styles.catRowGood,
+                        openCategoryRow.shortfall > 0 && styles.catRowBad,
+                      ]}>
+                        {openCategoryRow.shortfall === null
+                          ? 'No target set'
+                          : openCategoryRow.shortfall === 0
+                            ? 'Target met'
+                            : money(openCategoryRow.shortfall)}
+                      </Text>
+                    </View>
+                    <View style={styles.catRow}>
+                      <Text style={styles.catRowLabel}>Incentive on {openCategoryRow.category}</Text>
+                      <Text style={[styles.catRowValue, styles.catRowIncentive]}>
+                        {money(openCategoryRow.incentive)}
+                      </Text>
+                    </View>
+
+                    {categoryData.incentiveNote ? (
+                      <Text style={styles.attendanceNoteText}>{categoryData.incentiveNote}</Text>
+                    ) : null}
+                  </View>
+                )}
+              </>
+            )}
+
+            {/*
+              * The week as a sheet he can keep.
+              *
+              * Monday to Saturday, because Sunday is not a working day here —
+              * the same week the attendance percentage already counts.
+              */}
+            <Text style={styles.sectionLabel}>Weekly report</Text>
+            <Text style={styles.sectionHint}>Monday to Saturday, saved to your Downloads.</Text>
+            <View style={styles.weekBtnRow}>
+              <TouchableOpacity
+                style={[styles.weekBtn, downloading && styles.weekBtnBusy]}
+                disabled={downloading}
+                onPress={() => downloadWeeklyReport(thisWeekDay)}
+              >
+                {downloading
+                  ? <ActivityIndicator color="#FFFFFF" size="small" />
+                  : <Text style={styles.weekBtnText}>⬇  This week</Text>}
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.weekBtn, styles.weekBtnGhost, downloading && styles.weekBtnBusy]}
+                disabled={downloading}
+                onPress={() => downloadWeeklyReport(lastWeekDay)}
+              >
+                <Text style={[styles.weekBtnText, styles.weekBtnGhostText]}>⬇  Last week</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
         </ScrollView>
       )}
     </SafeAreaView>
@@ -370,10 +635,144 @@ const styles = StyleSheet.create({
     borderBottomColor: '#E2E8F0',
     zIndex: 10,
   },
-  dropdownContainer: {
-    flex: 1,
-    position: 'relative',
+  selectorGrow: { flex: 1 },
+
+  incentiveTotalRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: scale(10),
+    marginBottom: verticalScale(4),
   },
+  incentiveTotal: {
+    fontSize: responsiveFontSize(24),
+    fontWeight: '900',
+    color: '#00796B',
+    marginTop: verticalScale(2),
+  },
+  planPill: {
+    maxWidth: '46%',
+    backgroundColor: '#E0F2F1',
+    borderRadius: 999,
+    paddingHorizontal: scale(10),
+    paddingVertical: verticalScale(5),
+  },
+  planPillText: { fontSize: responsiveFontSize(10.5), fontWeight: '800', color: '#00796B' },
+
+  weekBtnRow: { flexDirection: 'row', gap: scale(10), marginTop: verticalScale(4) },
+  weekBtn: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: verticalScale(12),
+    borderRadius: 10,
+    backgroundColor: '#00796B',
+  },
+  weekBtnGhost: { backgroundColor: '#E0F2F1' },
+  weekBtnBusy: { opacity: 0.6 },
+  weekBtnText: { color: '#FFFFFF', fontWeight: '800', fontSize: responsiveFontSize(12.5) },
+  weekBtnGhostText: { color: '#00796B' },
+  retryBtn: {
+    alignSelf: 'flex-start',
+    marginTop: verticalScale(10),
+    paddingHorizontal: scale(16),
+    paddingVertical: verticalScale(8),
+    borderRadius: 8,
+    backgroundColor: '#E0F2F1',
+  },
+  retryBtnText: { color: '#00796B', fontWeight: '800', fontSize: responsiveFontSize(12) },
+  sectionLabel: {
+    fontSize: responsiveFontSize(11),
+    fontWeight: '900',
+    color: '#64748B',
+    textTransform: 'uppercase',
+    letterSpacing: 0.6,
+    marginTop: verticalScale(18),
+  },
+  sectionHint: {
+    fontSize: responsiveFontSize(11),
+    color: '#94A3B8',
+    marginTop: 2,
+    marginBottom: verticalScale(10),
+  },
+
+  categoryChipWrap: { flexDirection: 'row', flexWrap: 'wrap', gap: scale(8) },
+  catChip: {
+    paddingHorizontal: scale(13),
+    paddingVertical: verticalScale(8),
+    borderRadius: 999,
+    backgroundColor: '#F1F5F9',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+  },
+  catChipActive: { backgroundColor: '#00796B', borderColor: '#00796B' },
+  catChipText: { fontSize: responsiveFontSize(12), fontWeight: '700', color: '#475569' },
+  catChipTextActive: { color: '#FFFFFF' },
+
+  catDetail: {
+    marginTop: verticalScale(14),
+    padding: scale(14),
+    borderRadius: 12,
+    backgroundColor: '#F8FAFC',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+  },
+  catDetailTitle: {
+    fontSize: responsiveFontSize(14),
+    fontWeight: '900',
+    color: '#0F172A',
+    marginBottom: verticalScale(10),
+  },
+  catRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: verticalScale(9),
+    borderBottomWidth: 1,
+    borderBottomColor: '#EEF2F7',
+    gap: scale(10),
+  },
+  catRowLabel: { fontSize: responsiveFontSize(12), color: '#64748B', flex: 1 },
+  catRowValue: { fontSize: responsiveFontSize(13), fontWeight: '700', color: '#334155' },
+  catRowStrong: { color: '#0F172A', fontWeight: '900' },
+  catRowGood: { color: '#059669' },
+  catRowBad: { color: '#DC2626' },
+  catRowIncentive: { color: '#00796B', fontWeight: '900' },
+  pickerBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(15,23,42,0.45)',
+    justifyContent: 'center',
+    padding: scale(28),
+  },
+  pickerSheet: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 14,
+    paddingVertical: verticalScale(10),
+    // Room for twelve months without filling the screen, and short enough
+    // that it is obviously a list that scrolls.
+    maxHeight: '70%',
+  },
+  pickerTitle: {
+    fontSize: responsiveFontSize(12),
+    fontWeight: '800',
+    color: '#64748B',
+    textTransform: 'uppercase',
+    letterSpacing: 0.6,
+    paddingHorizontal: scale(16),
+    paddingBottom: verticalScale(8),
+  },
+  pickerScroll: { flexGrow: 0 },
+  pickerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: verticalScale(13),
+    paddingHorizontal: scale(16),
+    borderBottomWidth: 1,
+    borderBottomColor: '#F1F5F9',
+  },
+  pickerRowActive: { backgroundColor: '#E0F2F1' },
+  pickerTick: { color: '#00796B', fontWeight: '900', fontSize: responsiveFontSize(14) },
   selectorBtn: {
     height: verticalScale(38),
     borderWidth: 1,
@@ -387,29 +786,6 @@ const styles = StyleSheet.create({
     fontSize: responsiveFontSize(13),
     fontWeight: '700',
     color: '#4A5568',
-  },
-  dropdownOptionsList: {
-    position: 'absolute',
-    top: 42,
-    left: 0,
-    right: 0,
-    backgroundColor: '#FFFFFF',
-    borderWidth: 1,
-    borderColor: '#E2E8F0',
-    borderRadius: 8,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.08,
-    shadowRadius: 8,
-    elevation: 4,
-    zIndex: 100,
-    overflow: 'hidden',
-  },
-  dropdownOptionItem: {
-    paddingVertical: verticalScale(10),
-    paddingHorizontal: scale(12),
-    borderBottomWidth: 1,
-    borderBottomColor: '#F7F9FC',
   },
   optionText: {
     fontSize: responsiveFontSize(13.5),

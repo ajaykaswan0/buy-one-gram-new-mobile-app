@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { useLanguage } from '../i18n';
 import {
   StyleSheet,
   Text,
@@ -10,11 +11,13 @@ import {
   TextInput,
   RefreshControl,
   Alert,
+  BackHandler,
 } from 'react-native';
 import { scale, verticalScale, responsiveFontSize, maxContainerWidth } from '../utils/responsive';
 import PartyProfileScreen from './PartyProfileScreen';
 
-export default function OutstandingListScreen({ token, apiUrl, onBack, onNavigateToOrder }) {
+export default function OutstandingListScreen({ token, apiUrl, onBack, onNavigateToOrder, onNavigateToCollection }) {
+  const { t, term, name } = useLanguage();
   const [parties, setParties] = useState([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -72,6 +75,26 @@ export default function OutstandingListScreen({ token, apiUrl, onBack, onNavigat
     return '₹' + Number(amount).toLocaleString('en-IN');
   };
 
+
+  /**
+   * The hardware back button, while a party profile is open inside this screen.
+   *
+   * This screen shows the profile itself rather than asking App to change
+   * screens, so App still believes we are on the list and its own back handler
+   * takes us to the home tab. Handled here, where the state actually lives.
+   *
+   * Registered only while the profile is open, and Android calls the most
+   * recently added handler first, so this runs before App's and stops there.
+   */
+  useEffect(() => {
+    if (!selectedPartyId) return undefined;
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      setSelectedPartyId(null);
+      return true;
+    });
+    return () => subscription.remove();
+  }, [selectedPartyId]);
+
   if (selectedPartyId) {
     return (
       <PartyProfileScreen
@@ -83,6 +106,7 @@ export default function OutstandingListScreen({ token, apiUrl, onBack, onNavigat
           fetchOutstandingParties(); // reload list
         }}
         onNavigateToOrder={onNavigateToOrder}
+        onNavigateToCollection={onNavigateToCollection}
       />
     );
   }
@@ -142,7 +166,7 @@ export default function OutstandingListScreen({ token, apiUrl, onBack, onNavigat
                 >
                   <View style={styles.cardHeader}>
                     <View style={{ flex: 1 }}>
-                      <Text style={styles.partyName}>{party.partyName}</Text>
+                      <Text style={name(styles.partyName)}>{name(party.partyName)}</Text>
                       <Text style={styles.partyCode}>{party.partyCode}</Text>
                     </View>
                     <Text style={styles.outstandingVal}>

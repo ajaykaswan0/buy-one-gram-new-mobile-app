@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback} from 'react';
 import {
   StyleSheet,
   Text,
@@ -8,8 +8,12 @@ import {
   SafeAreaView,
   ActivityIndicator,
   Modal,
+  RefreshControl,
 } from 'react-native';
 import { scale, verticalScale, responsiveFontSize, maxContainerWidth } from '../utils/responsive';
+import { useLanguage, LANGUAGES } from '../i18n';
+import EmployeeIdCard from '../components/EmployeeIdCard';
+import CompanyPolicySheet from '../components/CompanyPolicySheet';
 
 const MONTH_NAMES = [
   'January', 'February', 'March', 'April', 'May', 'June',
@@ -17,11 +21,14 @@ const MONTH_NAMES = [
 ];
 
 export default function ProfileScreen({ user, token, apiUrl, onLogout }) {
+  const { language, setLanguage, t } = useLanguage();
   const [payrolls, setPayrolls] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [selectedSlip, setSelectedSlip] = useState(null);
   const [slipModalVisible, setSlipModalVisible] = useState(false);
+  const [idCardVisible, setIdCardVisible] = useState(false);
+  const [policyVisible, setPolicyVisible] = useState(false);
 
   // Get initials for profile avatar
   const initials = user.name
@@ -32,6 +39,20 @@ export default function ProfileScreen({ user, token, apiUrl, onLogout }) {
         .substring(0, 2)
         .toUpperCase()
     : 'EE';
+
+  // Pull down to reload, so the screen can be refreshed in place rather than
+  // by navigating away and back.
+  const [refreshing, setRefreshing] = useState(false);
+  const onPullRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await loadPayrolls();
+    } catch (e) {
+      console.log('[Refresh] failed:', e.message);
+    } finally {
+      setRefreshing(false);
+    }
+  }, [loadPayrolls]);
 
   const loadPayrolls = async () => {
     setLoading(true);
@@ -90,7 +111,11 @@ export default function ProfileScreen({ user, token, apiUrl, onLogout }) {
 
   return (
     <SafeAreaView style={styles.safeArea}>
-      <ScrollView contentContainerStyle={styles.container}>
+      <ScrollView contentContainerStyle={styles.container}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onPullRefresh} colors={['#00796B']} tintColor="#00796B" />
+        }
+      >
         {/* Profile Info Header */}
         <View style={styles.profileHeader}>
           <View style={styles.avatar}>
@@ -100,6 +125,56 @@ export default function ProfileScreen({ user, token, apiUrl, onLogout }) {
           <Text style={styles.profileRole}>
             {user.roleDisplayName || user.role?.displayName || user.roleName || 'Employee'}
           </Text>
+
+          {/* Something to hold up at a shop door. A shopkeeper handing over
+              cash reasonably wants to see who he is handing it to. */}
+          <View style={styles.profileBtnRow}>
+            <TouchableOpacity style={styles.idCardBtn} onPress={() => setIdCardVisible(true)}>
+              <Text style={styles.idCardBtnText}>🪪  {t('Show ID Card')}</Text>
+            </TouchableOpacity>
+            {/* What the company tells a party, and its certificates — read in
+                the app, never handed to another one. */}
+            <TouchableOpacity style={styles.idCardBtn} onPress={() => setPolicyVisible(true)}>
+              <Text style={styles.idCardBtnText}>📋  {t('Company Policy')}</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+
+        <CompanyPolicySheet
+          visible={policyVisible}
+          apiUrl={apiUrl}
+          token={token}
+          onClose={() => setPolicyVisible(false)}
+        />
+
+        <EmployeeIdCard
+          visible={idCardVisible}
+          user={user}
+          token={token}
+          apiUrl={apiUrl}
+          onClose={() => setIdCardVisible(false)}
+        />
+
+        {/* Language — kept near the top of Profile because it is the first
+            thing someone changes and then never touches again. */}
+        <View style={styles.languageCard}>
+          <Text style={styles.languageTitle}>{t('Choose your language')}</Text>
+          <View style={styles.languageRow}>
+            {LANGUAGES.map((option) => (
+              <TouchableOpacity
+                key={option.code}
+                style={[styles.languageBtn, language === option.code && styles.languageBtnActive]}
+                onPress={() => setLanguage(option.code)}
+              >
+                <Text style={[styles.languageNative, language === option.code && styles.languageTextActive]}>
+                  {option.native}
+                </Text>
+                <Text style={[styles.languageLabel, language === option.code && styles.languageTextActive]}>
+                  {option.label}
+                </Text>
+              </TouchableOpacity>
+            ))}
+          </View>
         </View>
 
         {/* Account Details Card */}
@@ -311,6 +386,16 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     color: '#2D3748',
   },
+  profileBtnRow: { flexDirection: 'row', gap: scale(8), marginTop: verticalScale(10), flexWrap: 'wrap', justifyContent: 'center' },
+  idCardBtn: {
+    paddingHorizontal: scale(14),
+    paddingVertical: verticalScale(8),
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#00796B',
+    backgroundColor: '#E6FFFA',
+  },
+  idCardBtnText: { color: '#00695C', fontWeight: '700', fontSize: responsiveFontSize(11) },
   profileRole: {
     fontSize: responsiveFontSize(13),
     color: '#718096',
@@ -319,6 +404,25 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
     letterSpacing: 0.5,
   },
+  languageCard: {
+    marginHorizontal: scale(16), marginBottom: verticalScale(14),
+    padding: scale(16), borderRadius: 14, backgroundColor: '#FFFFFF',
+    borderWidth: 1, borderColor: '#E2E8F0',
+  },
+  languageTitle: {
+    fontSize: responsiveFontSize(13), fontWeight: '800',
+    color: '#1A202C', marginBottom: verticalScale(10),
+  },
+  languageRow: { flexDirection: 'row', gap: scale(8) },
+  languageBtn: {
+    flex: 1, paddingVertical: verticalScale(11), borderRadius: 10,
+    borderWidth: 1, borderColor: '#E2E8F0', alignItems: 'center',
+  },
+  languageBtnActive: { borderColor: '#00796B', backgroundColor: '#E6F6EF' },
+  languageNative: { fontSize: responsiveFontSize(14), fontWeight: '800', color: '#2D3748' },
+  languageLabel: { fontSize: responsiveFontSize(10), color: '#718096', marginTop: 2 },
+  languageTextActive: { color: '#00695C' },
+
   detailsCard: {
     backgroundColor: '#FFFFFF',
     borderRadius: 16,

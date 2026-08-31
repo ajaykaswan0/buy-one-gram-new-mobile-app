@@ -14,17 +14,32 @@ const actions = [
 ];
 
 export default function CrmHomeScreen({token,apiUrl,user,activeLogId,onNavigateToAttendance,onNavigateToLeave,onNavigateToIssues,onNavigateToRecovery,onNavigateToProducts,onNavigateToOrder,onNavigateToParties,onNavigateToRoutePlanner}) {
-  const [stats,setStats]=useState({visits:0,collection:0}),[loading,setLoading]=useState(true),[refreshing,setRefreshing]=useState(false);
+  const [stats,setStats]=useState({toCollect:0,parties:0,collection:0}),[loading,setLoading]=useState(true),[refreshing,setRefreshing]=useState(false);
   const load=useCallback(async()=>{try{
-    const [visitsResponse,collectionsResponse]=await Promise.all([
-      fetch(`${apiUrl}/visit/my/today`,{headers:{Authorization:`Bearer ${token}`}}),
+    const [recoveryResponse,collectionsResponse]=await Promise.all([
+      fetch(`${apiUrl}/finance/recoveries/overdue?tab=today&page=1&limit=1`,{headers:{Authorization:`Bearer ${token}`}}),
       fetch(`${apiUrl}/collection/my?limit=500`,{headers:{Authorization:`Bearer ${token}`}}),
     ]);
-    const [visitsResult,collectionsResult]=await Promise.all([visitsResponse.json(),collectionsResponse.json()]);
+    const [recoveryResult,collectionsResult]=await Promise.all([recoveryResponse.json(),collectionsResponse.json()]);
     const monthStart=new Date();monthStart.setDate(1);monthStart.setHours(0,0,0,0);
     const collections=Array.isArray(collectionsResult.data)?collectionsResult.data:[];
+
+    /**
+     * What is left on today's round, not what has been done.
+     *
+     * A count of completed visits reads the same whether there were two shops
+     * to see or fifty. The useful number is the one still waiting — it starts
+     * at the day's list and drops by one each time a party is visited and a
+     * date is recorded, so the dashboard says how much of the day is left.
+     *
+     * Counted by party rather than by bill: two overdue invoices at the same
+     * shop are still one call to make.
+     */
+    // The server counts both, so the dashboard asks for one row and reads the
+    // totals off it rather than downloading the whole round to count it.
     setStats({
-      visits:Array.isArray(visitsResult.data)?visitsResult.data.length:0,
+      toCollect:Number(recoveryResult?.meta?.counts?.today||0),
+      parties:Number(recoveryResult?.totalRecords||0),
       collection:collections.filter(item=>new Date(item.collectionDate||item.createdAt)>=monthStart).reduce((sum,item)=>sum+Number(item.amount||0),0),
     });
   }finally{setLoading(false);setRefreshing(false)}},[apiUrl,token]);
@@ -32,7 +47,7 @@ export default function CrmHomeScreen({token,apiUrl,user,activeLogId,onNavigateT
   const handlers={'Attendance':onNavigateToAttendance,'Leave':onNavigateToLeave,'Issues':onNavigateToIssues,'Recovery':onNavigateToRecovery,'Rate List':onNavigateToProducts,'Create Order':onNavigateToOrder,'Assigned Parties':onNavigateToParties,'Plan Route':onNavigateToRoutePlanner};
   return <SafeAreaView style={s.safe}><ScrollView contentContainerStyle={s.body} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={()=>{setRefreshing(true);load()}} colors={['#00796B']}/>}>
     <View style={s.welcome}><View><Text style={s.eyebrow}>CRM WORKSPACE</Text><Text style={s.title}>Hello, {user?.name||'CRM Manager'}</Text><Text style={s.subtitle}>Customer visits, collections and issue resolution</Text></View><View style={[s.online,activeLogId&&s.onlineActive]}><Text style={s.onlineText}>{activeLogId?'ON DUTY':'OFF DUTY'}</Text></View></View>
-    {loading?<ActivityIndicator color="#00796B" style={{margin:30}}/>:<View style={s.stats}><View style={s.stat}><Text style={s.statLabel}>Parties Visited Today</Text><Text style={s.statValue}>{stats.visits}</Text><Text style={s.statHint}>Completed and ongoing visits</Text></View><View style={s.stat}><Text style={s.statLabel}>Collection This Month</Text><Text style={s.statValue}>₹{stats.collection.toLocaleString('en-IN')}</Text><Text style={s.statHint}>Money collected by you</Text></View></View>}
+    {loading?<ActivityIndicator color="#00796B" style={{margin:30}}/>:<View style={s.stats}><TouchableOpacity style={s.stat} onPress={onNavigateToRecovery}><Text style={s.statLabel}>Parties To Collect Today</Text><Text style={s.statValue}>{stats.parties}</Text><Text style={s.statHint}>{stats.parties===0?'Nothing left for today':`${stats.toCollect} bill${stats.toCollect===1?'':'s'} · drops as you record each visit`}</Text></TouchableOpacity><View style={s.stat}><Text style={s.statLabel}>Collection This Month</Text><Text style={s.statValue}>₹{stats.collection.toLocaleString('en-IN')}</Text><Text style={s.statHint}>Money collected by you</Text></View></View>}
     <View style={s.card}><Text style={s.cardTitle}>Quick Actions</Text><View style={s.grid}>{actions.map(([label,icon])=><TouchableOpacity key={label} style={s.action} onPress={handlers[label]}><View style={s.icon}><Text style={s.iconText}>{icon}</Text></View><Text style={s.actionText}>{label}</Text></TouchableOpacity>)}</View></View>
     <View style={s.focus}><Text style={s.focusTitle}>Today’s CRM Focus</Text><Text style={s.focusText}>Open Assigned Parties to view profiles, outstanding bills, collect money, create orders or raise customer issues.</Text></View>
   </ScrollView></SafeAreaView>;

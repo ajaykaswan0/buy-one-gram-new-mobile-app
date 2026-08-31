@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback} from 'react';
 import {
   StyleSheet,
   Text,
@@ -12,9 +12,12 @@ import {
   Alert,
   Linking,
   Platform,
+  RefreshControl,
 } from 'react-native';
 import { scale, verticalScale, responsiveFontSize, maxContainerWidth } from '../utils/responsive';
 import { launchCamera } from 'react-native-image-picker';
+import { getCurrentLocation } from '../services/currentLocation';
+import { useLanguage } from '../i18n';
 import { uploadFile } from '../services/firebaseUploadService';
 
 export default function DriverDashboardScreen({
@@ -25,13 +28,26 @@ export default function DriverDashboardScreen({
   onNavigateToLeave,
   onNavigateToProducts,
 }) {
+  /**
+   * `t` is for our own words; `term` is for the words the API sends back.
+   *
+   * A status like `ready_for_delivery` is a stored value with a real Hindi
+   * equivalent, so it translates. A party or product name does not — "Apex
+   * Supermart 10" is what the shop is called, and rendering it in Devanagari
+   * would stop it matching the paperwork, the invoice and the shopfront.
+   */
+  const { t, term } = useLanguage();
   const [activeRoute, setActiveRoute] = useState(null);
   const [deliveries, setDeliveries] = useState([]);
+  // Where the van is, so the next drop can be the closest one.
+  const [driverAt, setDriverAt] = useState(null);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('route'); // 'route' | 'history'
 
   // Modal states for COD Collection
   const [collectionModalVisible, setCollectionModalVisible] = useState(false);
+  // What the party can still take on credit, asked when the modal opens.
+  const [creditRoom, setCreditRoom] = useState(null);
   const [selectedStop, setSelectedStop] = useState(null);
   const [collectAmount, setCollectAmount] = useState('');
   const [paymentMode, setPaymentMode] = useState('cash');
@@ -48,10 +64,6 @@ export default function DriverDashboardScreen({
   const [failureReason, setFailureReason] = useState('');
   const [failureProof, setFailureProof] = useState(null);
   const [submittingFailure, setSubmittingFailure] = useState(false);
-  const [partialModalVisible, setPartialModalVisible] = useState(false);
-  const [partialRemarks, setPartialRemarks] = useState('');
-  const [partialProof, setPartialProof] = useState(null);
-  const [submittingPartial, setSubmittingPartial] = useState(false);
   const [historyOrderModalVisible, setHistoryOrderModalVisible] = useState(false);
   const [historyOrderDetail, setHistoryOrderDetail] = useState(null);
   const [historyOrderLoading, setHistoryOrderLoading] = useState(false);
@@ -73,6 +85,20 @@ export default function DriverDashboardScreen({
   const orderWeight = (order) => (order?.items || []).reduce(
     (sum, item) => sum + unitWeight(item) * Number(item.quantity || 0), 0
   );
+
+  // Pull down to reload, so the screen can be refreshed in place rather than
+  // by navigating away and back.
+  const [refreshing, setRefreshing] = useState(false);
+  const onPullRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await loadDriverData();
+    } catch (e) {
+      console.log('[Refresh] failed:', e.message);
+    } finally {
+      setRefreshing(false);
+    }
+  }, [loadDriverData]);
 
   const loadDriverData = async () => {
     setLoading(true);
@@ -167,6 +193,61 @@ export default function DriverDashboardScreen({
     }
   }, [token, apiUrl]);
 
+  /**
+   * Straight-line metres between two points.
+   *
+   * Good enough to order a list. A driver does not need road distance to know
+   * which shop is round the corner, and asking a routing service every time the
+   * screen redraws would cost far more than it is worth.
+   */
+  const metresBetween = (a, b) => {
+    if (!a || !b || !a.latitude || !b.latitude) return null;
+    const R = 6371000;
+    const dLat = ((b.latitude - a.latitude) * Math.PI) / 180;
+    const dLng = ((b.longitude - a.longitude) * Math.PI) / 180;
+    const h = Math.sin(dLat / 2) ** 2
+      + Math.cos((a.latitude * Math.PI) / 180) * Math.cos((b.latitude * Math.PI) / 180) * Math.sin(dLng / 2) ** 2;
+    return R * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+  };
+
+  /** The coordinates of whatever a stop is delivering to. */
+  const stopLocation = (stop) => {
+    const party = stop?.order?.partyId || stop?.partyId;
+    const latitude = Number(stop?.latitude ?? party?.location?.latitude);
+    const longitude = Number(stop?.longitude ?? party?.location?.longitude);
+    return Number.isFinite(latitude) && Number.isFinite(longitude) && latitude
+      ? { latitude, longitude } : null;
+  };
+
+  /**
+   * Stops with the nearest first.
+   *
+   * Falls back to the planned sequence when there is no fix yet, and keeps
+   * stops with no coordinates at the end rather than dropping them — a shop
+   * without a pin still has to be delivered to.
+   */
+  const nearestFirst = (stops) => {
+    if (!driverAt) return stops;
+    return stops.slice().sort((a, b) => {
+      const da = metresBetween(driverAt, stopLocation(a));
+      const db = metresBetween(driverAt, stopLocation(b));
+      if (da === null && db === null) return 0;
+      if (da === null) return 1;
+      if (db === null) return -1;
+      return da - db;
+    });
+  };
+
+  useEffect(() => {
+    // One fix when the screen opens. A driver moving between drops can pull to
+    // refresh; polling GPS all day would cost battery for no real gain.
+    let alive = true;
+    getCurrentLocation()
+      .then((position) => { if (alive && position) setDriverAt(position); })
+      .catch(() => { /* no fix, so the planned order stands */ });
+    return () => { alive = false; };
+  }, []);
+
   // Find corresponding Delivery document for an order ID or stop item
   const getDeliveryForOrder = (orderId, stop = null) => {
     if (stop?.deliveryRecord) return stop.deliveryRecord;
@@ -198,7 +279,7 @@ export default function DriverDashboardScreen({
   // Exact user tab rules:
   const assignedStatuses = ['dispatched', 'assigned', 'ready_for_delivery', 'planned', 'confirmed', 'packed', 'warehouse', 'draft'];
   const outForDeliveryStatuses = ['out_for_delivery', 'in_transit', 'outfordelivery'];
-  const completedStatuses = ['delivered', 'cancelled', 'failed', 'returned', 'partial_delivery_return_pending'];
+  const completedStatuses = ['delivered', 'cancelled', 'failed', 'returned'];
 
   const getEffectiveStatus = (stopOrDelivery) => {
     const order = stopOrDelivery?.order || stopOrDelivery?.orderId;
@@ -216,68 +297,39 @@ export default function DriverDashboardScreen({
     return timeB - timeA;
   });
 
-  // 1. Out For Delivery Tab (ALL orders/stops that are in the active route and not completed)
+  // The two working tabs split on one question: is this order on my route?
+  //
+  // Previously both were derived from order status, which meant an order assigned
+  // to a driver but never put on a route could quietly appear in neither list.
   const routeStops = activeRoute?.stops || [];
-  const outForDeliveryMap = new Map();
+  const routeOrderIds = new Set(
+    routeStops.map((stop) => String(stop.order?._id || stop.order || stop._id)),
+  );
 
-  routeStops.forEach((stop) => {
-    const status = getEffectiveStatus(stop);
-    if (!completedStatuses.includes(status)) {
-      const key = String(stop.order?._id || stop.order || stop._id);
-      outForDeliveryMap.set(key, stop);
-    }
-  });
+  // "Ready for Delivery": everything on my route that is not finished yet.
+  const outForDeliveryStops = routeStops.filter(
+    (stop) => !completedStatuses.includes(getEffectiveStatus(stop)),
+  );
 
-  deliveries.forEach((d) => {
-    const status = getEffectiveStatus(d);
-    if (!completedStatuses.includes(status)) {
+  // "Assigned to me": assigned to me but on no route - the gap that used to be
+  // invisible. These are the orders the office has given me that nobody has
+  // planned into a trip.
+  const assignedRouteStops = deliveries
+    .filter((d) => {
       const key = String(d.orderId?._id || d.orderId || d._id);
-      if (!outForDeliveryMap.has(key)) {
-        outForDeliveryMap.set(key, {
-          _id: d._id,
-          order: d.orderId,
-          deliveryRecord: d,
-          party: d.partyId || d.orderId?.partyId,
-          latitude: d.partyId?.location?.latitude,
-          longitude: d.partyId?.location?.longitude,
-          status: d.status,
-        });
-      }
-    }
-  });
-
-  const outForDeliveryStops = Array.from(outForDeliveryMap.values());
-
-  // 2. Assigned Tab (ONLY dispatched, assigned, ready_for_delivery, planned)
-  const assignedMap = new Map();
-
-  routeStops.forEach((stop) => {
-    const status = getEffectiveStatus(stop);
-    if (assignedStatuses.includes(status) && !outForDeliveryStatuses.includes(status) && !completedStatuses.includes(status)) {
-      const key = String(stop.order?._id || stop.order || stop._id);
-      assignedMap.set(key, stop);
-    }
-  });
-
-  deliveries.forEach((d) => {
-    const status = getEffectiveStatus(d);
-    if (assignedStatuses.includes(status) && !outForDeliveryStatuses.includes(status) && !completedStatuses.includes(status)) {
-      const key = String(d.orderId?._id || d.orderId || d._id);
-      if (!assignedMap.has(key)) {
-        assignedMap.set(key, {
-          _id: d._id,
-          order: d.orderId,
-          deliveryRecord: d,
-          party: d.partyId || d.orderId?.partyId,
-          latitude: d.partyId?.location?.latitude,
-          longitude: d.partyId?.location?.longitude,
-          status: d.status,
-        });
-      }
-    }
-  });
-
-  const assignedRouteStops = Array.from(assignedMap.values());
+      if (routeOrderIds.has(key)) return false;
+      return !completedStatuses.includes(getEffectiveStatus(d));
+    })
+    .map((d) => ({
+      _id: d._id,
+      order: d.orderId,
+      deliveryRecord: d.isVirtual ? null : d,
+      party: d.partyId || d.orderId?.partyId,
+      latitude: d.partyId?.location?.latitude || d.orderId?.partyId?.location?.latitude,
+      longitude: d.partyId?.location?.longitude || d.orderId?.partyId?.location?.longitude,
+      status: d.status,
+      notInRoute: true,
+    }));
 
   // Launch optimized Google Maps sequencing for all stops
   const handleOpenGoogleMapsRoute = () => {
@@ -295,7 +347,7 @@ export default function DriverDashboardScreen({
       return delivery?.status === 'out_for_delivery' && stop.latitude && stop.longitude;
     });
     if (stopsList.length === 0) {
-      Alert.alert('No Locations', 'Stops do not have GPS coordinates mapped.');
+      Alert.alert(t('No Locations'), t('Stops do not have GPS coordinates mapped.'));
       return;
     }
 
@@ -307,19 +359,19 @@ export default function DriverDashboardScreen({
 
     const mapsUrl = `https://www.google.com/maps/dir/?api=1&origin=${origin}&destination=${destination}&waypoints=${waypoints}&travelmode=driving`;
     Linking.openURL(mapsUrl).catch(() => {
-      Alert.alert('Error', 'Google Maps could not be opened.');
+      Alert.alert(t('Error'), t('Google Maps could not be opened.'));
     });
   };
 
   // Open single stop directions
   const handleNavigateToStop = (stop) => {
     if (!stop.latitude || !stop.longitude) {
-      Alert.alert('Missing Location', 'Customer location not configured.');
+      Alert.alert(t('Missing Location'), t('Customer location not configured.'));
       return;
     }
     const mapsUrl = `https://www.google.com/maps/dir/?api=1&destination=${stop.latitude},${stop.longitude}&travelmode=driving`;
     Linking.openURL(mapsUrl).catch(() => {
-      Alert.alert('Error', 'Google Maps could not be opened.');
+      Alert.alert(t('Error'), t('Google Maps could not be opened.'));
     });
   };
 
@@ -328,7 +380,7 @@ export default function DriverDashboardScreen({
     const orderObj = stop?.order || stop?.orderId || stop;
     const delivery = getDeliveryForOrder(orderObj?._id || orderObj, stop);
     if (!delivery) {
-      Alert.alert('Error', 'No active delivery record found for this stop.');
+      Alert.alert(t('Error'), t('No active delivery record found for this stop.'));
       return;
     }
 
@@ -340,54 +392,29 @@ export default function DriverDashboardScreen({
     setReceiptPhoto(null);
     setPendingDeliveryPayment(null);
     setBillPhoto(null);
+    setCreditRoom(null);
     setCollectionModalVisible(true);
-  };
 
-  const openPartialDelivery = (stop) => {
-    setSelectedStop(stop);
-    setPartialRemarks('');
-    setPartialProof(null);
-    setPartialModalVisible(true);
-  };
-
-  const capturePartialProof = () => launchCamera(
-    { mediaType: 'photo', quality: 0.8, maxWidth: 1600, maxHeight: 1600, includeBase64: false },
-    (response) => {
-      if (response.didCancel) return;
-      if (response.errorCode) return Alert.alert('Camera Error', response.errorMessage || 'Failed to start camera.');
-      const asset = response.assets?.[0];
-      if (asset) setPartialProof({ uri: asset.uri, fileName: asset.fileName, type: asset.type, fileSize: asset.fileSize });
-    }
-  );
-
-  const submitPartialDelivery = async () => {
-    const order = selectedStop?.order;
-    if (!order?._id) return;
-    if (!partialProof) return Alert.alert('Photo required', 'Take a photo of the party return bill.');
-    setSubmittingPartial(true);
-    try {
-      const uploaded = await uploadFile({
-        file: partialProof,
-        module: 'delivery',
-        relatedModel: 'Order',
-        token,
-        apiUrl,
-        onProgress: (stage) => setUploadProgress(stage),
-      });
-      const response = await fetch(`${apiUrl}/order/${order._id}/partial-delivery`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ proof: uploaded.storagePath, remarks: partialRemarks }),
-      });
-      const data = await response.json();
-      if (!response.ok || !data.success) throw new Error(data.message || 'Could not record partial delivery');
-      setPartialModalVisible(false);
-      Alert.alert('Return recorded', 'Take the undelivered items back to the warehouse for confirmation.');
-      loadDriverData();
-    } catch (error) {
-      Alert.alert('Failed', error.message);
-    } finally {
-      setSubmittingPartial(false);
+    /**
+     * Whether the goods may be left unpaid, asked now rather than found out
+     * later.
+     *
+     * Skip Payment used to be offered on every order: the driver photographed
+     * the bill, tapped skip, waited for the upload, and was then refused because
+     * the party had no credit left. Asked here the button simply is not
+     * available, with the reason on it.
+     *
+     * Asked fresh every time, because a party's outstanding moves through the
+     * day and the figure the route was loaded with is already old.
+     */
+    const orderId = order?._id || orderObj?._id;
+    if (orderId) {
+      fetch(`${apiUrl}/order/${orderId}/credit-room`, { headers: { Authorization: `Bearer ${token}` } })
+        .then((r) => r.json())
+        .then((data) => { if (data?.success) setCreditRoom(data.data); })
+        // A failed check must not block the delivery. The server enforces the
+        // rule when the delivery is submitted either way.
+        .catch(() => {});
     }
   };
 
@@ -423,16 +450,16 @@ export default function DriverDashboardScreen({
 
       const data = await response.json();
       if (response.ok && data.success) {
-        Alert.alert('Success', `Delivery status marked as ${status}!`);
+        Alert.alert(t('Success'), `Delivery status marked as ${status}!`);
         loadDriverData();
         return true;
       } else {
-        Alert.alert('Failed', data.message || 'Could not update delivery.');
+        Alert.alert(t('Failed'), data.message || 'Could not update delivery.');
         return false;
       }
     } catch (e) {
       console.warn('Delivery update error:', e.message);
-      Alert.alert('Error', 'Network connection issue.');
+      Alert.alert(t('Error'), t('Network connection issue.'));
       return false;
     }
   };
@@ -449,7 +476,7 @@ export default function DriverDashboardScreen({
       (response) => {
         if (response.didCancel) return;
         if (response.errorCode) {
-          Alert.alert('Camera Error', response.errorMessage || 'Failed to start camera.');
+          Alert.alert(t('Camera Error'), response.errorMessage || 'Failed to start camera.');
           return;
         }
         const asset = response.assets[0];
@@ -463,17 +490,46 @@ export default function DriverDashboardScreen({
     );
   };
 
+  /**
+   * Straight to the camera once payment is settled.
+   *
+   * A driver standing at a doorway with the bill in one hand should not have to
+   * read a second screen and press "upload" before the camera opens. Both
+   * confirming payment and skipping it now open the camera immediately; the
+   * shot is the last thing between here and the delivery being done.
+   *
+   * If the camera is dismissed, the old screen is shown rather than leaving the
+   * delivery half-finished with nowhere to go.
+   */
   const continueToBillUpload = (payment) => {
     setPendingDeliveryPayment(payment);
     setCollectionModalVisible(false);
-    setBillModalVisible(true);
+
+    launchCamera(
+      { mediaType: 'photo', quality: 0.8, maxWidth: 1600, maxHeight: 1600, includeBase64: false },
+      (response) => {
+        if (response.didCancel) { setBillModalVisible(true); return; }
+        if (response.errorCode) {
+          Alert.alert(t('Camera Error'), response.errorMessage || 'Failed to start camera.');
+          setBillModalVisible(true);
+          return;
+        }
+        const asset = response.assets?.[0];
+        if (!asset) { setBillModalVisible(true); return; }
+        const photo = { uri: asset.uri, fileName: asset.fileName, type: asset.type, fileSize: asset.fileSize };
+        setBillPhoto(photo);
+        // Passed along explicitly: the state set just above has not landed yet
+        // by the time this runs.
+        submitDeliveredBill(payment, photo);
+      }
+    );
   };
 
   const captureBillPhoto = () => launchCamera(
     { mediaType: 'photo', quality: 0.8, maxWidth: 1600, maxHeight: 1600, includeBase64: false },
     (response) => {
       if (response.didCancel) return;
-      if (response.errorCode) return Alert.alert('Camera Error', response.errorMessage || 'Failed to start camera.');
+      if (response.errorCode) return Alert.alert(t('Camera Error'), response.errorMessage || 'Failed to start camera.');
       const asset = response.assets?.[0];
       if (asset) setBillPhoto({ uri: asset.uri, fileName: asset.fileName, type: asset.type, fileSize: asset.fileSize });
     }
@@ -482,19 +538,19 @@ export default function DriverDashboardScreen({
   // Record payment decision first; delivery completes only after bill photo.
   const handleConfirmCODCollection = () => {
     if (!collectAmount.trim()) {
-      Alert.alert('Required', 'Please enter collected amount.');
+      Alert.alert(t('Required'), t('Please enter collected amount.'));
       return;
     }
 
     const order = selectedStop.order;
     const expected = Number(order.netPayableAmount || order.grandTotal || 0);
     if (Number(collectAmount) <= 0 || Number(collectAmount) > expected) {
-      Alert.alert('Mismatched Amount', `Collected amount must match the order total: ₹${expected}`);
+      Alert.alert(t('Mismatched Amount'), `Collected amount must match the order total: ₹${expected}`);
       return;
     }
 
     if (paymentMode !== 'cash' && !transactionRef.trim()) {
-      Alert.alert('Required', paymentMode === 'cheque' ? 'Enter cheque number.' : 'Enter transaction reference.');
+      Alert.alert(t('Required'), paymentMode === 'cheque' ? 'Enter cheque number.' : 'Enter transaction reference.');
       return;
     }
     continueToBillUpload({
@@ -506,26 +562,30 @@ export default function DriverDashboardScreen({
     });
   };
 
-  const submitDeliveredBill = async () => {
+  const submitDeliveredBill = async (paymentOverride = null, photoOverride = null) => {
     const order = selectedStop?.order || selectedStop;
     const delivery = getDeliveryForOrder(order?._id || order, selectedStop);
-    if (!delivery || !billPhoto) return Alert.alert('Bill required', 'Take a photo of the delivered bill.');
+    // Taken as arguments when called straight from the camera, because React
+    // has not applied the state by that point.
+    const payment = paymentOverride || pendingDeliveryPayment;
+    const photo = photoOverride || billPhoto;
+    if (!delivery || !photo) return Alert.alert(t('Bill required'), t('Take a photo of the delivered bill.'));
     setSubmittingCollection(true);
     try {
-      const billUpload = await uploadFile({ file: billPhoto, module: 'delivery', relatedModel: 'Delivery', relatedId: delivery._id, token, apiUrl, onProgress: setUploadProgress });
+      const billUpload = await uploadFile({ file: photo, module: 'delivery', relatedModel: 'Delivery', relatedId: delivery._id, token, apiUrl, onProgress: setUploadProgress });
       let receiptPath;
-      if (receiptPhoto && !pendingDeliveryPayment?.paymentSkipped) {
+      if (receiptPhoto && !payment?.paymentSkipped) {
         const receiptUpload = await uploadFile({ file: receiptPhoto, module: 'delivery', relatedModel: 'Collection', token, apiUrl, onProgress: setUploadProgress });
         receiptPath = receiptUpload.storagePath;
       }
-      const saved = await submitDeliveryStatus(delivery._id, 'delivered', { ...pendingDeliveryPayment, deliveryPhoto: billUpload.storagePath, receiptPhoto: receiptPath, orderId: order?._id || order });
+      const saved = await submitDeliveryStatus(delivery._id, 'delivered', { ...payment, deliveryPhoto: billUpload.storagePath, receiptPhoto: receiptPath, orderId: order?._id || order });
       if (!saved) return;
       setBillModalVisible(false);
       setBillPhoto(null);
       setReceiptPhoto(null);
       setPendingDeliveryPayment(null);
     } catch (error) {
-      Alert.alert('Delivery failed', error.message);
+      Alert.alert(t('Delivery failed'), error.message);
     } finally {
       setSubmittingCollection(false);
       setUploadProgress('');
@@ -553,10 +613,10 @@ export default function DriverDashboardScreen({
       if (response.ok && data.success) {
         setHistoryOrderDetail(data.data);
       } else {
-        Alert.alert('Failed', data.message || 'Could not load order details.');
+        Alert.alert(t('Failed'), data.message || 'Could not load order details.');
       }
     } catch (error) {
-      Alert.alert('Error', 'Could not load order details.');
+      Alert.alert(t('Error'), t('Could not load order details.'));
     } finally {
       setHistoryOrderLoading(false);
     }
@@ -565,7 +625,7 @@ export default function DriverDashboardScreen({
   // Submit delivery failure details
   const handleConfirmFailure = async () => {
     if (!failureReason.trim()) {
-      Alert.alert('Required', 'Please enter reason for failure.');
+      Alert.alert(t('Required'), t('Please enter reason for failure.'));
       return;
     }
 
@@ -601,7 +661,7 @@ export default function DriverDashboardScreen({
     { mediaType: 'photo', quality: 0.8, maxWidth: 1600, maxHeight: 1600, includeBase64: false },
     (response) => {
       if (response.didCancel) return;
-      if (response.errorCode) return Alert.alert('Camera Error', response.errorMessage || 'Failed to start camera.');
+      if (response.errorCode) return Alert.alert(t('Camera Error'), response.errorMessage || 'Failed to start camera.');
       const asset = response.assets?.[0];
       if (asset) setFailureProof({ uri: asset.uri, fileName: asset.fileName, type: asset.type, fileSize: asset.fileSize });
     }
@@ -612,24 +672,24 @@ export default function DriverDashboardScreen({
       {/* Header Banner */}
       <View style={styles.header}>
         <Text style={styles.headerTitle}>🚚 Driver Console</Text>
-        <Text style={styles.headerSubtitle}>Route Assignments & Deliveries</Text>
+        <Text style={styles.headerSubtitle}>{t('Route Assignments & Deliveries')}</Text>
       </View>
 
       {/* Quick Action Navigation Grid */}
       <View style={styles.actionGrid}>
         <TouchableOpacity style={styles.actionBtn} onPress={onNavigateToAttendance}>
           <Text style={styles.actionIcon}>📅</Text>
-          <Text style={styles.actionText}>Attendance</Text>
+          <Text style={styles.actionText}>{t('Attendance')}</Text>
         </TouchableOpacity>
 
         <TouchableOpacity style={styles.actionBtn} onPress={onNavigateToProducts}>
           <Text style={styles.actionIcon}>📋</Text>
-          <Text style={styles.actionText}>Price List</Text>
+          <Text style={styles.actionText}>{t('Price List')}</Text>
         </TouchableOpacity>
 
         <TouchableOpacity style={styles.actionBtn} onPress={onNavigateToLeave}>
           <Text style={styles.actionIcon}>✉️</Text>
-          <Text style={styles.actionText}>Leave Apply</Text>
+          <Text style={styles.actionText}>{t('Leave Apply')}</Text>
         </TouchableOpacity>
       </View>
 
@@ -639,27 +699,27 @@ export default function DriverDashboardScreen({
           style={[styles.tabItem, activeTab === 'route' && styles.activeTab]}
           onPress={() => setActiveTab('route')}
         >
-          <Text style={[styles.tabText, activeTab === 'route' && styles.activeTabText]}>
-            Routes
-          </Text>
+          <Text style={[styles.tabText, activeTab === 'route' && styles.activeTabText]}>{t('Routes')}</Text>
         </TouchableOpacity>
         <TouchableOpacity style={[styles.tabItem, activeTab === 'assigned' && styles.activeTab]} onPress={() => setActiveTab('assigned')}>
-          <Text style={[styles.tabText, activeTab === 'assigned' && styles.activeTabText]}>Assigned</Text>
+          <Text style={[styles.tabText, activeTab === 'assigned' && styles.activeTabText]}>{t('Assigned')}</Text>
         </TouchableOpacity>
         <TouchableOpacity style={[styles.tabItem, activeTab === 'out' && styles.activeTab]} onPress={() => setActiveTab('out')}>
-          <Text style={[styles.tabText, activeTab === 'out' && styles.activeTabText]}>Out for Delivery</Text>
+          <Text style={[styles.tabText, activeTab === 'out' && styles.activeTabText]}>{t('Ready for Delivery')}</Text>
         </TouchableOpacity>
         <TouchableOpacity
           style={[styles.tabItem, activeTab === 'history' && styles.activeTab]}
           onPress={() => setActiveTab('history')}
         >
-          <Text style={[styles.tabText, activeTab === 'history' && styles.activeTabText]}>
-            Delivered History
-          </Text>
+          <Text style={[styles.tabText, activeTab === 'history' && styles.activeTabText]}>{t('Delivered History')}</Text>
         </TouchableOpacity>
       </View>
 
-      <ScrollView contentContainerStyle={styles.container}>
+      <ScrollView contentContainerStyle={styles.container}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onPullRefresh} colors={['#00796B']} tintColor="#00796B" />
+        }
+      >
         {loading ? (
           <ActivityIndicator color="#00796B" size="large" style={{ marginVertical: 40 }} />
         ) : ['route', 'assigned', 'out'].includes(activeTab) ? (
@@ -670,7 +730,7 @@ export default function DriverDashboardScreen({
                 <View style={styles.summaryRow}>
                   <Text style={styles.routeNumberText}>Route: {activeRoute.routeNumber}</Text>
                   <Text style={[styles.statusBadge, styles.activeBadge]}>
-                    {activeRoute.status.toUpperCase()}
+                    {term(activeRoute.status)}
                   </Text>
                 </View>
                 <Text style={styles.routeDetailsText}>
@@ -690,15 +750,17 @@ export default function DriverDashboardScreen({
               </View>}
 
               {activeTab === 'route' && <View style={styles.routeSummaryCard}>
-                <Text style={styles.sectionTitle}>Route configuration</Text>
+                <Text style={styles.sectionTitle}>{t('Route configuration')}</Text>
                 <Text style={styles.routeDetailsText}>Service area: {activeRoute.name}</Text>
                 <Text style={styles.routeDetailsText}>Planned stops: {activeRoute.totalOrders || activeRoute.stops?.length || 0}</Text>
                 <Text style={styles.routeDetailsText}>Estimated distance: {Number(activeRoute.estimatedDistanceKm || 0).toFixed(1)} km</Text>
                 <Text style={styles.routeDetailsText}>Estimated duration: {Math.round(Number(activeRoute.estimatedDurationMinutes || 0))} minutes</Text>
               </View>}
               {activeTab === 'route' && <View>
-                <Text style={styles.sectionTitle}>Orders included in this route</Text>
-                {(activeRoute.stops || []).map((stop, index) => {
+                <Text style={styles.sectionTitle}>
+                  Orders included in this route{driverAt ? ' — nearest first' : ''}
+                </Text>
+                {nearestFirst(activeRoute.stops || []).map((stop, index) => {
                   const order = stop.order;
                   const party = order?.partyId;
                   const delivery = getDeliveryForOrder(order?._id || order);
@@ -711,7 +773,7 @@ export default function DriverDashboardScreen({
                         styles.stopStatusBadge,
                         currentStatus === 'delivered' ? styles.deliveredBadge :
                         currentStatus === 'failed' ? styles.failedBadge : styles.pendingBadge
-                      ]}>{String(currentStatus).replaceAll('_', ' ').toUpperCase()}</Text>
+                      ]}>{term(currentStatus)}</Text>
                     </View>
                     <View style={styles.stopBody}>
                       <Text style={styles.addressText}>📍 {party?.address || 'No Address configured'}</Text>
@@ -744,14 +806,7 @@ export default function DriverDashboardScreen({
                           style={styles.failActionBtn}
                           onPress={() => handleMarkFailed(stop)}
                         >
-                          <Text style={styles.failActionBtnText}>Cancel</Text>
-                        </TouchableOpacity>
-
-                        <TouchableOpacity
-                          style={styles.navigateActionBtn}
-                          onPress={() => openPartialDelivery(stop)}
-                        >
-                          <Text style={styles.navigateActionBtnText}>Partial</Text>
+                          <Text style={styles.failActionBtnText}>{t('Cancel')}</Text>
                         </TouchableOpacity>
 
                         <TouchableOpacity
@@ -764,13 +819,13 @@ export default function DriverDashboardScreen({
                     )}
                     {String(currentStatus).toLowerCase() === 'cancelled' && (
                       <View style={styles.stopActionsRow}>
-                        <Text style={styles.mobileText}>Cancelled order</Text>
+                        <Text style={styles.mobileText}>{t('Cancelled order')}</Text>
                       </View>
                     )}
                   </View>;
                 })}
               </View>}
-              {activeTab !== 'route' && <Text style={styles.sectionTitle}>{activeTab === 'assigned' ? 'Assigned orders' : 'Out for delivery orders from active route'}</Text>}
+              {activeTab !== 'route' && <Text style={styles.sectionTitle}>{activeTab === 'assigned' ? 'Assigned to me, not yet in a route' : 'Ready for delivery - orders on my route'}</Text>}
               {activeTab !== 'route' && (activeTab === 'assigned'
                 ? assignedRouteStops
                 : outForDeliveryStops
@@ -799,7 +854,7 @@ export default function DriverDashboardScreen({
                         currentStatus === 'delivered' ? styles.deliveredBadge :
                         currentStatus === 'failed' ? styles.failedBadge : styles.pendingBadge
                       ]}>
-                        {currentStatus.replace('_', ' ').toUpperCase()}
+                        {term(currentStatus)}
                       </Text>
                     </View>
 
@@ -830,8 +885,8 @@ export default function DriverDashboardScreen({
                     {activeTab === 'assigned' && (
                       <View style={styles.stopActionsRow}>
                         {belongsToActiveRoute
-                          ? <Text style={styles.mobileText}>Open this order from Routes / Out for Delivery to act on it</Text>
-                          : <Text style={styles.mobileText}>Waiting to be added to an active route</Text>}
+                          ? <Text style={styles.mobileText}>{t('Open this order from Routes / Out for Delivery to act on it')}</Text>
+                          : <Text style={styles.mobileText}>{t('Waiting to be added to an active route')}</Text>}
                       </View>
                     )}
                     {(currentStatus === 'out_for_delivery' || currentStatus === 'dispatched' || activeTab === 'out') && (
@@ -847,14 +902,7 @@ export default function DriverDashboardScreen({
                           style={styles.failActionBtn}
                           onPress={() => handleMarkFailed(stop)}
                         >
-                          <Text style={styles.failActionBtnText}>Cancel</Text>
-                        </TouchableOpacity>
-
-                        <TouchableOpacity
-                          style={styles.navigateActionBtn}
-                          onPress={() => openPartialDelivery(stop)}
-                        >
-                          <Text style={styles.navigateActionBtnText}>Partial</Text>
+                          <Text style={styles.failActionBtnText}>{t('Cancel')}</Text>
                         </TouchableOpacity>
 
                         <TouchableOpacity
@@ -872,15 +920,15 @@ export default function DriverDashboardScreen({
           ) : (
             <View style={styles.emptyContainer}>
               <Text style={styles.emptyIcon}>🚚</Text>
-              <Text style={styles.emptyTitle}>No Active Route</Text>
-              <Text style={styles.emptyDesc}>You do not have an active route assigned for today.</Text>
+              <Text style={styles.emptyTitle}>{t('No Active Route')}</Text>
+              <Text style={styles.emptyDesc}>{t('You do not have an active route assigned for today.')}</Text>
             </View>
           )
         ) : completedOrders.length === 0 ? (
           <View style={styles.emptyContainer}>
             <Text style={styles.emptyIcon}>📂</Text>
-            <Text style={styles.emptyTitle}>No Delivered History</Text>
-            <Text style={styles.emptyDesc}>No completed or delivered orders found.</Text>
+            <Text style={styles.emptyTitle}>{t('No Delivered History')}</Text>
+            <Text style={styles.emptyDesc}>{t('No completed or delivered orders found.')}</Text>
           </View>
         ) : (
           <View style={{ gap: 12 }}>
@@ -893,7 +941,7 @@ export default function DriverDashboardScreen({
                 <View style={styles.summaryRow}>
                   <Text style={styles.historyRouteNumber}>Order: {order?.orderNumber || delivery.deliveryNumber || 'Order'}</Text>
                   <Text style={[styles.statusBadge, styles.completedBadge]}>
-                    {currentStatus.replace('_', ' ').toUpperCase()}
+                    {term(currentStatus)}
                   </Text>
                 </View>
                 <Text style={styles.historyMetaText}>
@@ -912,7 +960,7 @@ export default function DriverDashboardScreen({
                   Warehouse: {delivery.warehouseId?.name || delivery.routeId?.warehouse?.name || 'Main Warehouse'}
                 </Text>
                 <TouchableOpacity style={[styles.historyViewBtn, { marginTop: 10 }]} onPress={() => openHistoryOrderDetail(order?._id || order)}>
-                  <Text style={styles.historyViewBtnText}>View Order Details</Text>
+                  <Text style={styles.historyViewBtnText}>{t('View Order Details')}</Text>
                 </TouchableOpacity>
               </View>
               );
@@ -923,7 +971,7 @@ export default function DriverDashboardScreen({
       <Modal visible={historyOrderModalVisible} transparent animationType="fade" onRequestClose={() => setHistoryOrderModalVisible(false)}>
         <View style={styles.modalOverlay}>
           <View style={styles.modalCard}>
-            <Text style={styles.modalTitle}>Order Details</Text>
+            <Text style={styles.modalTitle}>{t('Order Details')}</Text>
             {historyOrderLoading ? (
               <ActivityIndicator color="#00796B" size="large" style={{ marginVertical: 24 }} />
             ) : historyOrderDetail ? (
@@ -932,7 +980,7 @@ export default function DriverDashboardScreen({
                 <Text style={styles.historyMetaText}>Party: {historyOrderDetail.partyId?.partyName || '—'}</Text>
                 <Text style={styles.historyMetaText}>Mobile: {historyOrderDetail.partyId?.mobile || '—'}</Text>
                 <Text style={styles.historyMetaText}>Address: {historyOrderDetail.partyId?.address || '—'}</Text>
-                <Text style={styles.historyMetaText}>Status: {String(historyOrderDetail.status || '').replaceAll('_', ' ').toUpperCase()}</Text>
+                <Text style={styles.historyMetaText}>{t('Status')}: {term(historyOrderDetail.status || '')}</Text>
                 <Text style={styles.historyMetaText}>Payment: {String(historyOrderDetail.paymentType || '—').toUpperCase()}</Text>
                 <Text style={styles.historyMetaText}>Total: ₹{Number(historyOrderDetail.netPayableAmount || historyOrderDetail.grandTotal || 0).toLocaleString('en-IN')}</Text>
                 <Text style={styles.historyMetaText}>Weight: {orderWeight(historyOrderDetail).toFixed(2)} kg</Text>
@@ -947,11 +995,11 @@ export default function DriverDashboardScreen({
                 ))}
               </ScrollView>
             ) : (
-              <Text style={styles.historyMetaText}>No order details found.</Text>
+              <Text style={styles.historyMetaText}>{t('No order details found.')}</Text>
             )}
             <View style={styles.modalActions}>
               <TouchableOpacity style={styles.modalCancelBtn} onPress={() => setHistoryOrderModalVisible(false)}>
-                <Text style={styles.modalCancelBtnText}>Close</Text>
+                <Text style={styles.modalCancelBtnText}>{t('Close')}</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -968,7 +1016,21 @@ export default function DriverDashboardScreen({
         >
           <View style={styles.modalOverlay}>
             <View style={styles.modalCard}>
-              <Text style={styles.modalTitle}>Payment at Delivery</Text>
+              {/*
+                * A way out of the popup.
+                *
+                * It could only be closed by finishing or by the hardware back
+                * button, which on a delivery screen is easy to miss and leaves
+                * a driver stuck mid-doorstep.
+                */}
+              <TouchableOpacity
+                style={styles.modalCloseX}
+                onPress={() => setCollectionModalVisible(false)}
+                hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+              >
+                <Text style={styles.modalCloseXText}>✕</Text>
+              </TouchableOpacity>
+              <Text style={styles.modalTitle}>{t('Payment at Delivery')}</Text>
               <Text style={styles.modalSubtitle}>
                 Please confirm payment from {selectedStop.order?.partyId?.partyName} before delivering.
               </Text>
@@ -976,7 +1038,7 @@ export default function DriverDashboardScreen({
               <View style={styles.divider} />
 
               <View style={{ gap: 12 }}>
-                <Text style={styles.fieldLabel}>Amount Collected (INR)</Text>
+                <Text style={styles.fieldLabel}>{t('Amount Collected (INR)')}</Text>
                 <TextInput
                   style={styles.inputField}
                   value={collectAmount}
@@ -984,7 +1046,7 @@ export default function DriverDashboardScreen({
                   keyboardType="decimal-pad"
                 />
 
-                <Text style={styles.fieldLabel}>Payment Mode *</Text>
+                <Text style={styles.fieldLabel}>{t('Payment Mode *')}</Text>
                 <View style={styles.modeRow}>
                   {['cash', 'upi', 'cheque'].map((mode) => (
                     <TouchableOpacity
@@ -1001,7 +1063,7 @@ export default function DriverDashboardScreen({
 
                 {paymentMode !== 'cash' && (
                   <>
-                    <Text style={styles.fieldLabel}>Reference / Transaction No. *</Text>
+                    <Text style={styles.fieldLabel}>{t('Reference / Transaction No. *')}</Text>
                     <TextInput
                       style={styles.inputField}
                       placeholder="Enter UTR/Txn ID..."
@@ -1012,7 +1074,7 @@ export default function DriverDashboardScreen({
                   </>
                 )}
 
-                <Text style={styles.fieldLabel}>Proof / Receipt Photo (Optional)</Text>
+                <Text style={styles.fieldLabel}>{t('Proof / Receipt Photo (Optional)')}</Text>
                 <TouchableOpacity
                   style={{
                     height: 40,
@@ -1037,14 +1099,26 @@ export default function DriverDashboardScreen({
                 ) : null}
               </View>
 
+              {creditRoom && !creditRoom.canSkip && (
+                <Text style={styles.creditBlocked}>
+                  {`Payment cannot be skipped \u2014 ${creditRoom.partyName} has \u20b9${Number(creditRoom.availableCredit).toLocaleString('en-IN')} of credit left and this order is \u20b9${Number(creditRoom.orderAmount).toLocaleString('en-IN')}. Collect the money to complete this delivery.`}
+                </Text>
+              )}
+              {creditRoom && creditRoom.canSkip && (
+                <Text style={styles.creditAllowed}>
+                  {`If they will not pay now, this becomes a credit sale due in ${creditRoom.creditDays} days${creditRoom.usesOwnTerms ? '' : ' (no terms set on this party)'}.`}
+                </Text>
+              )}
+
               <View style={styles.divider} />
 
               <View style={styles.modalActions}>
                 <TouchableOpacity
-                  style={styles.modalCancelBtn}
+                  style={[styles.modalCancelBtn, creditRoom && !creditRoom.canSkip && { opacity: 0.45 }]}
+                  disabled={Boolean(creditRoom && !creditRoom.canSkip)}
                   onPress={() => continueToBillUpload({ paymentSkipped: true })}
                 >
-                  <Text style={styles.modalCancelBtnText}>Skip Payment</Text>
+                  <Text style={styles.modalCancelBtnText}>{t('Skip Payment')}</Text>
                 </TouchableOpacity>
 
                 <TouchableOpacity
@@ -1060,7 +1134,7 @@ export default function DriverDashboardScreen({
                       </Text>
                     </View>
                   ) : (
-                    <Text style={styles.modalConfirmBtnText}>Continue to Bill</Text>
+                    <Text style={styles.modalConfirmBtnText}>{t('Continue to Bill')}</Text>
                   )}
                 </TouchableOpacity>
               </View>
@@ -1073,18 +1147,25 @@ export default function DriverDashboardScreen({
         <Modal visible={billModalVisible} transparent animationType="fade" onRequestClose={() => setBillModalVisible(false)}>
           <View style={styles.modalOverlay}>
             <View style={styles.modalCard}>
-              <Text style={styles.modalTitle}>Upload Delivered Bill</Text>
+              <TouchableOpacity
+                style={styles.modalCloseX}
+                onPress={() => { setBillModalVisible(false); setBillPhoto(null); }}
+                hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+              >
+                <Text style={styles.modalCloseXText}>✕</Text>
+              </TouchableOpacity>
+              <Text style={styles.modalTitle}>{t('Upload Delivered Bill')}</Text>
               <Text style={styles.modalSubtitle}>Take a clear photo of the bill handed to the party. This photo is mandatory for every delivered order.</Text>
               <TouchableOpacity style={styles.navigateActionBtn} onPress={captureBillPhoto}>
                 <Text style={styles.navigateActionBtnText}>{billPhoto ? 'Retake Bill Photo' : 'Take Bill Photo *'}</Text>
               </TouchableOpacity>
-              {billPhoto && <Text style={[styles.fieldLabel, { color: '#276749', marginTop: 8 }]}>Bill photo attached</Text>}
+              {billPhoto && <Text style={[styles.fieldLabel, { color: '#276749', marginTop: 8 }]}>{t('Bill photo attached')}</Text>}
               <View style={styles.modalActions}>
                 <TouchableOpacity style={styles.modalCancelBtn} onPress={() => { setBillModalVisible(false); setCollectionModalVisible(true); }}>
-                  <Text style={styles.modalCancelBtnText}>Back</Text>
+                  <Text style={styles.modalCancelBtnText}>{t('Back')}</Text>
                 </TouchableOpacity>
                 <TouchableOpacity style={styles.modalConfirmBtn} disabled={submittingCollection || !billPhoto} onPress={submitDeliveredBill}>
-                  {submittingCollection ? <ActivityIndicator color="#fff" /> : <Text style={styles.modalConfirmBtnText}>Upload & Deliver</Text>}
+                  {submittingCollection ? <ActivityIndicator color="#fff" /> : <Text style={styles.modalConfirmBtnText}>{t('Upload & Deliver')}</Text>}
                 </TouchableOpacity>
               </View>
             </View>
@@ -1092,28 +1173,29 @@ export default function DriverDashboardScreen({
         </Modal>
       )}
 
-      {selectedStop && (
-        <Modal visible={partialModalVisible} transparent animationType="fade" onRequestClose={() => setPartialModalVisible(false)}>
-          <View style={styles.modalOverlay}>
-            <View style={styles.modalCard}>
-              <Text style={styles.modalTitle}>Partial delivery</Text>
-              <Text style={styles.modalSubtitle}>Take a photo of the party return bill. Warehouse will verify item quantities and create the credit note.</Text>
-              <ScrollView style={{ maxHeight: 330 }}>
-                <TouchableOpacity style={styles.navigateActionBtn} onPress={capturePartialProof}><Text style={styles.navigateActionBtnText}>{partialProof ? 'Retake Return Bill Photo' : 'Take Return Bill Photo *'}</Text></TouchableOpacity>
-                {partialProof && <Text style={[styles.fieldLabel, { color: '#276749', marginTop: 8 }]}>Photo attached</Text>}
-                <Text style={[styles.fieldLabel, { marginTop: 12 }]}>Driver remarks</Text>
-                <TextInput style={[styles.inputField, { height: 70, textAlignVertical: 'top' }]} multiline value={partialRemarks} onChangeText={setPartialRemarks} />
-              </ScrollView>
-              <View style={styles.modalActions}>
-                <TouchableOpacity style={styles.modalCancelBtn} onPress={() => setPartialModalVisible(false)}><Text style={styles.modalCancelBtnText}>Cancel</Text></TouchableOpacity>
-                <TouchableOpacity style={styles.modalConfirmBtn} disabled={submittingPartial} onPress={submitPartialDelivery}>{submittingPartial ? <ActivityIndicator color="#fff" /> : <Text style={styles.modalConfirmBtnText}>Record & return</Text>}</TouchableOpacity>
-              </View>
-            </View>
-          </View>
-        </Modal>
-      )}
 
       {/* Delivery Cancel Reason Modal */}
+      {/*
+        * Something on screen while the bill is going up.
+        *
+        * The camera closes the moment the shot is taken and the upload happens
+        * with no modal open, so the driver was dropped back to the stop with
+        * its Maps / Cancel / Deliver buttons and reasonably concluded it had
+        * failed — and pressed Deliver again. This blocks the screen until the
+        * delivery is actually saved.
+        */}
+      <Modal visible={submittingCollection} transparent animationType="fade" onRequestClose={() => {}}>
+        <View style={styles.uploadingOverlay}>
+          <View style={styles.uploadingCard}>
+            <ActivityIndicator size="large" color="#00796B" />
+            <Text style={styles.uploadingTitle}>{t('Saving delivery…')}</Text>
+            <Text style={styles.uploadingText}>
+              {uploadProgress || t('Sending the bill photo. Please wait.')}
+            </Text>
+          </View>
+        </View>
+      </Modal>
+
       {selectedStop && (
         <Modal
           visible={failureModalVisible}
@@ -1123,7 +1205,7 @@ export default function DriverDashboardScreen({
         >
           <View style={styles.modalOverlay}>
             <View style={styles.modalCard}>
-              <Text style={styles.modalTitle}>Cancel Delivery</Text>
+              <Text style={styles.modalTitle}>{t('Cancel Delivery')}</Text>
               <Text style={styles.modalSubtitle}>
                 Add a remark and proof photo for order #{selectedStop.order?.orderNumber}.
               </Text>
@@ -1131,7 +1213,7 @@ export default function DriverDashboardScreen({
               <View style={styles.divider} />
 
               <View style={{ gap: 12 }}>
-                <Text style={styles.fieldLabel}>Cancellation Remark *</Text>
+                <Text style={styles.fieldLabel}>{t('Cancellation Remark *')}</Text>
                 <TextInput
                   style={[styles.inputField, { height: 80, textAlignVertical: 'top' }]}
                   placeholder="e.g. Customer refused, item missing, address issue..."
@@ -1142,7 +1224,7 @@ export default function DriverDashboardScreen({
                 />
 
                 <View style={{ gap: 8 }}>
-                  <Text style={styles.fieldLabel}>Proof Photo</Text>
+                  <Text style={styles.fieldLabel}>{t('Proof Photo')}</Text>
                   <TouchableOpacity style={styles.navigateActionBtn} onPress={captureFailureProof} activeOpacity={0.8}>
                     <Text style={styles.navigateActionBtnText}>
                       {failureProof ? 'Change Proof Photo' : 'Attach Proof Photo'}
@@ -1153,9 +1235,7 @@ export default function DriverDashboardScreen({
                       Attached: {failureProof.fileName || failureProof.uri?.split('/').pop() || 'Photo'}
                     </Text>
                   ) : (
-                    <Text style={styles.helperText}>
-                      Optional, but helpful for admin and warehouse review.
-                    </Text>
+                    <Text style={styles.helperText}>{t('Optional, but helpful for admin and warehouse review.')}</Text>
                   )}
                 </View>
               </View>
@@ -1167,7 +1247,7 @@ export default function DriverDashboardScreen({
                   style={styles.modalCancelBtn}
                   onPress={() => setFailureModalVisible(false)}
                 >
-                  <Text style={styles.modalCancelBtnText}>Cancel</Text>
+                  <Text style={styles.modalCancelBtnText}>{t('Cancel')}</Text>
                 </TouchableOpacity>
 
                 <TouchableOpacity
@@ -1178,7 +1258,7 @@ export default function DriverDashboardScreen({
                   {submittingFailure ? (
                     <ActivityIndicator color="#FFFFFF" size="small" />
                   ) : (
-                    <Text style={styles.modalConfirmBtnText}>Save Cancel</Text>
+                    <Text style={styles.modalConfirmBtnText}>{t('Save Cancel')}</Text>
                   )}
                 </TouchableOpacity>
               </View>
@@ -1573,6 +1653,37 @@ const styles = StyleSheet.create({
     borderColor: '#E2E8F0',
     padding: scale(20),
   },
+  uploadingOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(15,23,42,0.55)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 32,
+  },
+  uploadingCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 16,
+    paddingVertical: 28,
+    paddingHorizontal: 32,
+    alignItems: 'center',
+    gap: 12,
+    minWidth: 240,
+  },
+  uploadingTitle: { fontSize: 16, fontWeight: '800', color: '#0F172A' },
+  uploadingText: { fontSize: 13, color: '#64748B', textAlign: 'center', lineHeight: 19 },
+  modalCloseX: {
+    position: 'absolute',
+    top: 10,
+    right: 12,
+    width: 32,
+    height: 32,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 16,
+    backgroundColor: 'rgba(148,163,184,0.18)',
+    zIndex: 5,
+  },
+  modalCloseXText: { fontSize: 16, fontWeight: '900', color: '#64748B', lineHeight: 18 },
   modalTitle: {
     fontSize: responsiveFontSize(17),
     fontWeight: '800',
@@ -1583,6 +1694,21 @@ const styles = StyleSheet.create({
     color: '#718096',
     marginTop: verticalScale(4),
     lineHeight: 18,
+  },
+  creditBlocked: {
+    color: '#B91C1C',
+    backgroundColor: '#FEE2E2',
+    borderRadius: 8,
+    padding: 10,
+    marginTop: 10,
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  creditAllowed: {
+    color: '#B45309',
+    fontSize: 12,
+    fontWeight: '700',
+    marginTop: 10,
   },
   divider: {
     height: 1,
