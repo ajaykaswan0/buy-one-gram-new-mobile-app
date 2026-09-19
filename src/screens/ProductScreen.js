@@ -9,6 +9,7 @@ import {
   ActivityIndicator,
   SafeAreaView,
   ScrollView,
+  FlatList,
   TextInput,
   Alert,
   RefreshControl,
@@ -33,7 +34,14 @@ export default function ProductScreen({ token, apiUrl, user, onBack }) {
   // On by default: the price a shopkeeper is quoted is the one he pays, so
   // showing the pre-tax rate first invites an argument at the counter.
   const [withGst, setWithGst] = useState(true);
-  const [selectedPackSize, setSelectedPackSize] = useState('All');
+  /**
+   * Opens on one pack size rather than every one at once.
+   *
+   * Every product has four or five variants, so "All" is a hundred and
+   * seventy-five rows — which is what made this screen slow to open. 1kg is
+   * the one most orders are placed in, and "All" is still one tap away.
+   */
+  const [selectedPackSize, setSelectedPackSize] = useState('1kg');
 
   // Parties sharing states
   const [parties, setParties] = useState([]);
@@ -129,15 +137,29 @@ export default function ProductScreen({ token, apiUrl, user, onBack }) {
           }
         }
 
-        // GST Calculation
+        /**
+         * The stored price is the one with GST in it, not the one without.
+         *
+         * This multiplied it up for the "with GST" view, which charged the tax
+         * twice — Arhar 1kg reads 114.50 on the printed rate list and the app
+         * showed 120.23. The pricing formula builds the tax in (base x 1.05,
+         * and the 1.05 is the five per cent), and the printed list says
+         * "Prices inclusive of GST", so the stored figure is the inclusive one.
+         *
+         * With GST is therefore what is stored, and without GST is that figure
+         * divided back out. A 30kg sack is GST-exempt and divides by one, so
+         * both views show it the same, which is right.
+         */
         const gstPercentage = variant.gstPercentage || 0;
-        const rate = withGst ? price * (1 + gstPercentage / 100) : price;
+        const rate = withGst ? price : price / (1 + gstPercentage / 100);
         // +/- difference from last price list update
         const previousPrice = priceHistory.length > 0
           ? priceHistory[priceHistory.length - 1].price
           : price;
         const diff = price - previousPrice;
-        const diffRate = withGst ? diff * (1 + gstPercentage / 100) : diff;
+        // The change is between two inclusive prices, so it is shown the same
+        // way round as the price above it.
+        const diffRate = withGst ? diff : diff / (1 + gstPercentage / 100);
 
         // Margin percentage: (MRP - Rate) / Rate * 100
         const margin = rate > 0 ? Math.max(0, Math.round(((mrp - rate) / rate) * 100)) : 0;
@@ -374,7 +396,18 @@ export default function ProductScreen({ token, apiUrl, user, onBack }) {
       </View>
 
       {/* Product List */}
-      <ScrollView
+      {/*
+        * A FlatList, not a ScrollView.
+        *
+        * A ScrollView builds every row before it shows anything, so choosing
+        * "All" meant laying out a hundred and seventy-five rows before the
+        * screen appeared — which is the wait. A FlatList builds the ones on
+        * screen and the rest as they are scrolled to, so it opens at once
+        * however many there are.
+        */}
+      <FlatList
+        data={displayedItems}
+        keyExtractor={(item, idx) => String(item.id || idx)}
         contentContainerStyle={styles.listContainer}
         refreshControl={
           <RefreshControl
@@ -384,15 +417,18 @@ export default function ProductScreen({ token, apiUrl, user, onBack }) {
           />
         }
         showsVerticalScrollIndicator={false}
-      >
-        {displayedItems.length === 0 ? (
+        initialNumToRender={12}
+        maxToRenderPerBatch={12}
+        windowSize={7}
+        removeClippedSubviews
+        ListEmptyComponent={(
           <View style={styles.emptyContainer}>
             <Text style={styles.emptyIcon}>📋</Text>
             <Text style={styles.emptyTitle}>No Rates Found</Text>
             <Text style={styles.emptyDesc}>Try adjusting filters or search term</Text>
           </View>
-        ) : (
-          displayedItems.map((item, idx) => {
+        )}
+        renderItem={({ item, index: idx }) => {
             const isNegative = item.diff < 0;
             const isPositive = item.diff > 0;
             const diffColor = isPositive ? '#38A169' : isNegative ? '#E53E3E' : '#718096';
@@ -446,9 +482,8 @@ export default function ProductScreen({ token, apiUrl, user, onBack }) {
                 </Text>
               </View>
             );
-          })
-        )}
-      </ScrollView>
+        }}
+      />
 
       {/* Share Modal Dialog */}
       {shareModalVisible && (

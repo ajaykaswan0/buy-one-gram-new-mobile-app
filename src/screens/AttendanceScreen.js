@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback} from 'react';
+import { getCurrentPositionSafely } from '../services/currentLocation';
 import {
   StyleSheet,
   Text,
@@ -14,7 +15,6 @@ import {
   RefreshControl,
 } from 'react-native';
 import { scale, verticalScale, responsiveFontSize, maxContainerWidth } from '../utils/responsive';
-import Geolocation from '@react-native-community/geolocation';
 import { launchCamera } from 'react-native-image-picker';
 import { uploadPhoto } from '../services/photoUpload';
 
@@ -171,7 +171,7 @@ export default function AttendanceScreen({ token, apiUrl, onBack, onAttendanceMa
           setError('Location permission is required to mark attendance.');
           return;
         }
-        Geolocation.getCurrentPosition(
+        getCurrentPositionSafely(
           async (position) => {
             const { latitude, longitude, accuracy } = position.coords;
 
@@ -261,7 +261,7 @@ export default function AttendanceScreen({ token, apiUrl, onBack, onAttendanceMa
           setError('Location permission is required to mark attendance.');
           return;
         }
-        Geolocation.getCurrentPosition(
+        getCurrentPositionSafely(
           async (position) => {
             const { latitude, longitude, accuracy } = position.coords;
 

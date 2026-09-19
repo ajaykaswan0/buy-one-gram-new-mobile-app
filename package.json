@@ -10,8 +10,10 @@
     "react": "19.2.3",
     "react-native": "0.86.0",
     "react-native-blob-util": "^0.24.10",
+    "react-native-contacts": "^8.0.10",
     "react-native-image-picker": "^8.2.1",
-    "react-native-pdf": "^7.0.5"
+    "react-native-pdf": "^7.0.5",
+    "react-native-webview": "^14.0.1"
   },
   "scripts": {
     "start": "react-native start",

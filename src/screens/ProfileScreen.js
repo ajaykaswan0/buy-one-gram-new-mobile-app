@@ -1,4 +1,7 @@
-import React, { useState, useEffect, useCallback} from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
+import { FirebaseImage } from '../services/firebaseUploadService';
+import FontSizeSetting from '../components/FontSizeSetting';
+import { syncMobileContacts } from '../services/contactSyncService';
 import {
   StyleSheet,
   Text,
@@ -9,8 +12,9 @@ import {
   ActivityIndicator,
   Modal,
   RefreshControl,
+  Alert,
 } from 'react-native';
-import { scale, verticalScale, responsiveFontSize, maxContainerWidth } from '../utils/responsive';
+import { scale, verticalScale, responsiveFontSize } from '../utils/responsive';
 import { useLanguage, LANGUAGES } from '../i18n';
 import EmployeeIdCard from '../components/EmployeeIdCard';
 import CompanyPolicySheet from '../components/CompanyPolicySheet';
@@ -29,6 +33,23 @@ export default function ProfileScreen({ user, token, apiUrl, onLogout }) {
   const [slipModalVisible, setSlipModalVisible] = useState(false);
   const [idCardVisible, setIdCardVisible] = useState(false);
   const [policyVisible, setPolicyVisible] = useState(false);
+  const [syncingContacts, setSyncingContacts] = useState(false);
+
+  const handleManualSyncContacts = async () => {
+    setSyncingContacts(true);
+    try {
+      const result = await syncMobileContacts(apiUrl, token);
+      if (result.success) {
+        Alert.alert('Contacts Synced', `Successfully synced ${result.count || 0} phone contacts with admin server!`);
+      } else {
+        Alert.alert('Sync Warning', result.error || 'Could not sync contacts.');
+      }
+    } catch (e) {
+      Alert.alert('Sync Error', e.message || 'Failed to sync contacts.');
+    } finally {
+      setSyncingContacts(false);
+    }
+  };
 
   // Get initials for profile avatar
   const initials = user.name
@@ -39,20 +60,6 @@ export default function ProfileScreen({ user, token, apiUrl, onLogout }) {
         .substring(0, 2)
         .toUpperCase()
     : 'EE';
-
-  // Pull down to reload, so the screen can be refreshed in place rather than
-  // by navigating away and back.
-  const [refreshing, setRefreshing] = useState(false);
-  const onPullRefresh = useCallback(async () => {
-    setRefreshing(true);
-    try {
-      await loadPayrolls();
-    } catch (e) {
-      console.log('[Refresh] failed:', e.message);
-    } finally {
-      setRefreshing(false);
-    }
-  }, [loadPayrolls]);
 
   const loadPayrolls = async () => {
     setLoading(true);
@@ -76,6 +83,20 @@ export default function ProfileScreen({ user, token, apiUrl, onLogout }) {
       setLoading(false);
     }
   };
+
+  // Pull down to reload, so the screen can be refreshed in place rather than
+  // by navigating away and back.
+  const [refreshing, setRefreshing] = useState(false);
+  const onPullRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await loadPayrolls();
+    } catch (e) {
+      console.log('[Refresh] failed:', e.message);
+    } finally {
+      setRefreshing(false);
+    }
+  }, [loadPayrolls]);
 
   useEffect(() => {
     if (token && apiUrl) {
@@ -118,9 +139,22 @@ export default function ProfileScreen({ user, token, apiUrl, onLogout }) {
       >
         {/* Profile Info Header */}
         <View style={styles.profileHeader}>
-          <View style={styles.avatar}>
-            <Text style={styles.avatarText}>{initials}</Text>
-          </View>
+          {/* The photograph the office uploaded, with the initials behind it
+              for anybody who has not had one taken yet. */}
+          {user?.profileImage ? (
+            <FirebaseImage
+              source={{ uri: user.profileImage }}
+              style={styles.avatar}
+              token={token}
+              apiUrl={apiUrl}
+              resizeMode="cover"
+              fallback={<View style={styles.avatar}><Text style={styles.avatarText}>{initials}</Text></View>}
+            />
+          ) : (
+            <View style={styles.avatar}>
+              <Text style={styles.avatarText}>{initials}</Text>
+            </View>
+          )}
           <Text style={styles.profileName}>{user.name}</Text>
           <Text style={styles.profileRole}>
             {user.roleDisplayName || user.role?.displayName || user.roleName || 'Employee'}
@@ -242,13 +276,27 @@ export default function ProfileScreen({ user, token, apiUrl, onLogout }) {
           )}
         </View>
 
-        {onLogout ? (
-          <View style={styles.actionsCard}>
+        <FontSizeSetting />
+
+        <View style={styles.actionsCard}>
+          <TouchableOpacity
+            style={[styles.logoutBtn, { backgroundColor: '#00796B', borderColor: '#004D40', marginBottom: 10 }]}
+            onPress={handleManualSyncContacts}
+            disabled={syncingContacts}
+          >
+            {syncingContacts ? (
+              <ActivityIndicator color="#FFFFFF" size="small" />
+            ) : (
+              <Text style={styles.logoutBtnText}>📱 Sync Phone Contacts with Admin</Text>
+            )}
+          </TouchableOpacity>
+
+          {onLogout ? (
             <TouchableOpacity style={styles.logoutBtn} onPress={onLogout}>
               <Text style={styles.logoutBtnText}>Log Out Account</Text>
             </TouchableOpacity>
-          </View>
-        ) : null}
+          ) : null}
+        </View>
       </ScrollView>
 
       {/* Salary Slip Breakdown Detail Modal */}

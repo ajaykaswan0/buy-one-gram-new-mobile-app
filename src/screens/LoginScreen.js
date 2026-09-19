@@ -6,7 +6,6 @@ import {
   TextInput,
   TouchableOpacity,
   ActivityIndicator,
-  Modal,
   SafeAreaView,
   Image,
 } from 'react-native';
@@ -73,7 +72,7 @@ export default function LoginScreen({ onLoginSuccess }) {
 
       onLoginSuccess(data.token, data.user, API_URL);
     } catch (err) {
-      setError(err.message || 'Network error. Check connection or local Wi-Fi URL.');
+      setError(err.message || 'Network error. Please check your connection.');
     } finally {
       setLoading(false);
     }
@@ -130,8 +129,6 @@ export default function LoginScreen({ onLoginSuccess }) {
           )}
         </TouchableOpacity>
       </View>
-
-
     </SafeAreaView>
   );
 }

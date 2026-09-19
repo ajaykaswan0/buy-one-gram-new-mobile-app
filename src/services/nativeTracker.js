@@ -43,6 +43,23 @@ export const stopNativeTracking = async () => {
   }
 };
 
+/**
+ * Ask the service to check in now.
+ *
+ * Called when a push arrives saying somebody wants to watch. It does not turn
+ * live mode on — the server already did that — it only saves the phone waiting
+ * out its ten-minute upload window before finding out.
+ */
+export const wakeNativeTracking = async () => {
+  if (!hasNativeTracking || !native.wake) return false;
+  try {
+    return await native.wake();
+  } catch (error) {
+    console.log('[Tracker] wake failed:', error.message);
+    return false;
+  }
+};
+
 /** `{ enabled, queued, userId }` — for the diagnostics screen. */
 export const nativeTrackingStatus = async () => {
   if (!hasNativeTracking) return null;

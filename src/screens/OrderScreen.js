@@ -871,8 +871,28 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
           </View>
         )}
 
+        {/* A shop the office has not accepted takes no order. The server
+            refuses it too; this stops the salesman building a whole basket
+            first and being turned away at the end. */}
+        {selectedParty && selectedParty.approvalStatus === 'pending' && (
+          <View style={styles.awaitingApproval}>
+            <Text style={styles.awaitingApprovalTitle}>Waiting for approval</Text>
+            <Text style={styles.awaitingApprovalText}>
+              {`${selectedParty.partyName} is new. You can visit it, but an order has to wait until the office accepts it.`}
+            </Text>
+          </View>
+        )}
+        {selectedParty && selectedParty.approvalStatus === 'rejected' && (
+          <View style={[styles.awaitingApproval, styles.rejectedBox]}>
+            <Text style={[styles.awaitingApprovalTitle, { color: '#FFFFFF' }]}>Not accepted</Text>
+            <Text style={[styles.awaitingApprovalText, { color: '#FFF5F5' }]}>
+              {`The office did not accept ${selectedParty.partyName}${selectedParty.approvalRemarks ? `: ${selectedParty.approvalRemarks}` : ''}. No order can be placed against it.`}
+            </Text>
+          </View>
+        )}
+
         {/* Step 2: Order Catalog & Details */}
-        {selectedParty && (
+        {selectedParty && !['pending', 'rejected'].includes(selectedParty.approvalStatus) && (
           <View style={styles.formContainer}>
             <View style={styles.catalogHeader}>
               <Text style={styles.stepTitle}>Step 2: Add Products</Text>
@@ -2188,6 +2208,29 @@ const styles = StyleSheet.create({
   reviewChangeText: { fontWeight: '900', color: '#475569' },
   reviewConfirmBtn: { flex: 2, padding: scale(14), borderRadius: 12, backgroundColor: '#0F766E', alignItems: 'center' },
   reviewConfirmText: { fontWeight: '900', color: '#FFFFFF' },
+  awaitingApproval: {
+    margin: 16,
+    padding: 14,
+    borderRadius: 12,
+    backgroundColor: '#FFF5F5',
+    borderWidth: 1.5,
+    borderColor: '#FC8181',
+  },
+  rejectedBox: {
+    backgroundColor: '#C53030',
+    borderColor: '#9B2C2C',
+  },
+  awaitingApprovalTitle: {
+    color: '#C53030',
+    fontWeight: '900',
+    fontSize: 14,
+  },
+  awaitingApprovalText: {
+    color: '#742A2A',
+    fontSize: 12,
+    marginTop: 4,
+    lineHeight: 17,
+  },
   minimumWarning: {
     color: '#B45309',
     fontWeight: '700',

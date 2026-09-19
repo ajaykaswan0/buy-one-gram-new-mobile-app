@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import { FirebaseImage } from '../services/firebaseUploadService';
 import {
   StyleSheet,
   Text,
@@ -12,7 +13,7 @@ import {
 } from 'react-native';
 import { scale, verticalScale, responsiveFontSize, maxContainerWidth } from '../utils/responsive';
 
-export default function NotificationScreen({ token, apiUrl, onBack, onClearBadge }) {
+export default function NotificationScreen({ token, apiUrl, onBack, onClearBadge, openNotificationId }) {
   const [notifications, setNotifications] = useState([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -24,6 +25,7 @@ export default function NotificationScreen({ token, apiUrl, onBack, onClearBadge
 
   // Expanded notification state
   const [expandedNotifications, setExpandedNotifications] = useState({});
+  const listRef = React.useRef(null);
 
   const toggleExpand = (id) => {
     setExpandedNotifications((prev) => ({
@@ -88,6 +90,37 @@ export default function NotificationScreen({ token, apiUrl, onBack, onClearBadge
     markNotificationsAsRead();
   }, []);
 
+  /**
+   * Open the notification that was tapped, rather than the list it is in.
+   *
+   * A push used to drop the person on the notifications tab with fifteen
+   * entries and leave them to find the one that had just buzzed. This expands
+   * it and scrolls to it.
+   *
+   * If it is not on the first page it is simply not scrolled to — the one just
+   * tapped is the newest, so it is at the top; going hunting through pages for
+   * an older one would be a lot of code for a case that does not happen.
+   */
+  useEffect(() => {
+    if (!openNotificationId || !notifications.length) return;
+    const index = notifications.findIndex((item) => String(item._id) === String(openNotificationId));
+    if (index < 0) return;
+    setExpandedNotifications((current) => ({ ...current, [openNotificationId]: true }));
+    if (index > 0) {
+      // After the rows have measured, or the list scrolls to the wrong place.
+      const timer = setTimeout(() => {
+        try {
+          listRef.current?.scrollToIndex({ index, animated: true, viewPosition: 0.2 });
+        } catch (e) {
+          // A row that has not been measured yet throws; being on the page and
+          // expanded is enough.
+        }
+      }, 350);
+      return () => clearTimeout(timer);
+    }
+    return undefined;
+  }, [openNotificationId, notifications]);
+
   const onRefresh = useCallback(() => {
     setRefreshing(true);
     fetchNotifications(1, false);
@@ -126,6 +159,19 @@ export default function NotificationScreen({ token, apiUrl, onBack, onClearBadge
         >
           {item.message}
         </Text>
+        {/* A poster sent with the notification — a price list, a scheme.
+            Only once the row is open, so the list stays a list. */}
+        {isExpanded && !!item.image && (
+          <FirebaseImage
+            // An object, not a string: FirebaseImage reads source.uri, and a
+            // bare string left it with nothing to resolve and nothing to draw.
+            source={{ uri: item.image }}
+            token={token}
+            apiUrl={apiUrl}
+            style={styles.notificationImage}
+            resizeMode="cover"
+          />
+        )}
         <View style={styles.cardFooter}>
           <Text style={styles.notificationDate}>{dateStr}</Text>
           <Text style={styles.expandHintText}>
@@ -155,6 +201,8 @@ export default function NotificationScreen({ token, apiUrl, onBack, onClearBadge
         </View>
       ) : (
         <FlatList
+          ref={listRef}
+          onScrollToIndexFailed={() => { /* not measured yet; it is expanded anyway */ }}
           data={notifications}
           keyExtractor={(item) => item._id}
           renderItem={renderNotificationItem}
@@ -282,6 +330,13 @@ const styles = StyleSheet.create({
     borderRadius: 4,
     backgroundColor: '#00BFA5',
     marginLeft: scale(10),
+  },
+  notificationImage: {
+    width: '100%',
+    height: 170,
+    borderRadius: 10,
+    marginTop: 10,
+    backgroundColor: '#EEF2F7',
   },
   notificationMessage: {
     fontSize: responsiveFontSize(13.5),

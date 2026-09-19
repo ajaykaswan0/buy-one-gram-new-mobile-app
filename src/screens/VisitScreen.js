@@ -213,6 +213,22 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
     setFormError('');
     setSuccess('');
     setAddModalVisible(true);
+
+    /**
+     * Start looking for the phone's position now, while the form is being
+     * filled in.
+     *
+     * It used to start only once the shop photo had been taken, which is the
+     * last thing anybody does — so the GPS began from cold at the exact moment
+     * the salesman was ready to submit, and he watched it for twelve seconds.
+     * Started here, the name, mobile and address take longer to type than the
+     * fix takes to arrive, and by the time the photo is taken it is already on
+     * the form.
+     *
+     * It costs nothing extra: the watch stops itself as soon as the fix is good
+     * enough, and after twelve seconds regardless.
+     */
+    startPreciseLocationCapture();
   };
 
   /**
@@ -245,46 +261,92 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
         await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION);
       }
 
+      /**
+       * A pin on the form within a second, then quietly better.
+       *
+       * This used to refuse any cached fix and wait for accuracy of ten metres
+       * or better, for thirty seconds, before letting the form be used. Inside a
+       * shop that fix often never arrives, so the salesman watched a spinner and
+       * was then told the location would be taken later — which is the complaint.
+       *
+       * A shop's pin does not need ten metres. The visit radius is two hundred,
+       * and every pin in the book was taken by a phone on a doorstep. So:
+       *
+       *   - a fix the phone already has goes on the form at once, however rough,
+       *     so there is always something to submit;
+       *   - the watch keeps running and quietly replaces it with anything
+       *     better;
+       *   - fifty metres is good enough to stop waiting;
+       *   - after twelve seconds it settles for the best it has rather than
+       *     failing. It only fails when the phone gave nothing at all.
+       */
       let bestLocation = null;
       let watchId = null;
       let timer = null;
+      let settled = false;
+
+      const GOOD_ENOUGH = 50;
+      const STOP_WAITING = 12000;
+
+      const useCoords = (coords) => {
+        setLat(coords.latitude);
+        setLng(coords.longitude);
+        setLocationAccuracy(coords.accuracy);
+      };
 
       const finishLocation = (coords, warningMsg = '') => {
         if (watchId !== null) Geolocation.clearWatch(watchId);
         if (timer) clearTimeout(timer);
-        setLat(coords.latitude);
-        setLng(coords.longitude);
-        setLocationAccuracy(coords.accuracy);
+        settled = true;
+        useCoords(coords);
         if (warningMsg) setLocationWarning(warningMsg);
         setFetchingLocation(false);
       };
 
-      // 30-second fallback timer
+      /**
+       * Whatever the phone can give immediately, cached or coarse. This is the
+       * one that makes the form usable straight away; the watch below improves
+       * on it.
+       */
+      Geolocation.getCurrentPosition(
+        (position) => {
+          const { latitude, longitude, accuracy } = position.coords;
+          if (settled) return;
+          if (!bestLocation || accuracy < bestLocation.accuracy) bestLocation = { latitude, longitude, accuracy };
+          useCoords(bestLocation);
+          setLocationStatusText(`Pinned to about ${Math.round(accuracy)}m — still improving`);
+        },
+        () => {},
+        { enableHighAccuracy: false, timeout: 8000, maximumAge: 120000 },
+      );
+
       timer = setTimeout(() => {
         if (watchId !== null) Geolocation.clearWatch(watchId);
         if (bestLocation) {
-          const roundedAcc = Math.round(bestLocation.accuracy);
           finishLocation(
             bestLocation,
-            `Location accuracy is lower than expected (~${roundedAcc}m). You can continue, but the pinned location may be less precise.`
+            bestLocation.accuracy > GOOD_ENOUGH
+              ? `Pinned to about ${Math.round(bestLocation.accuracy)}m. Good enough to save — tap Retry outside the shop if you want it tighter.`
+              : '',
           );
         } else {
           setFetchingLocation(false);
-          setFormError('Could not obtain GPS location within 30 seconds.');
+          setFormError('The phone gave no location at all. Check that location is switched on, then tap Retry.');
         }
-      }, 30000);
+      }, STOP_WAITING);
 
       watchId = Geolocation.watchPosition(
         (position) => {
           const { latitude, longitude, accuracy } = position.coords;
           if (!bestLocation || accuracy < bestLocation.accuracy) {
             bestLocation = { latitude, longitude, accuracy };
+            useCoords(bestLocation);
           }
 
-          if (accuracy <= 10) {
+          if (accuracy <= GOOD_ENOUGH) {
             finishLocation({ latitude, longitude, accuracy });
           } else {
-            setLocationStatusText(`Getting precise location... Current accuracy: ~${Math.round(accuracy)}m (waiting for ≤10m)`);
+            setLocationStatusText(`Pinned to about ${Math.round(accuracy)}m — still improving`);
           }
         },
         (err) => {
@@ -295,7 +357,7 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
           distanceFilter: 0,
           interval: 1000,
           fastestInterval: 500,
-          timeout: 30000,
+          timeout: STOP_WAITING,
           maximumAge: 0,
         }
       );
@@ -328,8 +390,10 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
         if (asset) {
           setNewPartyPhoto(asset.base64);
           setNewPartyPhotoAsset(asset);
-          // High accuracy location mode captured ONLY when outlet photo is captured
-          startPreciseLocationCapture();
+          // The fix has been coming in since the form opened. Only ask again if
+          // it never arrived, so the photo is still a second chance rather than
+          // throwing away a good pin and starting over.
+          if (!lat || !lng) startPreciseLocationCapture();
         }
       }
     );
@@ -338,7 +402,12 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
   // A usable pin, and whether the form may be submitted at all. Kept here so
   // the button, its label and the note beneath it can never disagree.
   const hasPin = lat != null && lng != null;
-  const canSubmitParty = hasPin && !fetchingLocation && !creatingPartyLoading;
+  /**
+   * A pin is enough. Waiting for the watch to settle held the form hostage to a
+   * fix that may never sharpen; the pin on screen is already good enough to save
+   * and the watch only ever replaces it with something better.
+   */
+  const canSubmitParty = hasPin && !creatingPartyLoading;
 
   /** Moves the bar to a stage. Animated, so it reads as progress, not as jumps. */
   const advance = (to, label) => {
@@ -633,6 +702,11 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
         style={[
           styles.partyCard,
           item.visitedToday && styles.partyCardVisited,
+          // A shop the office has not accepted yet. Red, because an order
+          // against it will be refused and the salesman should see that from
+          // the list rather than at the till.
+          item.approvalStatus === 'pending' && styles.partyCardWaiting,
+          item.approvalStatus === 'rejected' && styles.partyCardRejected,
         ]}
         key={item._id}
         onPress={() => setSelectedProfilePartyId(item._id)}
@@ -644,6 +718,16 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
               {item.visitedToday && (
                 <View style={styles.visitedBadge}>
                   <Text style={styles.visitedBadgeText}>✓ Visited</Text>
+                </View>
+              )}
+              {item.approvalStatus === 'pending' && (
+                <View style={styles.waitingBadge}>
+                  <Text style={styles.waitingBadgeText}>Waiting for approval</Text>
+                </View>
+              )}
+              {item.approvalStatus === 'rejected' && (
+                <View style={styles.rejectedBadge}>
+                  <Text style={styles.rejectedBadgeText}>Not accepted</Text>
                 </View>
               )}
             </View>
@@ -1068,7 +1152,7 @@ export default function VisitScreen({ token, user, apiUrl, onBack, onNavigateToO
                     ) : null}
                   </View>
                 ) : (
-                  <Text style={styles.locationError}>Location will be captured automatically when you take the shop front photo.</Text>
+                  <Text style={styles.locationError}>No location yet. Tap Retry, or take the shop front photo — that captures one too.</Text>
                 )}
               </View>
 
@@ -1366,6 +1450,38 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.01,
     shadowRadius: 10,
     elevation: 1,
+  },
+  partyCardWaiting: {
+    borderColor: '#FC8181',
+    borderWidth: 1.5,
+    backgroundColor: '#FFF5F5',
+  },
+  partyCardRejected: {
+    borderColor: '#C53030',
+    borderWidth: 1.5,
+    backgroundColor: '#FFF5F5',
+  },
+  waitingBadge: {
+    backgroundColor: '#FED7D7',
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 999,
+  },
+  waitingBadgeText: {
+    color: '#C53030',
+    fontSize: 10,
+    fontWeight: '900',
+  },
+  rejectedBadge: {
+    backgroundColor: '#C53030',
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 999,
+  },
+  rejectedBadgeText: {
+    color: '#FFFFFF',
+    fontSize: 10,
+    fontWeight: '900',
   },
   partyCardVisited: {
     borderColor: '#38A169',

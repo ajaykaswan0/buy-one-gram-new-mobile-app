@@ -16,7 +16,6 @@ import {
 } from 'react-native';
 import { scale, verticalScale, responsiveFontSize, maxContainerWidth } from '../utils/responsive';
 import { launchCamera } from 'react-native-image-picker';
-import { getCurrentLocation } from '../services/currentLocation';
 import { useLanguage } from '../i18n';
 import { uploadFile } from '../services/firebaseUploadService';
 
@@ -27,6 +26,10 @@ export default function DriverDashboardScreen({
   onNavigateToAttendance,
   onNavigateToLeave,
   onNavigateToProducts,
+  // Which of this screen's own tabs to open on. The footer's Delivery History
+  // button reuses this same screen rather than building a second one — it just
+  // opens straight onto the 'history' tab instead of 'route'.
+  initialTab = 'route',
 }) {
   /**
    * `t` is for our own words; `term` is for the words the API sends back.
@@ -40,9 +43,8 @@ export default function DriverDashboardScreen({
   const [activeRoute, setActiveRoute] = useState(null);
   const [deliveries, setDeliveries] = useState([]);
   // Where the van is, so the next drop can be the closest one.
-  const [driverAt, setDriverAt] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState('route'); // 'route' | 'history'
+  const [activeTab, setActiveTab] = useState(initialTab); // 'route' | 'assigned' | 'out' | 'history'
 
   // Modal states for COD Collection
   const [collectionModalVisible, setCollectionModalVisible] = useState(false);
@@ -119,13 +121,17 @@ export default function DriverDashboardScreen({
             || allRoutes[0];
 
           if (active) {
-            const detailResponse = await fetch(`${apiUrl}/transportation/routes/${active._id}`, {
+            // path=0: the drawn road geometry costs a routing call and there is
+            // no map on this screen to put it on.
+            const detailResponse = await fetch(`${apiUrl}/transportation/routes/${active._id}?path=0`, {
               headers: { Authorization: `Bearer ${token}` },
             });
             const detailText = await detailResponse.text();
             const detailData = detailText ? JSON.parse(detailText) : null;
             if (detailResponse.ok && detailData?.success) {
-              setActiveRoute(detailData.data);
+              // The totals come from the server, so the load the office planned
+              // and the load the driver is told about are the same figures.
+              setActiveRoute({ ...detailData.data, summary: detailData.summary || null });
             } else {
               setActiveRoute(active);
             }
@@ -193,60 +199,6 @@ export default function DriverDashboardScreen({
     }
   }, [token, apiUrl]);
 
-  /**
-   * Straight-line metres between two points.
-   *
-   * Good enough to order a list. A driver does not need road distance to know
-   * which shop is round the corner, and asking a routing service every time the
-   * screen redraws would cost far more than it is worth.
-   */
-  const metresBetween = (a, b) => {
-    if (!a || !b || !a.latitude || !b.latitude) return null;
-    const R = 6371000;
-    const dLat = ((b.latitude - a.latitude) * Math.PI) / 180;
-    const dLng = ((b.longitude - a.longitude) * Math.PI) / 180;
-    const h = Math.sin(dLat / 2) ** 2
-      + Math.cos((a.latitude * Math.PI) / 180) * Math.cos((b.latitude * Math.PI) / 180) * Math.sin(dLng / 2) ** 2;
-    return R * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
-  };
-
-  /** The coordinates of whatever a stop is delivering to. */
-  const stopLocation = (stop) => {
-    const party = stop?.order?.partyId || stop?.partyId;
-    const latitude = Number(stop?.latitude ?? party?.location?.latitude);
-    const longitude = Number(stop?.longitude ?? party?.location?.longitude);
-    return Number.isFinite(latitude) && Number.isFinite(longitude) && latitude
-      ? { latitude, longitude } : null;
-  };
-
-  /**
-   * Stops with the nearest first.
-   *
-   * Falls back to the planned sequence when there is no fix yet, and keeps
-   * stops with no coordinates at the end rather than dropping them — a shop
-   * without a pin still has to be delivered to.
-   */
-  const nearestFirst = (stops) => {
-    if (!driverAt) return stops;
-    return stops.slice().sort((a, b) => {
-      const da = metresBetween(driverAt, stopLocation(a));
-      const db = metresBetween(driverAt, stopLocation(b));
-      if (da === null && db === null) return 0;
-      if (da === null) return 1;
-      if (db === null) return -1;
-      return da - db;
-    });
-  };
-
-  useEffect(() => {
-    // One fix when the screen opens. A driver moving between drops can pull to
-    // refresh; polling GPS all day would cost battery for no real gain.
-    let alive = true;
-    getCurrentLocation()
-      .then((position) => { if (alive && position) setDriverAt(position); })
-      .catch(() => { /* no fix, so the planned order stands */ });
-    return () => { alive = false; };
-  }, []);
 
   // Find corresponding Delivery document for an order ID or stop item
   const getDeliveryForOrder = (orderId, stop = null) => {
@@ -341,13 +293,27 @@ export default function DriverDashboardScreen({
       ? `${startLoc.latitude},${startLoc.longitude}`
       : 'current+location';
 
-    // Sequence stops
-    const stopsList = activeRoute.stops.filter((stop) => {
-      const delivery = getDeliveryForOrder(stop.order?._id || stop.order);
-      return delivery?.status === 'out_for_delivery' && stop.latitude && stop.longitude;
-    });
+    /**
+     * The stops still worth driving to, in the planned order.
+     *
+     * This used to demand a delivery status of exactly `out_for_delivery` —
+     * a status nothing in this app ever sets, so the list was always empty
+     * and the button always claimed the stops had no GPS coordinates, whatever
+     * the real reason. What actually matters is: not already dealt with, and
+     * somewhere to point the map at. An errand stop has no order and so no
+     * delivery record, but the driver still has to physically go there.
+     */
+    const stopsList = [...activeRoute.stops]
+      .sort((a, b) => (a.sequence || 0) - (b.sequence || 0))
+      .filter((stop) => {
+        if (!stop.latitude || !stop.longitude) return false;
+        if (!stop.order) return true;
+        const delivery = getDeliveryForOrder(stop.order?._id || stop.order);
+        const status = String(delivery?.status || stop.status || '').toLowerCase();
+        return !completedStatuses.includes(status);
+      });
     if (stopsList.length === 0) {
-      Alert.alert(t('No Locations'), t('Stops do not have GPS coordinates mapped.'));
+      Alert.alert(t('No Locations'), t('Every stop on this route is either delivered or has no saved location.'));
       return;
     }
 
@@ -752,23 +718,65 @@ export default function DriverDashboardScreen({
               {activeTab === 'route' && <View style={styles.routeSummaryCard}>
                 <Text style={styles.sectionTitle}>{t('Route configuration')}</Text>
                 <Text style={styles.routeDetailsText}>Service area: {activeRoute.name}</Text>
-                <Text style={styles.routeDetailsText}>Planned stops: {activeRoute.totalOrders || activeRoute.stops?.length || 0}</Text>
+                <Text style={styles.routeDetailsText}>Planned stops: {activeRoute.summary?.stops || activeRoute.stops?.length || 0}</Text>
+                <Text style={styles.routeDetailsText}>Orders: {activeRoute.summary?.orders ?? activeRoute.totalOrders ?? 0}{activeRoute.summary?.replacements ? `  (${activeRoute.summary.replacements} replacement)` : ''}</Text>
+                <Text style={styles.routeDetailsText}>Total load: {activeRoute.summary?.weightKg ?? 0} kg</Text>
                 <Text style={styles.routeDetailsText}>Estimated distance: {Number(activeRoute.estimatedDistanceKm || 0).toFixed(1)} km</Text>
                 <Text style={styles.routeDetailsText}>Estimated duration: {Math.round(Number(activeRoute.estimatedDurationMinutes || 0))} minutes</Text>
               </View>}
               {activeTab === 'route' && <View>
-                <Text style={styles.sectionTitle}>
-                  Orders included in this route{driverAt ? ' — nearest first' : ''}
-                </Text>
-                {nearestFirst(activeRoute.stops || []).map((stop, index) => {
+                <Text style={styles.sectionTitle}>Stops, in the planned order</Text>
+                {/*
+                  The office's sequence, exactly as planned.
+
+                  This used to re-sort by whichever shop was nearest, so the
+                  numbers the planner saw on the map and the numbers the driver
+                  saw on his phone were different — and the optimised order,
+                  which is the whole point of planning a route, was thrown away
+                  every time the screen opened.
+                */}
+                {[...(activeRoute.stops || [])].sort((a, b) => (a.sequence || 0) - (b.sequence || 0)).map((stop, index) => {
                   const order = stop.order;
                   const party = order?.partyId;
                   const delivery = getDeliveryForOrder(order?._id || order);
                   const currentStatus = delivery?.status || stop.status || 'planned';
+
+                  // An errand the office put on the route — collecting sacks, a
+                  // bank run. It has no bill, so the delivery card would show it
+                  // as "Customer, Order #-, ₹0" with a Deliver button that means
+                  // nothing. It gets its own line instead.
+                  if (!order) {
+                    return <View key={stop._id || index} style={styles.stopCard}>
+                      <View style={styles.stopHeader}>
+                        <View style={styles.stopNumCircle}><Text style={styles.stopNumText}>{stop.sequence || index + 1}</Text></View>
+                        <View style={{ flex: 1, marginLeft: 12 }}>
+                          <Text style={styles.partyNameText}>{stop.label || 'Stop'}</Text>
+                          <Text style={styles.orderNumText}>No delivery — a stop on the way</Text>
+                        </View>
+                      </View>
+                      {stop.address ? <View style={styles.stopBody}>
+                        <Text style={styles.addressText}>📍 {stop.address}</Text>
+                      </View> : null}
+                      <View style={styles.stopActionsRow}>
+                        <TouchableOpacity style={styles.navigateActionBtn} onPress={() => handleNavigateToStop(stop)}>
+                          <Text style={styles.navigateActionBtnText}>📍 Maps</Text>
+                        </TouchableOpacity>
+                      </View>
+                    </View>;
+                  }
+
                   return <View key={stop._id || index} style={styles.stopCard}>
                     <View style={styles.stopHeader}>
                       <View style={styles.stopNumCircle}><Text style={styles.stopNumText}>{stop.sequence || index + 1}</Text></View>
-                      <View style={{ flex: 1, marginLeft: 12 }}><Text style={styles.partyNameText}>{party?.partyName || 'Customer'}</Text><Text style={styles.orderNumText}>Order #{order?.orderNumber || '-'}</Text></View>
+                      <View style={{ flex: 1, marginLeft: 12 }}>
+                        <Text style={styles.partyNameText}>{party?.partyName || 'Customer'}</Text>
+                        <Text style={styles.orderNumText}>Order #{order?.orderNumber || '-'}</Text>
+                        {/* Goods going back out over a complaint. The driver has
+                            to know before he knocks, not after. */}
+                        {stop.isReplacement || order?.orderType === 'replacement'
+                          ? <Text style={styles.replacementTag}>REPLACEMENT</Text>
+                          : null}
+                      </View>
                       <Text style={[
                         styles.stopStatusBadge,
                         currentStatus === 'delivered' ? styles.deliveredBadge :
@@ -1451,6 +1459,18 @@ const styles = StyleSheet.create({
     fontSize: responsiveFontSize(14.5),
     fontWeight: '800',
     color: '#2D3748',
+  },
+  replacementTag: {
+    marginTop: 3,
+    alignSelf: 'flex-start',
+    color: '#db2777',
+    borderColor: '#db2777',
+    borderWidth: 1,
+    borderRadius: 4,
+    paddingHorizontal: 5,
+    paddingVertical: 1,
+    fontSize: 10,
+    fontWeight: '700',
   },
   orderNumText: {
     fontSize: responsiveFontSize(12),

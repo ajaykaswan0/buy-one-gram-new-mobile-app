@@ -28,3 +28,4 @@ export const fileUrl = (path) => {
   if (/^(https?:|data:|file:)/i.test(value)) return value;
   return `${SERVER_URL}${value.startsWith('/') ? '' : '/'}${value}`;
 };
+

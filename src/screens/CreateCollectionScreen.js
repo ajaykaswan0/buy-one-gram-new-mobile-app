@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { getCurrentPositionSafely } from '../services/currentLocation';
 import {
   StyleSheet,
   Text,
@@ -14,7 +15,6 @@ import {
   PermissionsAndroid,
 } from 'react-native';
 import { scale, verticalScale, responsiveFontSize, maxContainerWidth } from '../utils/responsive';
-import Geolocation from '@react-native-community/geolocation';
 import { launchCamera } from 'react-native-image-picker';
 import { uploadPhoto } from '../services/photoUpload';
 import CalendarPicker from '../components/CalendarPicker';
@@ -60,7 +60,7 @@ export default function CreateCollectionScreen({ token, apiUrl, party, onBack })
         if (Platform.OS === 'android') {
           await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION);
         }
-        Geolocation.getCurrentPosition(
+        getCurrentPositionSafely(
           (position) => {
             setLatitude(position.coords.latitude);
             setLongitude(position.coords.longitude);

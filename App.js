@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { setTheme } from './src/services/appSkin';
+import { loadFontScale } from './src/services/fontScale';
 import {
   StyleSheet,
   View,
@@ -21,7 +23,7 @@ import { bottomBarPadding } from './src/utils/systemBars';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { getMessaging } from '@react-native-firebase/messaging';
 import { startTracking, stopTracking } from './src/services/locationTracker';
-import { hasNativeTracking, startNativeTracking, stopNativeTracking } from './src/services/nativeTracker';
+import { hasNativeTracking, startNativeTracking, stopNativeTracking, wakeNativeTracking } from './src/services/nativeTracker';
 import LoginScreen from './src/screens/LoginScreen';
 import { LanguageProvider } from './src/i18n';
 import DashboardScreen from './src/screens/DashboardScreen';
@@ -50,9 +52,17 @@ import RecoveryScreen from './src/screens/RecoveryScreen';
 import SalesPartnerDashboardScreen from './src/screens/SalesPartnerDashboardScreen';
 import StoreManagerDashboardScreen from './src/screens/StoreManagerDashboardScreen';
 import PackerDashboardScreen from './src/screens/PackerDashboardScreen';
+import PurchaseManagerDashboardScreen from './src/screens/PurchaseManagerDashboardScreen';
+import TelecallingDashboardScreen from './src/screens/TelecallingDashboardScreen';
+import VendorListScreen from './src/screens/VendorListScreen';
+import VendorProfileScreen from './src/screens/VendorProfileScreen';
+import CreateVendorScreen from './src/screens/CreateVendorScreen';
+import PurchaseOrderListScreen from './src/screens/PurchaseOrderListScreen';
+import PurchaseOrderDetailScreen from './src/screens/PurchaseOrderDetailScreen';
+import PurchaseStockScreen from './src/screens/PurchaseStockScreen';
 import { API_URL } from './src/config/api';
 
-const REQUIRED_PERMISSION_KEYS = ['camera', 'contacts', 'location', 'backgroundLocation'];
+const REQUIRED_PERMISSION_KEYS = ['camera', 'location', 'backgroundLocation', 'notifications'];
 const TRACKING_PROFILE_KEY = 'tracking_profile';
 const DEVICE_ID_KEY = 'tracking_device_id';
 const PUSH_TOKEN_KEY = 'push_token';
@@ -82,18 +92,18 @@ const getPermissionState = async () => {
     };
   }
 
-  const [camera, contacts, foregroundLocation, backgroundLocation] = await Promise.all([
+  const [camera, foregroundLocation, backgroundLocation, notifications] = await Promise.all([
     PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.CAMERA),
-    PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.READ_CONTACTS),
     PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION),
     Platform.Version >= 29 ? PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.ACCESS_BACKGROUND_LOCATION) : Promise.resolve(true),
+    Platform.Version >= 33 ? PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS) : Promise.resolve(true),
   ]);
 
   const map = {
     camera,
-    contacts,
     location: Boolean(foregroundLocation),
     backgroundLocation: Boolean(backgroundLocation),
+    notifications: Boolean(notifications),
   };
 
   const missing = REQUIRED_PERMISSION_KEYS.filter((key) => !map[key]);
@@ -109,12 +119,15 @@ const requestAllRequiredPermissions = async () => {
     return { allGranted: true, missing: [], map: {} };
   }
 
-  // 1. Request foreground permissions first (Camera, Contacts, Location)
+  // 1. Request foreground permissions first (Camera, Location, Notifications)
   const foregroundPermissions = [
     PermissionsAndroid.PERMISSIONS.CAMERA,
-    PermissionsAndroid.PERMISSIONS.READ_CONTACTS,
     PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
   ];
+
+  if (Platform.Version >= 33) {
+    foregroundPermissions.push(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS);
+  }
 
   await PermissionsAndroid.requestMultiple(foregroundPermissions);
 
@@ -209,8 +222,18 @@ const registerFcmTokenWithBackend = async ({ authToken, apiUrl }) => {
     const cleanToken = String(fcmToken || '').trim();
     if (!cleanToken) return;
 
+    /**
+     * Remembered against the server it was registered with.
+     *
+     * This used to compare the token alone, so once it had been registered
+     * anywhere it was never sent again — point the app at a different server
+     * and that server never learns the token, and no push ever arrives. The
+     * symptom is silence, which looks like push being broken rather than a
+     * token that was never handed over.
+     */
+    const registeredWith = `${apiUrl}|${cleanToken}`;
     const savedToken = await AsyncStorage.getItem(PUSH_TOKEN_KEY);
-    if (savedToken === cleanToken) return;
+    if (savedToken === registeredWith) return;
 
     const response = await fetch(`${apiUrl}/auth/push-token`, {
       method: 'POST',
@@ -226,7 +249,7 @@ const registerFcmTokenWithBackend = async ({ authToken, apiUrl }) => {
       throw new Error(error?.message || 'Failed to register push token');
     }
 
-    await AsyncStorage.setItem(PUSH_TOKEN_KEY, cleanToken);
+    await AsyncStorage.setItem(PUSH_TOKEN_KEY, registeredWith);
   } catch (error) {
     console.log('[FCM] Token registration failed:', error.message);
   }
@@ -249,6 +272,9 @@ function AppShell() {
   const [token, setToken] = useState(null);
   const [user, setUser] = useState(null);
   const [apiUrl, setApiUrl] = useState(API_URL);
+  // Which notification a push tap was about, so the screen opens that one
+  // rather than the list it happens to be in.
+  const [openNotificationId, setOpenNotificationId] = useState(null);
   
   // Navigation states
   const [activeTab, setActiveTab] = useState('home');
@@ -300,6 +326,8 @@ function AppShell() {
   };
   const [orderParty, setOrderParty] = useState(null);
   const [profilePartyId, setProfilePartyId] = useState(null);
+  const [selectedVendorId, setSelectedVendorId] = useState(null);
+  const [selectedPurchaseOrderId, setSelectedPurchaseOrderId] = useState(null);
   const [collectionParty, setCollectionParty] = useState(null);
 
   // Tracking states
@@ -396,9 +424,25 @@ function AppShell() {
       try {
         const storedToken = await AsyncStorage.getItem('token');
         const storedUser = await AsyncStorage.getItem('user');
-        // The server address is compiled in. It used to be read from storage,
-        // which meant a phone once pointed at a laptop kept going there after
-        // the production build was installed.
+        // The saved text size, read before the first screen draws so the app
+        // does not open small and jump a moment later.
+        await loadFontScale();
+
+        const startUrl = API_URL;
+
+        /**
+         * How the app is dressed today, before the first screen draws.
+         *
+         * Fetched here rather than on the dashboard because it repaints every
+         * screen, not one — and the server has already decided whether it is
+         * showing, so a phone with a wrong clock cannot start Diwali early.
+         * No token — the branding route is open, and a failure just leaves
+         * the app in its own colours.
+         */
+        fetch(`${startUrl}/app-settings/branding`)
+          .then((response) => (response.ok ? response.json() : null))
+          .then((body) => setTheme(body?.data?.dashboardTheme || null))
+          .catch(() => {});
 
         const storedTrackingProfile = await AsyncStorage.getItem(TRACKING_PROFILE_KEY);
         if (storedTrackingProfile) {
@@ -412,7 +456,7 @@ function AppShell() {
           // back to login if it has expired.
           let tokenIsValid = true;
           try {
-            const check = await fetch(`${API_URL}/auth/me`, {
+            const check = await fetch(`${startUrl}/auth/me`, {
               headers: { Authorization: `Bearer ${storedToken}` },
             });
             if (check.status === 401 || check.status === 403) tokenIsValid = false;
@@ -426,10 +470,16 @@ function AppShell() {
             setToken(storedToken);
             setUser(JSON.parse(storedUser));
             setActiveTab('home');
+            // The address this session is on, not the compiled-in one, for the
+            // same reason the tracker follows it: a server override has to move
+            // everything or it moves nothing usefully.
             registerFcmTokenWithBackend({
               authToken: storedToken,
-              apiUrl: API_URL,
+              // The address just resolved, not the state — setApiUrl has not
+              // taken effect within this same run of the effect.
+              apiUrl: startUrl,
             }).catch(() => {});
+            syncMobileContacts(startUrl, storedToken).catch(() => {});
           } else {
             await AsyncStorage.multiRemove(['token', 'user']);
           }
@@ -490,10 +540,13 @@ function AppShell() {
         if (trackingProfile?.userId) {
           startBackgroundLocationReporting(activeLogId || null);
         }
+        if (token && apiUrl) {
+          syncMobileContacts(apiUrl, token).catch(() => {});
+        }
       }
     });
     return () => subscription.remove();
-  }, [trackingProfile, activeLogId]);
+  }, [trackingProfile, activeLogId, token, apiUrl]);
 
   // 2. Keep daily-log summary synced from live tracking stream
   useEffect(() => {
@@ -578,7 +631,10 @@ function AppShell() {
       ]);
       const profile = rawProfile ? JSON.parse(rawProfile) : null;
       if (hasNativeTracking) {
-        const started = await startNativeTracking(profile, API_URL);
+        // The address the session actually logged in to, not the compiled-in
+        // one — otherwise the server setting on the login screen moves every
+        // screen and leaves the tracker still talking to production.
+        const started = await startNativeTracking(profile, apiUrl);
         if (started) return;
       }
 
@@ -593,7 +649,7 @@ function AppShell() {
         const state = await getPermissionState();
         return {
           token: storedToken,
-          apiUrl: API_URL,
+          apiUrl,
           profile: profileRaw ? JSON.parse(profileRaw) : null,
           // Tracking follows the login, not attendance, so every point counts.
           onDuty: true,
@@ -624,6 +680,44 @@ function AppShell() {
     }
   };
 
+  /**
+   * Sign out.
+   *
+   * There was no way to. ProfileScreen has drawn a Log Out button all along
+   * behind `{onLogout ? ...}` and App.js never passed one, so it has never
+   * appeared — a phone signed in as the wrong person had to be reinstalled.
+   *
+   * The session goes, and the tracking profile with it: leaving that behind
+   * would have the next person's movements reported under the last person's
+   * name. The device id stays, because it identifies the handset and not the
+   * person.
+   */
+  const handleLogout = async () => {
+    try {
+      stopNativeTracking?.();
+    } catch (error) {
+      console.log('[Logout] Could not stop tracking:', error?.message);
+    }
+    try {
+      await AsyncStorage.multiRemove(['token', 'user', 'active_log_id', TRACKING_PROFILE_KEY]);
+    } catch (error) {
+      console.log('[Logout] Could not clear the session:', error?.message);
+    }
+    setToken(null);
+    setUser(null);
+    setTrackingProfile(null);
+    setActiveLogId(null);
+    setActiveTab('home');
+    goBack();
+  };
+
+  const confirmLogout = () => {
+    Alert.alert('Log out', 'Sign out of this phone?', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Log out', style: 'destructive', onPress: handleLogout },
+    ]);
+  };
+
   const handleLoginSuccess = (newToken, newUser, currentUrl) => {
     setToken(newToken);
     setUser(newUser);
@@ -634,6 +728,7 @@ function AppShell() {
       authToken: newToken,
       apiUrl: currentUrl,
     }).catch(() => {});
+    syncMobileContacts(currentUrl, newToken).catch(() => {});
     getOrCreateDeviceId().then(async (deviceId) => {
       const nextTrackingProfile = {
         userId: newUser?.id || newUser?._id,
@@ -677,7 +772,9 @@ function AppShell() {
               throw new Error(data?.message || 'Failed to refresh push token');
             });
           }
-          return AsyncStorage.setItem(PUSH_TOKEN_KEY, String(nextToken || '').trim());
+          // Stored the same way as above — server and token together — or the
+          // next registration would think it had already been done here.
+          return AsyncStorage.setItem(PUSH_TOKEN_KEY, `${apiUrl}|${String(nextToken || '').trim()}`);
         })
         .catch((error) => {
           console.log('[FCM] Token refresh sync failed:', error.message);
@@ -687,18 +784,32 @@ function AppShell() {
 
     const unsubscribeForeground =
       typeof messagingInstance.onMessage === 'function'
-        ? messagingInstance.onMessage(async () => {
+        ? messagingInstance.onMessage(async (remoteMessage) => {
+            // With the app open the background handler never runs, so the wake
+            // has to be answered here too — otherwise live tracking is instant
+            // when the phone is in a pocket and slow when it is in a hand.
+            if (remoteMessage?.data?.type === 'tracking-wake') {
+              wakeNativeTracking().catch(() => {});
+              return;
+            }
             fetchUnreadCount();
           })
         : () => {};
 
-    // Tapping a notification should land on the notifications screen. Without
-    // these two the tap merely reopened whatever screen was last showing.
+    /**
+     * Tapping a notification opens the notifications screen.
+     *
+     * `navigateTo`, the same call the bell makes — the screen renders on
+     * subScreen, and these used to do `setActiveTab('notifications')` followed
+     * by `goBack()`, which set a tab that does not exist and then cleared the
+     * subScreen that would have rendered it. The result was a blank screen
+     * stuck on "loading", which is what a tap has always done.
+     */
     const unsubscribeOpened =
       typeof messagingInstance.onNotificationOpenedApp === 'function'
-        ? messagingInstance.onNotificationOpenedApp(() => {
-            setActiveTab('notifications');
-            goBack();
+        ? messagingInstance.onNotificationOpenedApp((opened) => {
+            setOpenNotificationId(opened?.data?.notificationId || null);
+            navigateTo('notifications');
             fetchUnreadCount();
           })
         : () => {};
@@ -709,8 +820,8 @@ function AppShell() {
       messagingInstance.getInitialNotification()
         .then((opened) => {
           if (!opened) return;
-          setActiveTab('notifications');
-          goBack();
+          setOpenNotificationId(opened?.data?.notificationId || null);
+          navigateTo('notifications');
           fetchUnreadCount();
         })
         .catch(() => {});
@@ -733,7 +844,6 @@ function AppShell() {
 
   const missingPermissionLabels = {
     camera: 'Camera / Photo',
-    contacts: 'Contacts',
     location: 'Location',
     backgroundLocation: 'Background Location',
   };
@@ -773,7 +883,7 @@ function AppShell() {
         <View style={styles.permissionGateCard}>
           <Text style={styles.permissionGateTitle}>Required permissions are off</Text>
           <Text style={styles.permissionGateDesc}>
-            This app needs location, camera/photo, contacts, and background location access. Until all are allowed, the app will stay locked.
+            This app needs location, camera/photo, and background location access. Until all are allowed, the app will stay locked.
           </Text>
           <View style={styles.permissionList}>
             {permissionState.missing.map((key) => (
@@ -822,6 +932,8 @@ function AppShell() {
   const isSalesPartner = normalizedRole === 'salespartner';
   const isStoreManager = ['storemanager', 'store_manager', 'warehousemanager', 'warehouse_manager', 'storekeeper'].includes(normalizedRole);
   const isPacker = normalizedRole === 'packer';
+  const isPurchaseManager = normalizedRole === 'purchasemanager';
+  const isTelecaller = ['telecaller', 'callingexecutive', 'calling_executive', 'telecalling'].includes(normalizedRole);
 
   // A packer gets one screen and nothing else: no tabs, no header, no profile.
   if (isPacker) {
@@ -874,6 +986,7 @@ function AppShell() {
               <Text style={styles.avatarCircleText}>{initials}</Text>
             </View>
           </TouchableOpacity>
+
         </View>
       </View>
 
@@ -1001,7 +1114,8 @@ function AppShell() {
           <NotificationScreen
             token={token}
             apiUrl={apiUrl}
-            onBack={() => goBack()}
+            openNotificationId={openNotificationId}
+            onBack={() => { setOpenNotificationId(null); goBack(); }}
             onClearBadge={() => setUnreadCount(0)}
           />
         ) : subScreen === 'outstandingList' ? (
@@ -1018,9 +1132,57 @@ function AppShell() {
               navigateTo('collection');
             }}
           />
+        ) : subScreen === 'purchaseVendors' ? (
+          <VendorListScreen
+            token={token}
+            apiUrl={apiUrl}
+            onBack={() => goBack()}
+            onSelectVendor={(id) => { setSelectedVendorId(id); navigateTo('vendorProfile'); }}
+            onAddVendor={() => navigateTo('createVendor')}
+          />
+        ) : subScreen === 'vendorProfile' ? (
+          <VendorProfileScreen
+            token={token}
+            apiUrl={apiUrl}
+            vendorId={selectedVendorId}
+            onBack={() => goBack()}
+            onOpenPurchaseOrder={(id) => { setSelectedPurchaseOrderId(id); navigateTo('purchaseOrderDetail'); }}
+          />
+        ) : subScreen === 'purchaseOrderDetail' ? (
+          <PurchaseOrderDetailScreen
+            token={token}
+            apiUrl={apiUrl}
+            poId={selectedPurchaseOrderId}
+            onBack={() => goBack()}
+          />
+        ) : subScreen === 'createVendor' ? (
+          <CreateVendorScreen
+            token={token}
+            apiUrl={apiUrl}
+            onBack={() => goBack()}
+            onCreated={(vendor) => {
+              setSelectedVendorId(vendor._id);
+              // Straight to the profile just made, not back to the list —
+              // the next thing a purchase manager does after adding a vendor
+              // is record a price for them, not look at the list again.
+              setSubScreen('vendorProfile');
+              setScreenStack((stack) => [...stack, 'purchaseVendors']);
+            }}
+          />
+        ) : subScreen === 'purchaseOrders' ? (
+          <PurchaseOrderListScreen token={token} apiUrl={apiUrl} onBack={() => goBack()} />
+        ) : subScreen === 'purchaseStock' ? (
+          <PurchaseStockScreen token={token} apiUrl={apiUrl} onBack={() => goBack()} />
         ) : activeTab === 'home' ? (
           isDriver ? (
+            // Keyed: this and the History-tab instance below are the same
+            // component type at the same spot in the tree, so without distinct
+            // keys React treats a switch between them as a prop update rather
+            // than a new mount — the Delivery History tab kept showing
+            // whatever internal tab Home was last left on, because its
+            // `useState(initialTab)` never got to run again.
             <DriverDashboardScreen
+              key="driver-home"
               token={token}
               apiUrl={apiUrl}
               activeLogId={activeLogId}
@@ -1071,6 +1233,29 @@ function AppShell() {
               onNavigateToProducts={() => navigateTo('products')}
               onNavigateToRoutePlanner={() => navigateTo('routePlanner')}
             />
+          ) : isPurchaseManager ? (
+            <PurchaseManagerDashboardScreen
+              onNavigateToAttendance={() => navigateTo('attendance')}
+              onNavigateToLeave={() => navigateTo('leave')}
+              onNavigateToVendors={() => navigateTo('purchaseVendors')}
+              onNavigateToCreateVendor={() => navigateTo('createVendor')}
+              onNavigateToStock={() => navigateTo('purchaseStock')}
+              onNavigateToPurchaseOrders={() => navigateTo('purchaseOrders')}
+            />
+          ) : isTelecaller ? (
+            <TelecallingDashboardScreen
+              token={token}
+              apiUrl={apiUrl}
+              user={user}
+              onNavigateToOrder={(party) => {
+                setOrderParty(party);
+                navigateTo('order');
+              }}
+              onNavigateToOrders={() => navigateTo('orderList')}
+              onNavigateToAttendance={() => navigateTo('attendance')}
+              onNavigateToLeave={() => navigateTo('leave')}
+              onNavigateToProducts={() => navigateTo('products')}
+            />
           ) : (
             <DashboardScreen
               token={token}
@@ -1098,19 +1283,40 @@ function AppShell() {
             user={user}
             token={token}
             apiUrl={apiUrl}
+            onLogout={confirmLogout}
           />
         ) : activeTab === 'history' ? (
-          isStoreManager ? (
+          isStoreManager || isSalesPartner || isTelecaller ? (
             <OrderListScreen
               token={token}
               apiUrl={apiUrl}
               onBack={() => { setActiveTab('home'); goBack(); }}
             />
-          ) : isSalesPartner ? (
-            <OrderListScreen
+          ) : isPurchaseManager ? (
+            // The footer's middle slot, repurposed: a purchase manager's most
+            // frequent stop is the vendor list, not a visit history nobody
+            // asked for.
+            <VendorListScreen
               token={token}
               apiUrl={apiUrl}
               onBack={() => { setActiveTab('home'); goBack(); }}
+              onSelectVendor={(id) => { setSelectedVendorId(id); navigateTo('vendorProfile'); }}
+              onAddVendor={() => navigateTo('createVendor')}
+            />
+          ) : isDriver ? (
+            // Same screen as Home, opened straight on its own Delivered
+            // History tab — a driver has no "visits" to show here. A distinct
+            // key from the Home instance above, or React reuses that instance
+            // instead of mounting fresh and initialTab never takes effect.
+            <DriverDashboardScreen
+              key="driver-history"
+              token={token}
+              apiUrl={apiUrl}
+              activeLogId={activeLogId}
+              initialTab="history"
+              onNavigateToAttendance={() => navigateTo('attendance')}
+              onNavigateToLeave={() => navigateTo('leave')}
+              onNavigateToProducts={() => navigateTo('products')}
             />
           ) : (
           <VisitHistoryScreen
@@ -1174,20 +1380,22 @@ function AppShell() {
       {/* Global Bottom Tab Bar (Image 1/2 style) */}
       <View style={styles.tabBar}>
         {/* Left Side Tab Buttons */}
-        <TouchableOpacity
-          style={styles.tabItem}
-          onPress={() => { setActiveTab('report'); goBack(); }}
-        >
-            <Text style={[styles.tabIcon, activeTab === 'report' && styles.activeTabColor]}>{isSalesPartner ? '🗺️' : '📊'}</Text>
-          <Text style={[styles.tabLabel, activeTab === 'report' && styles.activeTabColor]}>{isSalesPartner ? 'Route' : 'Report'}</Text>
-        </TouchableOpacity>
+        {!isDriver && !isPurchaseManager && !isTelecaller && (
+          <TouchableOpacity
+            style={styles.tabItem}
+            onPress={() => { setActiveTab('report'); goBack(); }}
+          >
+              <Text style={[styles.tabIcon, activeTab === 'report' && styles.activeTabColor]}>{isSalesPartner ? '🗺️' : '📊'}</Text>
+            <Text style={[styles.tabLabel, activeTab === 'report' && styles.activeTabColor]}>{isSalesPartner ? 'Route' : 'Report'}</Text>
+          </TouchableOpacity>
+        )}
 
         <TouchableOpacity
           style={styles.tabItem}
           onPress={() => { setActiveTab('history'); goBack(); }}
         >
-          <Text style={[styles.tabIcon, activeTab === 'history' && styles.activeTabColor]}>{isSalesPartner ? '📋' : '🕒'}</Text>
-          <Text style={[styles.tabLabel, activeTab === 'history' && styles.activeTabColor]}>{isSalesPartner ? 'Orders' : 'History'}</Text>
+          <Text style={[styles.tabIcon, activeTab === 'history' && styles.activeTabColor]}>{isSalesPartner || isTelecaller ? '📋' : isPurchaseManager ? '🏬' : '🕒'}</Text>
+          <Text style={[styles.tabLabel, activeTab === 'history' && styles.activeTabColor]}>{isSalesPartner || isTelecaller ? 'Orders' : isPurchaseManager ? 'Vendors' : isDriver ? 'Delivery History' : 'History'}</Text>
         </TouchableOpacity>
 
         {/* Middle Floating Home Button */}
@@ -1201,13 +1409,15 @@ function AppShell() {
         </View>
 
         {/* Right Side Tab Buttons */}
-        <TouchableOpacity
-          style={styles.tabItem}
-          onPress={() => { setActiveTab('beatPlan'); goBack(); }}
-        >
-          <Text style={[styles.tabIcon, activeTab === 'beatPlan' && styles.activeTabColor]}>🗺️</Text>
-          <Text style={[styles.tabLabel, activeTab === 'beatPlan' && styles.activeTabColor]}>Beat Plan</Text>
-        </TouchableOpacity>
+        {!isDriver && !isPurchaseManager && !isTelecaller && (
+          <TouchableOpacity
+            style={styles.tabItem}
+            onPress={() => { setActiveTab('beatPlan'); goBack(); }}
+          >
+            <Text style={[styles.tabIcon, activeTab === 'beatPlan' && styles.activeTabColor]}>🗺️</Text>
+            <Text style={[styles.tabLabel, activeTab === 'beatPlan' && styles.activeTabColor]}>Beat Plan</Text>
+          </TouchableOpacity>
+        )}
 
         <TouchableOpacity
           style={styles.tabItem}
@@ -1348,6 +1558,7 @@ const styles = StyleSheet.create({
   profileIndicator: {
     padding: scale(2),
   },
+  // TEMPORARY, with the login screen's server box. Remove together.
   headerRightContainer: {
     flexDirection: 'row',
     alignItems: 'center',

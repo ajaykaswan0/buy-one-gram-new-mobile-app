@@ -35,7 +35,6 @@ export default function StoreManagerDashboardScreen({
   const [reconcileOrders, setReconcileOrders] = useState([]);
   const [packedOrders, setPackedOrders] = useState([]);
   const [dispatchedOrders, setDispatchedOrders] = useState([]);
-  const [drivers, setDrivers] = useState([]);
 
   // Packing Modal state
   const [selectedOrder, setSelectedOrder] = useState(null);
@@ -52,7 +51,6 @@ export default function StoreManagerDashboardScreen({
   // Vehicle Load & Dispatch Modal state
   const [dispatchModalVisible, setDispatchModalVisible] = useState(false);
   const [dispatchOrder, setDispatchOrder] = useState(null);
-  const [selectedDriverId, setSelectedDriverId] = useState('');
   const [submittingDispatch, setSubmittingDispatch] = useState(false);
 
   const fetchDashboardData = useCallback(async () => {
@@ -74,14 +72,6 @@ export default function StoreManagerDashboardScreen({
       setPackedOrders(packed);
       setDispatchedOrders(dispatched);
 
-      // 2. Fetch Drivers list
-      const driverRes = await fetch(`${apiUrl}/users?role=driver&limit=100`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const driverData = await driverRes.json();
-      if (driverRes.ok && Array.isArray(driverData.data)) {
-        setDrivers(driverData.data);
-      }
     } catch (e) {
       console.log('[StoreManagerDashboard] Error fetching data:', e.message);
     } finally {
@@ -253,7 +243,6 @@ export default function StoreManagerDashboardScreen({
   // Open Dispatch Modal
   const handleOpenDispatchModal = (order) => {
     setDispatchOrder(order);
-    setSelectedDriverId(order.assignedDriverId?._id || order.assignedDriverId || '');
     setDispatchModalVisible(true);
   };
 
@@ -263,19 +252,14 @@ export default function StoreManagerDashboardScreen({
     setSubmittingDispatch(true);
 
     try {
-      // 1. Assign Driver if selected
-      if (selectedDriverId) {
-        await fetch(`${apiUrl}/order/${dispatchOrder._id}/assign-driver`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
-          },
-          body: JSON.stringify({ driverId: selectedDriverId }),
-        });
-      }
-
-      // 2. Change status to dispatched
+      /*
+       * The store does not choose the driver any more.
+       *
+       * An order gets a driver when the day is routed and at no other time, so
+       * that what is in a van and what the plan says are the same thing. The
+       * store's job here is to say the goods are loaded and gone.
+       */
+      // Change status to dispatched
       const statusRes = await fetch(`${apiUrl}/order/${dispatchOrder._id}/status`, {
         method: 'PUT',
         headers: {
@@ -752,33 +736,23 @@ export default function StoreManagerDashboardScreen({
               </TouchableOpacity>
             </View>
 
-            <Text style={styles.inputLabel}>Select Delivery Driver *</Text>
-            {drivers.length === 0 ? (
-              <Text style={{ color: '#E53E3E', fontSize: 13, marginBottom: 12 }}>
-                No active driver accounts found in database.
-              </Text>
-            ) : (
-              <View style={{ marginBottom: 16 }}>
-                {drivers.map((d) => (
-                  <TouchableOpacity
-                    key={d._id}
-                    style={[
-                      styles.driverSelectItem,
-                      selectedDriverId === d._id && styles.driverSelectItemActive,
-                    ]}
-                    onPress={() => setSelectedDriverId(d._id)}
-                  >
-                    <Text
-                      style={[
-                        styles.driverSelectItemText,
-                        selectedDriverId === d._id && styles.driverSelectItemTextActive,
-                      ]}
-                    >
-                      👤 {d.name} ({d.mobile || 'No Mobile'})
-                    </Text>
-                  </TouchableOpacity>
-                ))}
+            <Text style={styles.inputLabel}>Driver</Text>
+            {/*
+              Read-only: whoever the route named. An order that is on no route
+              has nobody to load it into, and dispatching it would put goods in
+              a van the office does not know about.
+            */}
+            {dispatchOrder?.assignedDriverId ? (
+              <View style={[styles.driverSelectItem, styles.driverSelectItemActive, { marginBottom: 16 }]}>
+                <Text style={[styles.driverSelectItemText, styles.driverSelectItemTextActive]}>
+                  👤 {dispatchOrder.assignedDriverId?.name || 'Assigned driver'}
+                  {dispatchOrder.assignedDriverId?.mobile ? ` (${dispatchOrder.assignedDriverId.mobile})` : ''}
+                </Text>
               </View>
+            ) : (
+              <Text style={{ color: '#E53E3E', fontSize: 13, marginBottom: 12 }}>
+                Not on any route yet. The office has to plan this order into a route before it can go out.
+              </Text>
             )}
 
             <View style={styles.modalFooterActions}>
@@ -790,9 +764,12 @@ export default function StoreManagerDashboardScreen({
               </TouchableOpacity>
 
               <TouchableOpacity
-                style={[styles.confirmDispatchBtn, submittingDispatch && styles.disabledBtn]}
+                style={[
+                  styles.confirmDispatchBtn,
+                  (submittingDispatch || !dispatchOrder?.assignedDriverId) && styles.disabledBtn,
+                ]}
                 onPress={handleSubmitDispatch}
-                disabled={submittingDispatch}
+                disabled={submittingDispatch || !dispatchOrder?.assignedDriverId}
               >
                 {submittingDispatch ? (
                   <ActivityIndicator color="#FFF" size="small" />

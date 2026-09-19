@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import { useSyncExternalStore } from 'react';
+import { getTheme, subscribeSkin } from '../services/appSkin';
 import { useLanguage } from '../i18n';
 import {
   StyleSheet,
@@ -39,6 +41,13 @@ export default function DashboardScreen({
 
   // Active banner slide index
   const [activeBannerIndex, setActiveBannerIndex] = useState(0);
+  /**
+   * The festival, read from the store App.js fills at startup.
+   *
+   * This screen used to fetch it itself, which meant two requests for one
+   * answer and a moment where the colours had changed but the greeting had not.
+   */
+  const dashboardTheme = useSyncExternalStore(subscribeSkin, getTheme, getTheme);
 
   const [banners, setBanners] = useState([
     {
@@ -237,12 +246,14 @@ export default function DashboardScreen({
     fetchDashboardStats();
   }, [token, apiUrl]);
 
+
   const onRefresh = useCallback(() => {
     setRefreshing(true);
     fetchDashboardStats();
   }, [token, apiUrl]);
 
   const isOnline = activeLogId !== null;
+  const festive = dashboardTheme && (dashboardTheme.greeting || dashboardTheme.headerFrom);
 
   return (
     <SafeAreaView style={styles.safeArea}>
@@ -252,6 +263,28 @@ export default function DashboardScreen({
           <RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={['#00796B']} />
         }
       >
+        {/*
+          * The festive band, when the office has set one.
+          *
+          * Above the banners rather than replacing them: the offers still have
+          * to be read, and a greeting is the first thing not the only thing.
+          */}
+        {festive ? (
+          <View style={[styles.festiveBand, { backgroundColor: dashboardTheme.headerTo || '#00796B' }]}>
+            <View style={[styles.festiveInner, { backgroundColor: dashboardTheme.headerFrom || '#00796B' }]}>
+              {!!dashboardTheme.emoji && <Text style={styles.festiveEmoji}>{dashboardTheme.emoji}</Text>}
+              {!!dashboardTheme.greeting && (
+                <Text style={[styles.festiveGreeting, dashboardTheme.accent ? { color: dashboardTheme.accent } : null]}>
+                  {dashboardTheme.greeting}
+                </Text>
+              )}
+              {!!dashboardTheme.subGreeting && (
+                <Text style={styles.festiveSub}>{dashboardTheme.subGreeting}</Text>
+              )}
+            </View>
+          </View>
+        ) : null}
+
         {/* Sliding Banners Carousel Section */}
         <View style={styles.bannerContainer}>
           <ScrollView
@@ -770,6 +803,27 @@ const styles = StyleSheet.create({
   },
 
   // Banner carousel styles
+  /**
+   * Two layers rather than a gradient: React Native has no gradient without a
+   * library, and one colour behind another with the top one inset reads as the
+   * same thing at this size.
+   */
+  festiveBand: {
+    marginHorizontal: 16,
+    marginTop: 14,
+    borderRadius: 16,
+    padding: 3,
+  },
+  festiveInner: {
+    borderRadius: 14,
+    paddingVertical: 18,
+    paddingHorizontal: 16,
+    alignItems: 'center',
+  },
+  festiveEmoji: { fontSize: 24, marginBottom: 6 },
+  festiveGreeting: { fontSize: 18, fontWeight: '800', color: '#FFFFFF', textAlign: 'center' },
+  festiveSub: { fontSize: 12, color: 'rgba(255,255,255,0.9)', marginTop: 4, textAlign: 'center' },
+
   bannerContainer: {
     width: '100%',
     alignItems: 'center',
