@@ -178,7 +178,7 @@ export default function CrmDashboardScreen({
       }
 
       // 3. Fetch Products / Rate List for this party
-      const prodRes = await fetch(`${apiUrl}/product?limit=100`, {
+      const prodRes = await fetch(`${apiUrl}/product?limit=100&productType=finished_goods`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       const prodData = await prodRes.json();

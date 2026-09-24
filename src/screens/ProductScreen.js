@@ -64,7 +64,7 @@ export default function ProductScreen({ token, apiUrl, user, onBack }) {
     try {
       const headers = { Authorization: `Bearer ${token}` };
       const [prodResponse, plResponse, stockResponse] = await Promise.all([
-        fetch(`${apiUrl}/product?limit=100`, { headers }),
+        fetch(`${apiUrl}/product?limit=100&productType=finished_goods`, { headers }),
         fetch(`${apiUrl}/price-list/manufacturing?page=1&limit=100`, { headers }),
         fetch(`${apiUrl}/inventory/stock?stockType=finished_goods&limit=100`, { headers }),
       ]);

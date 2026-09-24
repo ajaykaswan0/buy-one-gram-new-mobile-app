@@ -215,7 +215,7 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
     try {
       const headers = { Authorization: `Bearer ${token}` };
       const [productResponse, priceResponse, stockResponse] = await Promise.all([
-        fetch(`${apiUrl}/product?limit=100`, { headers }),
+        fetch(`${apiUrl}/product?limit=100&productType=finished_goods`, { headers }),
         fetch(`${apiUrl}/price-list/manufacturing?page=1&limit=100`, { headers }),
         fetch(`${apiUrl}/inventory/stock?stockType=finished_goods&limit=100`, { headers }),
       ]);
@@ -1475,8 +1475,8 @@ export default function OrderScreen({ token, apiUrl, user, preSelectedParty, onB
             </TouchableOpacity>
           </View>
         )}
-      </ScrollView>
-
+      </ScrollView>
+
       {/* The whole order, read back before it is placed. Everything shown here
           is the same value that goes into the payload. */}
       <Modal
