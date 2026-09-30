@@ -11,7 +11,7 @@ import {
   TouchableOpacity,
   ActivityIndicator,
   SafeAreaView,
-  ScrollView,
+  FlatList,
   RefreshControl,
   Alert,
 } from 'react-native';
@@ -19,6 +19,146 @@ import { scale, verticalScale, responsiveFontSize, maxContainerWidth } from '../
 import { launchCamera } from 'react-native-image-picker';
 import { uploadPhoto } from '../services/photoUpload';
 import { startVisitTracking, stopVisitTracking, endVisit, resumeVisitTracking, getActiveVisit, getVisitedToday, markVisitedToday } from '../services/activeVisit';
+
+/**
+ * One row of the "serving" list, pulled out so FlatList can mount only the
+ * rows actually on screen instead of every one of them at once — the whole
+ * point of moving off ScrollView+.map(), which rendered all fifty-plus
+ * cards (and re-rendered every one of them on any single interaction)
+ * whether or not they were visible.
+ */
+function ServingPartyCard({ entry, activeVisit, endingVisit, visitStartingId, onStartVisit, onEndVisit, onViewParty, onOpenMap, name }) {
+  const party = entry.partyId;
+  if (!party) return null;
+  const isDone = entry.isDone;
+  const visitedAt = entry.visitedAt;
+  const visitingHere = activeVisit
+    && String(activeVisit.partyId?._id || activeVisit.partyId) === String(party._id);
+  const busyElsewhere = Boolean(activeVisit) && !visitingHere;
+
+  return (
+    <View style={[styles.partyCard, isDone && styles.partyCardDone]}>
+      <View style={styles.partyHeader}>
+        <View style={{ flex: 1 }}>
+          <Text style={name(styles.partyName)}>{name(party.partyName || party.name)}</Text>
+          <Text style={styles.partyCode}>Code: {party.partyCode}</Text>
+          {entry.distanceFromMe != null && (
+            <Text style={styles.partyDistance}>
+              {entry.distanceFromMe < 1000
+                ? `📍 ${Math.round(entry.distanceFromMe)}m away`
+                : `📍 ${(entry.distanceFromMe / 1000).toFixed(1)}km away`}
+            </Text>
+          )}
+        </View>
+        {isDone && (
+          <View style={styles.visitedBadge}>
+            <Text style={styles.visitedBadgeText}>✓ Visited</Text>
+          </View>
+        )}
+      </View>
+
+      <Text style={styles.partyDetail}>👤 Owner: {party.ownerName || '—'}</Text>
+      <Text style={styles.partyDetail}>📞 Contact: {party.mobile}</Text>
+      <Text style={styles.partyDetail}>📍 Address: {party.address}</Text>
+
+      <View style={styles.divider} />
+
+      <View style={styles.btnRow}>
+        <TouchableOpacity style={styles.viewBtn} onPress={() => onViewParty && onViewParty(party._id)}>
+          <Text style={styles.viewBtnText}>👤 View Party</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity style={styles.mapBtn} onPress={() => onOpenMap(party, name(party.partyName || party.name))}>
+          <Text style={styles.mapBtnText}>🗺️ Map</Text>
+        </TouchableOpacity>
+
+        {isDone && !visitingHere ? (
+          <View style={styles.visitedLabel}>
+            <Text style={styles.visitedLabelText}>
+              ✓ Visit Complete
+              {visitedAt
+                ? ` · ${new Date(visitedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+                : ''}
+            </Text>
+          </View>
+        ) : visitingHere ? (
+          <TouchableOpacity
+            style={[styles.endVisitBtn, endingVisit && styles.disabledBtn]}
+            onPress={onEndVisit}
+            disabled={endingVisit}
+          >
+            {endingVisit ? <ActivityIndicator color="#fff" size="small" /> : <Text style={styles.visitBtnText}>🚪 End Visit</Text>}
+          </TouchableOpacity>
+        ) : (
+          <TouchableOpacity
+            style={[styles.visitBtn, (visitStartingId === party._id || busyElsewhere) && styles.disabledBtn]}
+            onPress={() => onStartVisit(party)}
+            disabled={visitStartingId === party._id || busyElsewhere}
+          >
+            {visitStartingId === party._id ? (
+              <ActivityIndicator color="#fff" size="small" />
+            ) : (
+              <Text style={styles.visitBtnText}>{busyElsewhere ? '⏳ Finish current visit' : '📍 Start Visit'}</Text>
+            )}
+          </TouchableOpacity>
+        )}
+      </View>
+    </View>
+  );
+}
+
+/** One row of the "still to visit" list — same reasoning as ServingPartyCard. */
+function PendingPartyCard({ row, activeVisit, visitStartingId, onStartVisit, onViewParty, onOpenMap, name }) {
+  const party = row.party;
+  const due = new Date(`${row.dueDate}T00:00:00`);
+  const daysLate = Math.max(0, Math.round((Date.now() - due.getTime()) / (24 * 60 * 60 * 1000)));
+
+  return (
+    <View style={styles.skippedCard}>
+      <View style={styles.skippedHeader}>
+        <View style={{ flex: 1 }}>
+          <Text style={name(styles.skippedPartyName)}>{name(party.partyName)}</Text>
+          <Text style={styles.skippedDayLbl}>
+            {party.partyCode ? `${party.partyCode} · ` : ''}
+            {party.area || party.city || 'No area'}
+          </Text>
+        </View>
+        <View style={styles.skippedBadge}>
+          <Text style={styles.skippedBadgeText}>{daysLate <= 1 ? 'YESTERDAY' : `${daysLate} DAYS`}</Text>
+        </View>
+      </View>
+
+      <Text style={styles.skippedArea}>
+        📅 Due {due.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' })}
+        {row.cycleDay ? ` · Beat day ${row.cycleDay}` : ''}
+        {row.timesMissed > 1 ? ` · missed ${row.timesMissed} times` : ''}
+      </Text>
+      {row.dayReason ? <Text style={styles.pendingReason}>{row.dayReason}</Text> : null}
+
+      <View style={styles.divider} />
+
+      <View style={styles.pendingActions}>
+        <TouchableOpacity style={styles.skippedPartyViewBtn} onPress={() => onViewParty && onViewParty(party._id)}>
+          <Text style={styles.skippedPartyViewText}>👤 View</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity style={styles.mapBtn} onPress={() => onOpenMap(party, name(party.partyName))}>
+          <Text style={styles.mapBtnText}>🗺️ Map</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[styles.pendingVisitBtn, (visitStartingId === party._id || Boolean(activeVisit)) && styles.disabledBtn]}
+          disabled={visitStartingId === party._id || Boolean(activeVisit)}
+          onPress={() => onStartVisit(party)}
+        >
+          <Text style={styles.pendingVisitBtnText}>
+            {visitStartingId === party._id ? 'Starting…' : activeVisit ? 'Finish current visit' : '📸 Start Visit'}
+          </Text>
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
+}
 
 export default function BeatPlanScreen({
   token,
@@ -603,147 +743,33 @@ export default function BeatPlanScreen({
           <Text style={styles.loadingText}>Syncing beat plan details...</Text>
         </View>
       ) : (
-        <ScrollView
-          contentContainerStyle={styles.scrollContent}
-          refreshControl={
-            <RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={['#00796B']} />
-          }
-        >
-          {activeTab === 'serving' ? (
-            todayBeat ? (
-              <View>
-                {/* Beat Meta Banner */}
-                <View style={styles.beatBanner}>
-                  <Text style={styles.beatBannerTitle}>
-                    📅 Day {todayBeat.cycleDay} • Route Plan
-                  </Text>
-                  <Text style={styles.beatBannerArea}>Area: {todayBeat.area || 'General'}</Text>
-                  <Text style={styles.beatBannerCount}>
-                    {todayBeat.totalParties} customer(s) scheduled
-                  </Text>
-                </View>
-
-                {/* Scheduled Party Cards */}
-                <View style={styles.partyList}>
-                  {orderedParties.map((entry) => {
-                    /**
-                     * `party` is the shop; `entry` is the shop's place on the
-                     * route. Whether it has been visited, and when, belong to
-                     * the entry — reading them off `party` silently returns
-                     * undefined, which is why a finished shop kept offering
-                     * "Start Visit" as though it had never been called on.
-                     */
-                    const party = entry.partyId;
-                    if (!party) return null;
-                    const isDone = entry.isDone;
-                    const visitedAt = entry.visitedAt;
-
-                    return (
-                      <View key={party._id} style={[styles.partyCard, isDone && styles.partyCardDone]}>
-                        <View style={styles.partyHeader}>
-                          <View style={{ flex: 1 }}>
-                            <Text style={name(styles.partyName)}>{name(party.partyName || party.name)}</Text>
-                            <Text style={styles.partyCode}>Code: {party.partyCode}</Text>
-                            {entry.distanceFromMe != null && (
-                              <Text style={styles.partyDistance}>
-                                {entry.distanceFromMe < 1000
-                                  ? `📍 ${Math.round(entry.distanceFromMe)}m away`
-                                  : `📍 ${(entry.distanceFromMe / 1000).toFixed(1)}km away`}
-                              </Text>
-                            )}
-                          </View>
-                          {isDone && (
-                            <View style={styles.visitedBadge}>
-                              <Text style={styles.visitedBadgeText}>✓ Visited</Text>
-                            </View>
-                          )}
-                        </View>
-
-                        <Text style={styles.partyDetail}>👤 Owner: {party.ownerName || '—'}</Text>
-                        <Text style={styles.partyDetail}>📞 Contact: {party.mobile}</Text>
-                        <Text style={styles.partyDetail}>📍 Address: {party.address}</Text>
-
-                        <View style={styles.divider} />
-
-                        {/* Action buttons */}
-                        <View style={styles.btnRow}>
-                          <TouchableOpacity
-                            style={styles.viewBtn}
-                            onPress={() => onNavigateToPartyProfile && onNavigateToPartyProfile(party._id)}
-                          >
-                            <Text style={styles.viewBtnText}>👤 View Party</Text>
-                          </TouchableOpacity>
-
-                          {/* Hands the pin to the phone's map app, which is the
-                              only thing that can actually walk him there. */}
-                          <TouchableOpacity
-                            style={styles.mapBtn}
-                            onPress={() => openPartyOnMap(party, name(party.partyName || party.name))}
-                          >
-                            <Text style={styles.mapBtnText}>🗺️ Map</Text>
-                          </TouchableOpacity>
-
-                          {(() => {
-                            const visitingHere = activeVisit
-                              && String(activeVisit.partyId?._id || activeVisit.partyId) === String(party._id);
-                            const busyElsewhere = Boolean(activeVisit) && !visitingHere;
-
-                            // Decided once, when the list was ordered, so the
-                            // card and the sorting can never disagree.
-                            const doneToday = isDone;
-                            if (doneToday && !visitingHere) {
-                              return (
-                                <View style={styles.visitedLabel}>
-                                  <Text style={styles.visitedLabelText}>
-                                    ✓ Visit Complete
-                                    {visitedAt
-                                      ? ` · ${new Date(visitedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
-                                      : ''}
-                                  </Text>
-                                </View>
-                              );
-                            }
-
-                            // The one open visit: the only thing offered is ending it.
-                            if (visitingHere) {
-                              return (
-                                <TouchableOpacity
-                                  style={[styles.endVisitBtn, endingVisit && styles.disabledBtn]}
-                                  onPress={handleEndVisit}
-                                  disabled={endingVisit}
-                                >
-                                  {endingVisit ? (
-                                    <ActivityIndicator color="#fff" size="small" />
-                                  ) : (
-                                    <Text style={styles.visitBtnText}>🚪 End Visit</Text>
-                                  )}
-                                </TouchableOpacity>
-                              );
-                            }
-
-                            return (
-                              <TouchableOpacity
-                                style={[styles.visitBtn, (visitStartingId === party._id || busyElsewhere) && styles.disabledBtn]}
-                                onPress={() => handleStartVisit(party)}
-                                disabled={visitStartingId === party._id || busyElsewhere}
-                              >
-                                {visitStartingId === party._id ? (
-                                  <ActivityIndicator color="#fff" size="small" />
-                                ) : (
-                                  <Text style={styles.visitBtnText}>
-                                    {busyElsewhere ? '⏳ Finish current visit' : '📍 Start Visit'}
-                                  </Text>
-                                )}
-                              </TouchableOpacity>
-                            );
-                          })()}
-                        </View>
-                      </View>
-                    );
-                  })}
-                </View>
+        activeTab === 'serving' ? (
+          <FlatList
+            data={todayBeat ? orderedParties : []}
+            keyExtractor={(entry, index) => String(entry.partyId?._id || entry._id || index)}
+            renderItem={({ item }) => (
+              <ServingPartyCard
+                entry={item}
+                activeVisit={activeVisit}
+                endingVisit={endingVisit}
+                visitStartingId={visitStartingId}
+                onStartVisit={handleStartVisit}
+                onEndVisit={handleEndVisit}
+                onViewParty={onNavigateToPartyProfile}
+                onOpenMap={openPartyOnMap}
+                name={name}
+              />
+            )}
+            contentContainerStyle={[styles.scrollContent, todayBeat && styles.partyList]}
+            refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={['#00796B']} />}
+            ListHeaderComponent={todayBeat ? (
+              <View style={styles.beatBanner}>
+                <Text style={styles.beatBannerTitle}>📅 Day {todayBeat.cycleDay} • Route Plan</Text>
+                <Text style={styles.beatBannerArea}>Area: {todayBeat.area || 'General'}</Text>
+                <Text style={styles.beatBannerCount}>{todayBeat.totalParties} customer(s) scheduled</Text>
               </View>
-            ) : (
+            ) : null}
+            ListEmptyComponent={
               <View style={styles.emptyBox}>
                 <Text style={styles.emptyIcon}>🏖️</Text>
                 <Text style={styles.emptyTitle}>
@@ -761,23 +787,48 @@ export default function BeatPlanScreen({
                     : 'No routes or beat plans have been scheduled for today.'}
                 </Text>
               </View>
-            )
-          ) : (
-            /*
-              Shops he still owes a visit.
+            }
+          />
+        ) : (
+          /*
+            Shops he still owes a visit.
 
-              One row per shop rather than one card per skipped day: the same
-              shop missed on three different days is still one shop to go and
-              see, and listing it three times only makes the list look worse
-              than the work actually is.
-            */
-            <View>
-              {pendingLoading ? (
+            One row per shop rather than one card per skipped day: the same
+            shop missed on three different days is still one shop to go and
+            see, and listing it three times only makes the list look worse
+            than the work actually is.
+          */
+          <FlatList
+            data={pendingLoading ? [] : pendingParties}
+            keyExtractor={(row, index) => String(row.party?._id || index)}
+            renderItem={({ item }) => (
+              <PendingPartyCard
+                row={item}
+                activeVisit={activeVisit}
+                visitStartingId={visitStartingId}
+                onStartVisit={handleStartVisit}
+                onViewParty={onNavigateToPartyProfile}
+                onOpenMap={openPartyOnMap}
+                name={name}
+              />
+            )}
+            contentContainerStyle={[styles.scrollContent, !pendingLoading && pendingParties.length > 0 && styles.skippedList]}
+            refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={['#00796B']} />}
+            ListHeaderComponent={!pendingLoading && pendingParties.length > 0 ? (
+              <View>
+                <Text style={styles.sectionTitle}>Still to visit ({pendingParties.length})</Text>
+                <Text style={styles.pendingHint}>
+                  These shops were on your beat on the dates shown and have not been visited since.
+                </Text>
+              </View>
+            ) : null}
+            ListEmptyComponent={
+              pendingLoading ? (
                 <View style={styles.centered}>
                   <ActivityIndicator size="large" color="#2C5282" />
                   <Text style={styles.loadingText}>Working out what is still owed…</Text>
                 </View>
-              ) : pendingParties.length === 0 ? (
+              ) : (
                 <View style={styles.emptyBox}>
                   <Text style={styles.emptyIcon}>🎉</Text>
                   <Text style={styles.emptyTitle}>Nothing pending</Text>
@@ -785,93 +836,10 @@ export default function BeatPlanScreen({
                     Every shop on your beat has been visited. Anything you missed has been covered.
                   </Text>
                 </View>
-              ) : (
-                <View style={styles.skippedList}>
-                  <Text style={styles.sectionTitle}>
-                    Still to visit ({pendingParties.length})
-                  </Text>
-                  <Text style={styles.pendingHint}>
-                    These shops were on your beat on the dates shown and have not been visited since.
-                  </Text>
-
-                  {pendingParties.map((row) => {
-                    const party = row.party;
-                    const due = new Date(`${row.dueDate}T00:00:00`);
-                    const daysLate = Math.max(
-                      0,
-                      Math.round((Date.now() - due.getTime()) / (24 * 60 * 60 * 1000))
-                    );
-
-                    return (
-                      <View key={String(party._id)} style={styles.skippedCard}>
-                        <View style={styles.skippedHeader}>
-                          <View style={{ flex: 1 }}>
-                            <Text style={name(styles.skippedPartyName)}>{name(party.partyName)}</Text>
-                            <Text style={styles.skippedDayLbl}>
-                              {party.partyCode ? `${party.partyCode} · ` : ''}
-                              {party.area || party.city || 'No area'}
-                            </Text>
-                          </View>
-                          <View style={styles.skippedBadge}>
-                            <Text style={styles.skippedBadgeText}>
-                              {daysLate <= 1 ? 'YESTERDAY' : `${daysLate} DAYS`}
-                            </Text>
-                          </View>
-                        </View>
-
-                        <Text style={styles.skippedArea}>
-                          📅 Due {due.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' })}
-                          {row.cycleDay ? ` · Beat day ${row.cycleDay}` : ''}
-                          {row.timesMissed > 1 ? ` · missed ${row.timesMissed} times` : ''}
-                        </Text>
-                        {row.dayReason ? (
-                          <Text style={styles.pendingReason}>{row.dayReason}</Text>
-                        ) : null}
-
-                        <View style={styles.divider} />
-
-                        <View style={styles.pendingActions}>
-                          <TouchableOpacity
-                            style={styles.skippedPartyViewBtn}
-                            onPress={() => onNavigateToPartyProfile && onNavigateToPartyProfile(party._id)}
-                          >
-                            <Text style={styles.skippedPartyViewText}>👤 View</Text>
-                          </TouchableOpacity>
-
-                          <TouchableOpacity
-                            style={styles.mapBtn}
-                            onPress={() => openPartyOnMap(party, name(party.partyName))}
-                          >
-                            <Text style={styles.mapBtnText}>🗺️ Map</Text>
-                          </TouchableOpacity>
-
-                          {/* He can clear the debt from here rather than
-                              hunting for the shop in another list. */}
-                          <TouchableOpacity
-                            style={[
-                              styles.pendingVisitBtn,
-                              (visitStartingId === party._id || Boolean(activeVisit)) && styles.disabledBtn,
-                            ]}
-                            disabled={visitStartingId === party._id || Boolean(activeVisit)}
-                            onPress={() => handleStartVisit(party)}
-                          >
-                            <Text style={styles.pendingVisitBtnText}>
-                              {visitStartingId === party._id
-                                ? 'Starting…'
-                                : activeVisit
-                                  ? 'Finish current visit'
-                                  : '📸 Start Visit'}
-                            </Text>
-                          </TouchableOpacity>
-                        </View>
-                      </View>
-                    );
-                  })}
-                </View>
-              )}
-            </View>
-          )}
-        </ScrollView>
+              )
+            }
+          />
+        )
       )}
     </SafeAreaView>
   );
