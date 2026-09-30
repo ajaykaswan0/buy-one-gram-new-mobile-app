@@ -82,7 +82,9 @@ export default function AttendanceScreen({ token, apiUrl, onBack, onAttendanceMa
         fetch(`${apiUrl}/attendance/my/today`, {
           headers: { Authorization: `Bearer ${token}` },
         }),
-        fetch(`${apiUrl}/attendance/my`, {
+        // Only the last 5 days are ever shown (historyList below), so there's
+        // no reason to pull the backend's default 30.
+        fetch(`${apiUrl}/attendance/my?limit=10`, {
           headers: { Authorization: `Bearer ${token}` },
         })
       ]);
@@ -201,7 +203,7 @@ export default function AttendanceScreen({ token, apiUrl, onBack, onAttendanceMa
               onAttendanceMarked?.();
               
               // Reload history logs
-              const historyRes = await fetch(`${apiUrl}/attendance/my`, {
+              const historyRes = await fetch(`${apiUrl}/attendance/my?limit=10`, {
                 headers: { Authorization: `Bearer ${token}` },
               });
               const historyData = await historyRes.json();
@@ -291,7 +293,7 @@ export default function AttendanceScreen({ token, apiUrl, onBack, onAttendanceMa
               onAttendanceMarked?.();
               
               // Reload history logs
-              const historyRes = await fetch(`${apiUrl}/attendance/my`, {
+              const historyRes = await fetch(`${apiUrl}/attendance/my?limit=10`, {
                 headers: { Authorization: `Bearer ${token}` },
               });
               const historyData = await historyRes.json();
