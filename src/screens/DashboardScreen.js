@@ -216,23 +216,47 @@ export default function DashboardScreen({
         setTotalOutstanding(0);
       });
 
-      await Promise.all([targetPromise, ordersPromise, visitsPromise, bannersPromise, partiesPromise, mePromise]);
+      /**
+       * The team summary, in two calls instead of one-per-member.
+       *
+       * /order/my and /parties/my already return the caller's own book plus
+       * their whole team's the moment scope=own is left off (the backend
+       * resolves the team itself) — so there was never a need to first list
+       * every team member and then ask twice per member. For 15 reports that
+       * was a /users call plus 30 concurrent order/party fetches on every
+       * single dashboard open; it is 2 now, run alongside the six above
+       * rather than after them.
+       */
+      const teamOrdersPromise = isCso
+        ? fetch(`${apiUrl}/order/my?startDate=${start}&endDate=${end}&limit=1000`, { headers: { Authorization: `Bearer ${token}` } })
+            .then((res) => res.json()).catch(() => ({ data: [] }))
+        : Promise.resolve(null);
+      const teamPartiesPromise = isCso
+        ? fetch(`${apiUrl}/parties/my`, { headers: { Authorization: `Bearer ${token}` } })
+            .then((res) => res.json()).catch(() => ({ data: [] }))
+        : Promise.resolve(null);
+
+      const [, , , , , , teamOrdersResult, teamPartiesResult] = await Promise.all([
+        targetPromise, ordersPromise, visitsPromise, bannersPromise, partiesPromise, mePromise,
+        teamOrdersPromise, teamPartiesPromise,
+      ]);
+
       if (isCso) {
-        const usersResponse = await fetch(`${apiUrl}/users?limit=200`, { headers: { Authorization: `Bearer ${token}` } });
-        const usersResult = await usersResponse.json();
-        const myId = user?._id || user?.id;
-        const members = (Array.isArray(usersResult.data) ? usersResult.data : []).filter(member => String(member.reportsTo?._id || member.reportsTo) === String(myId));
-        const memberData = await Promise.all(members.map(async member => {
-          const [orderResponse, partyResponse] = await Promise.all([
-            fetch(`${apiUrl}/order?salesmanId=${member._id}&startDate=${start}&endDate=${end}&limit=200`, { headers: { Authorization: `Bearer ${token}` } }),
-            fetch(`${apiUrl}/parties?assignedSalesman=${member._id}&limit=500`, { headers: { Authorization: `Bearer ${token}` } }),
-          ]);
-          const [orderResult, partyResult] = await Promise.all([orderResponse.json(), partyResponse.json()]);
-          const orders = Array.isArray(orderResult.data) ? orderResult.data.filter(order => String(order.salesmanId?._id || order.salesmanId) === String(member._id)) : [];
-          const parties = Array.isArray(partyResult.data) ? partyResult.data.filter(party => String(party.assignedSalesman?._id || party.assignedSalesman) === String(member._id)) : [];
-          return { orders: orders.length, sales: orders.reduce((sum,order)=>sum+Number(order.netPayableAmount||order.grandTotal||0),0), outstanding: parties.reduce((sum,party)=>sum+Number(party.currentOutstanding||0),0) };
-        }));
-        setTeamSummary({ members: members.length, orders: memberData.reduce((s,x)=>s+x.orders,0), sales: memberData.reduce((s,x)=>s+x.sales,0), outstanding: memberData.reduce((s,x)=>s+x.outstanding,0) });
+        const myId = String(user?._id || user?.id);
+        const teamOrders = (Array.isArray(teamOrdersResult?.data) ? teamOrdersResult.data : [])
+          .filter((order) => String(order.salesmanId?._id || order.salesmanId) !== myId);
+        const teamParties = (Array.isArray(teamPartiesResult?.data) ? teamPartiesResult.data : [])
+          .filter((party) => String(party.assignedSalesman?._id || party.assignedSalesman) !== myId);
+        const memberIds = new Set([
+          ...teamOrders.map((order) => String(order.salesmanId?._id || order.salesmanId)),
+          ...teamParties.map((party) => String(party.assignedSalesman?._id || party.assignedSalesman)),
+        ]);
+        setTeamSummary({
+          members: memberIds.size,
+          orders: teamOrders.length,
+          sales: teamOrders.reduce((sum, order) => sum + Number(order.netPayableAmount || order.grandTotal || 0), 0),
+          outstanding: teamParties.reduce((sum, party) => sum + Number(party.currentOutstanding || 0), 0),
+        });
       }
     } catch (e) {
       console.warn('Dashboard stats loader error:', e.message);
