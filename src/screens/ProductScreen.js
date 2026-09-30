@@ -138,28 +138,29 @@ export default function ProductScreen({ token, apiUrl, user, onBack }) {
         }
 
         /**
-         * The stored price is the one with GST in it, not the one without.
+         * The stored price is the one WITHOUT GST — PriceList.items[].price is
+         * tax-exclusive by design (rateFormula.service.js), the same figure an
+         * order is actually priced from. Whichever screen shows GST added on
+         * top is doing that for display only, never storing it.
          *
-         * This multiplied it up for the "with GST" view, which charged the tax
-         * twice — Arhar 1kg reads 114.50 on the printed rate list and the app
-         * showed 120.23. The pricing formula builds the tax in (base x 1.05,
-         * and the 1.05 is the five per cent), and the printed list says
-         * "Prices inclusive of GST", so the stored figure is the inclusive one.
-         *
-         * With GST is therefore what is stored, and without GST is that figure
-         * divided back out. A 30kg sack is GST-exempt and divides by one, so
-         * both views show it the same, which is right.
+         * This used to assume the opposite — that GST was already baked into
+         * the stored price, and the "without GST" view divided it back out —
+         * which was true of an older pricing formula that has since been
+         * fixed to stop double-charging GST at order time. Left unfixed here,
+         * "with GST" (the default) quietly showed the bare stored price, and
+         * "without GST" subtracted GST a second time from a number that
+         * never had it in the first place — a real cut below the actual rate.
          */
         const gstPercentage = variant.gstPercentage || 0;
-        const rate = withGst ? price : price / (1 + gstPercentage / 100);
+        const rate = withGst ? price * (1 + gstPercentage / 100) : price;
         // +/- difference from last price list update
         const previousPrice = priceHistory.length > 0
           ? priceHistory[priceHistory.length - 1].price
           : price;
         const diff = price - previousPrice;
-        // The change is between two inclusive prices, so it is shown the same
-        // way round as the price above it.
-        const diffRate = withGst ? diff : diff / (1 + gstPercentage / 100);
+        // The change is between two ex-GST prices, so it is shown the same
+        // way round as the rate above it.
+        const diffRate = withGst ? diff * (1 + gstPercentage / 100) : diff;
 
         // Margin percentage: (MRP - Rate) / Rate * 100
         const margin = rate > 0 ? Math.max(0, Math.round(((mrp - rate) / rate) * 100)) : 0;
